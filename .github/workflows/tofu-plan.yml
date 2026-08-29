@@ -148,3 +148,68 @@ jobs:
           echo "Auto-merge is only safe for dependency bumps that are a no-op against AWS,"
           echo "because merging to main triggers an immediate apply. Review this one by hand."
           exit 1
+
+  # ---------------------------------------------------------------------------
+  # Health of controls that can fail SILENTLY.
+  #
+  # Two controls in this repo have already reported healthy while being dead:
+  # CloudTrail delivered nothing for 108 minutes while IsLogging stayed true and
+  # only LatestDeliveryError told the truth, and the SNS alert topic has sat at
+  # zero confirmed subscribers while `tofu apply` reported success. Neither
+  # `tofu plan` nor the console surfaces either.
+  #
+  # This job runs on every PR so those failures surface within a day rather than
+  # at the next audit.
+  # ---------------------------------------------------------------------------
+  health:
+    name: health
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Refuse pull requests from forks
+        if: github.event.pull_request.head.repo.full_name != github.repository
+        run: exit 1
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: ${{ vars.AWS_PLAN_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-health-${{ github.run_id }}
+
+      # HARD FAIL. A trail that is not delivering is the failure mode that has
+      # already bitten, and every claim in the README about being "fully
+      # recorded" depends on it.
+      - name: CloudTrail is actually delivering
+        run: |
+          err=$(aws cloudtrail get-trail-status \
+            --name marcusdunnca-management-events \
+            --query 'LatestDeliveryError' --output text)
+          last=$(aws cloudtrail get-trail-status \
+            --name marcusdunnca-management-events \
+            --query 'LatestDeliveryAttemptSucceeded' --output text)
+          echo "last successful delivery: $last"
+          if [ "$err" != "None" ] && [ -n "$err" ]; then
+            echo "::error::CloudTrail delivery is failing: $err (last success $last)."
+            echo "The account is unaudited. Check the trail bucket policy."
+            exit 1
+          fi
+          echo "CloudTrail delivering normally."
+
+      # WARNING, not a failure: confirming a subscription needs a human to click
+      # a link, so failing here would block all merges on an action no CI run can
+      # take. Promote to a hard failure once both are confirmed.
+      - name: Cost alerts have confirmed subscribers
+        run: |
+          confirmed=$(aws sns get-topic-attributes --region us-east-1 \
+            --topic-arn arn:aws:sns:us-east-1:812642122818:marcusdunnca-cost-alerts \
+            --query 'Attributes.SubscriptionsConfirmed' --output text)
+          pending=$(aws sns get-topic-attributes --region us-east-1 \
+            --topic-arn arn:aws:sns:us-east-1:812642122818:marcusdunnca-cost-alerts \
+            --query 'Attributes.SubscriptionsPending' --output text)
+          echo "confirmed=$confirmed pending=$pending"
+          if [ "$confirmed" = "0" ]; then
+            echo "::warning::Cost-anomaly alerting is DEAD — $confirmed confirmed, $pending pending."
+            echo "Anomalies publish to a topic that delivers to nobody. Click the"
+            echo "confirmation links in the most recent AWS emails."
+          fi
