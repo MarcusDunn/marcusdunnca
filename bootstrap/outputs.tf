@@ -27,3 +27,18 @@ output "ci_permissions_boundary_arn" {
   description = "Boundary every CI-created role must carry. Referenced by infra/ when it creates roles."
   value       = aws_iam_policy.ci_permissions_boundary.arn
 }
+
+output "cloudtrail_bucket" {
+  description = "S3 bucket holding CloudTrail management-event logs."
+  value       = aws_s3_bucket.trail.id
+}
+
+output "cloudtrail_arn" {
+  description = "ARN of the account's management-events trail."
+  value       = aws_cloudtrail.management.arn
+}
+
+output "ci_guardrails_arn" {
+  description = "Deny-only policy attached to both CI roles."
+  value       = aws_iam_policy.ci_guardrails.arn
+}

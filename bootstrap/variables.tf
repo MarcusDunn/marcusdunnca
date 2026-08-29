@@ -22,6 +22,41 @@ variable "github_repo" {
   default     = "marcusdunnca"
 }
 
+variable "github_owner_id" {
+  description = <<-EOT
+    Numeric GitHub account ID of the owner.
+
+    GitHub issues OIDC subjects in immutable form —
+    `repo:OWNER@<owner_id>/REPO@<repo_id>:...` — and the repository is pinned to
+    that format via the actions/oidc/customization/sub API. Binding trust to the
+    numeric IDs rather than the names means renaming the repo, or a third party
+    later claiming the freed-up name `MarcusDunn/marcusdunnca`, cannot produce a
+    token this account will accept.
+  EOT
+  type        = number
+  default     = 51931484
+}
+
+variable "github_repo_id" {
+  description = "Numeric GitHub repository ID. See github_owner_id for why IDs are used."
+  type        = number
+  default     = 1350868756
+}
+
+variable "allowed_regions" {
+  description = <<-EOT
+    Regions the CI roles may operate in. Everything else is denied outright,
+    which is the single most effective control against denial-of-wallet: the
+    usual move after stealing credentials is to spin up compute in every region
+    at once, and this makes all but one of those calls fail.
+
+    us-east-1 is included because several global services (IAM, CloudTrail's
+    global endpoint, account contacts) are only addressable there.
+  EOT
+  type        = list(string)
+  default     = ["ca-central-1", "us-east-1"]
+}
+
 variable "apply_environment" {
   description = <<-EOT
     Name of the GitHub Environment that gates apply. The apply role's trust policy
@@ -49,4 +84,28 @@ variable "state_noncurrent_version_retention_days" {
   description = "How long to retain superseded state versions before expiring them."
   type        = number
   default     = 90
+}
+
+variable "cloudtrail_retention_days" {
+  description = "How long to keep CloudTrail logs in S3 before expiring them."
+  type        = number
+  default     = 400
+}
+
+variable "security_contact" {
+  description = <<-EOT
+    Alternate SECURITY contact for the account. AWS uses this to reach a human
+    about abuse reports and compromised-credential notices rather than falling
+    back to the root mailbox.
+
+    All four fields are required by the API, so leave this null to skip
+    registering the contact entirely.
+  EOT
+  type = object({
+    name          = string
+    title         = string
+    email_address = string
+    phone_number  = string
+  })
+  default = null
 }

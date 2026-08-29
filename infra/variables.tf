@@ -15,27 +15,3 @@ variable "account_alias" {
   type        = string
   default     = "marcusdunnca"
 }
-
-variable "cloudtrail_retention_days" {
-  description = "How long to keep CloudTrail logs in S3 before expiring them."
-  type        = number
-  default     = 400
-}
-
-variable "security_contact" {
-  description = <<-EOT
-    Alternate SECURITY contact for the account. AWS uses this to reach a human
-    about abuse reports and compromised-credential notices rather than falling
-    back to the root mailbox.
-
-    All four fields are required by the API, so leave this null to skip
-    registering the contact entirely.
-  EOT
-  type = object({
-    name          = string
-    title         = string
-    email_address = string
-    phone_number  = string
-  })
-  default = null
-}
