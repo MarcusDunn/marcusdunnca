@@ -64,6 +64,19 @@ jobs:
             exit 1
           fi
 
+      # TEMPORARY: prints only the non-secret claims of the OIDC token so the
+      # trust policy can be matched against what GitHub actually sends.
+      # Removed once the trust chain is confirmed.
+      - name: Debug OIDC claims
+        run: |
+          tok=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com" | jq -r '.value')
+          payload=$(echo "$tok" | cut -d. -f2)
+          pad=$(( (4 - ${#payload} % 4) % 4 ))
+          [ "$pad" -gt 0 ] && payload="${payload}$(printf '=%.0s' $(seq 1 $pad))"
+          echo "$payload" | tr '_-' '/+' | base64 -d 2>/dev/null \
+            | jq '{sub, aud, iss, repository, repository_owner, event_name, ref}'
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
         with:
