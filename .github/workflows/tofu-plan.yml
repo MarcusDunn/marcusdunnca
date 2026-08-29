@@ -1,0 +1,109 @@
+name: tofu plan
+
+on:
+  pull_request:
+    branches: [main]
+
+# Least privilege by default. id-token is what mints the OIDC JWT; nothing here
+# needs to write to the repo, and plan output goes to the job summary rather
+# than a PR comment specifically so we never need `pull-requests: write`.
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: tofu-plan-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: ca-central-1
+  TOFU_VERSION: 1.12.5
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # bootstrap is planned but never auto-applied — it owns the CI roles and
+        # the state bucket, so it is human-applied only. Planning it here still
+        # catches drift and review-time mistakes.
+        module: [bootstrap, infra]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup OpenTofu
+        uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+        with:
+          tofu_version: ${{ env.TOFU_VERSION }}
+          # The wrapper rewrites exit codes, which would break -detailed-exitcode.
+          tofu_wrapper: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: ${{ vars.AWS_PLAN_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-plan-${{ github.run_id }}
+
+      - name: Check formatting
+        run: tofu fmt -check -recursive -diff
+        working-directory: ${{ matrix.module }}
+
+      - name: Init
+        run: tofu init -input=false -backend-config=backend.hcl
+        working-directory: ${{ matrix.module }}
+
+      - name: Validate
+        run: tofu validate
+        working-directory: ${{ matrix.module }}
+
+      - name: Plan
+        id: plan
+        working-directory: ${{ matrix.module }}
+        # -lock=false keeps the plan role genuinely read-only: it never needs to
+        # write a lock object into the state bucket.
+        # -detailed-exitcode: 0 = no changes, 1 = error, 2 = changes pending.
+        run: |
+          set +e
+          tofu plan -input=false -lock=false -no-color -detailed-exitcode -out=tfplan > plan.txt 2>&1
+          code=$?
+          set -e
+          echo "exitcode=$code" >> "$GITHUB_OUTPUT"
+          cat plan.txt
+          if [ "$code" -eq 1 ]; then
+            exit 1
+          fi
+
+      - name: Publish plan to job summary
+        if: always() && steps.plan.outcome != 'skipped'
+        working-directory: ${{ matrix.module }}
+        run: |
+          {
+            echo "### \`${{ matrix.module }}\` plan"
+            echo
+            if [ "${{ steps.plan.outputs.exitcode }}" = "0" ]; then
+              echo "No infrastructure changes."
+            else
+              echo "Changes pending."
+            fi
+            echo
+            echo '```terraform'
+            # Guard against a pathological plan blowing the 1 MiB summary limit.
+            tail -c 60000 plan.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Block automated merges that would change infrastructure
+        if: github.actor == 'dependabot[bot]' && steps.plan.outputs.exitcode == '2'
+        run: |
+          echo "::error::Dependabot PR produces a non-empty plan for '${{ matrix.module }}'."
+          echo "Auto-merge is only safe for dependency bumps that are a no-op against AWS,"
+          echo "because merging to main triggers an immediate apply. Review this one by hand."
+          exit 1

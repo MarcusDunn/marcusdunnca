@@ -1,0 +1,26 @@
+# OpenTofu / Terraform
+.terraform/
+.terraform.lock.hcl.bak
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+crash.log
+crash.*.log
+
+# Never commit variable files — they are the usual accidental-secret vector.
+# Non-sensitive inputs belong in *.auto.tfvars, which IS committed (see below).
+*.tfvars
+!*.auto.tfvars
+
+# Nix
+result
+result-*
+
+# Local editor / OS noise
+.DS_Store
+.idea/
+.vscode/
+
+# Claude Code local settings
+.claude/settings.local.json

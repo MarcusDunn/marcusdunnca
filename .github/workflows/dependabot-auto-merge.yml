@@ -1,0 +1,35 @@
+name: dependabot auto-merge
+
+on: pull_request
+
+# Dependabot-triggered runs get a read-only token unless the workflow elevates
+# it explicitly, which is what this block does. Note this workflow uses
+# `pull_request` rather than `pull_request_target` and never checks out PR code,
+# so branch contents can never influence what runs here.
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    runs-on: ubuntu-latest
+    if: github.actor == 'dependabot[bot]'
+
+    steps:
+      - name: Fetch Dependabot metadata
+        id: meta
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+
+      - name: Enable auto-merge for non-major updates
+        # Majors are excluded on purpose: they are exactly the updates most
+        # likely to change provider behaviour and therefore mutate AWS.
+        if: steps.meta.outputs.update-type != 'version-update:semver-major'
+        run: gh pr merge --auto --squash "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Explain why a major update was left alone
+        if: steps.meta.outputs.update-type == 'version-update:semver-major'
+        run: |
+          echo "::notice::Major update (${{ steps.meta.outputs.dependency-names }}) — merge by hand after reviewing the plan."

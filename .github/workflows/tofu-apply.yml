@@ -1,0 +1,72 @@
+name: tofu apply
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  id-token: write
+
+# Never run two applies at once. The S3 lock would reject the second anyway,
+# but queueing produces a far clearer failure mode than a lock error.
+concurrency:
+  group: tofu-apply
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ca-central-1
+  TOFU_VERSION: 1.12.5
+
+jobs:
+  apply:
+    name: apply
+    runs-on: ubuntu-latest
+
+    # This line is load-bearing security, not decoration. Declaring the
+    # environment is what puts `environment:production` into the OIDC token's
+    # `sub` claim, which is the only thing the apply role's trust policy will
+    # accept. The environment is in turn restricted to the main branch on the
+    # GitHub side, so there is no way to reach the apply role from anywhere else.
+    environment: production
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup OpenTofu
+        uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+        with:
+          tofu_version: ${{ env.TOFU_VERSION }}
+          tofu_wrapper: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: ${{ vars.AWS_APPLY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-apply-${{ github.run_id }}
+
+      # Only infra/ is applied by CI. bootstrap/ owns these very credentials and
+      # is applied by a human from a workstation.
+      - name: Init
+        run: tofu init -input=false -backend-config=backend.hcl
+        working-directory: infra
+
+      - name: Apply
+        run: tofu apply -input=false -auto-approve
+        working-directory: infra
+
+      - name: Publish outputs to job summary
+        if: always()
+        working-directory: infra
+        run: |
+          {
+            echo "### infra outputs"
+            echo
+            echo '```'
+            tofu output 2>&1 || echo "(unavailable)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

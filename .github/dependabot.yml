@@ -1,0 +1,60 @@
+version: 2
+
+updates:
+  # ---------------------------------------------------------------------------
+  # GitHub Actions. These are pinned to commit SHAs, which Dependabot
+  # understands and updates in lockstep with the trailing `# vX.Y.Z` comment.
+  # This is the highest-value ecosystem here: a compromised action runs with our
+  # OIDC token.
+  # ---------------------------------------------------------------------------
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    # Wait 14 days after a release before proposing it. Long enough for a
+    # malicious or broken release to be caught and yanked by someone else.
+    cooldown:
+      default-days: 14
+    commit-message:
+      prefix: ci
+    labels:
+      - dependencies
+      - github-actions
+    groups:
+      # Non-major bumps ride together in one auto-mergeable PR. Majors are
+      # deliberately left ungrouped so each gets human review.
+      actions-non-major:
+        patterns: ["*"]
+        update-types:
+          - minor
+          - patch
+
+  # ---------------------------------------------------------------------------
+  # OpenTofu provider constraints in required_providers.
+  #
+  # Note: Dependabot updates the version *constraints* in .tf files, not
+  # .terraform.lock.hcl. Because our constraints are `~> 6.0`, only a new major
+  # produces a PR here. Refreshing the actual pinned versions and hashes in the
+  # lock files is handled by .github/workflows/update-locks.yml.
+  # ---------------------------------------------------------------------------
+  - package-ecosystem: terraform
+    directories:
+      - "/bootstrap"
+      - "/infra"
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 14
+    commit-message:
+      prefix: tofu
+    labels:
+      - dependencies
+      - terraform
+    groups:
+      providers-non-major:
+        patterns: ["*"]
+        update-types:
+          - minor
+          - patch
