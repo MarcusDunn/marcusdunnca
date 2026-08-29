@@ -36,13 +36,16 @@ resource "aws_budgets_budget" "monthly_cost" {
   limit_unit   = "USD"
   time_unit    = "MONTHLY"
 
-  # Alert well before the limit, then again when actually exceeded, then on a
-  # forecast breach — the forecast notification is the one that catches a
-  # runaway resource on the day it starts rather than at month end.
+  # Thresholds are percentages so they track monthly_budget_usd rather than
+  # needing to be re-tuned whenever the limit changes.
+  #
+  # 80% actual is the early warning; 100% actual is the limit itself; 100%
+  # forecast is the one that matters most, because it fires on the day a runaway
+  # resource starts rather than at month end when the money is already spent.
   notification {
     comparison_operator        = "GREATER_THAN"
-    threshold                  = 1
-    threshold_type             = "ABSOLUTE_VALUE"
+    threshold                  = 80
+    threshold_type             = "PERCENTAGE"
     notification_type          = "ACTUAL"
     subscriber_email_addresses = var.cost_alert_emails
   }
