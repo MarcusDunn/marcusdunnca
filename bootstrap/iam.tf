@@ -515,6 +515,17 @@ data "aws_iam_policy_document" "plan_permissions" {
       "ec2:GetEbsEncryptionByDefault",
       "ec2:GetEbsDefaultKmsKeyId",
       "account:GetAlternateContact",
+      # Cost tripwires managed in bootstrap/. Read-only: these return budget
+      # thresholds and monitor configuration, not spend data or contents.
+      "budgets:ViewBudget",
+      "budgets:DescribeBudget",
+      "budgets:DescribeBudgetAction",
+      "ce:GetAnomalyMonitors",
+      "ce:GetAnomalySubscriptions",
+      "sns:GetTopicAttributes",
+      "sns:ListTagsForResource",
+      "sns:GetSubscriptionAttributes",
+      "sns:ListSubscriptionsByTopic",
       "kms:DescribeKey",
       "kms:GetKeyRotationStatus",
       "kms:GetKeyPolicy",
