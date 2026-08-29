@@ -99,6 +99,10 @@ Two consequences follow from being public, both handled:
   additionally refuses to run unless the PR head is this repository.
 - **Secret scanning with push protection is enabled**, so a recognised
   credential is rejected at push time rather than after it is public.
+- **Workflow runs from every external contributor require approval**, not just
+  first-time ones, so no stranger's push causes CI to execute unreviewed.
+- **Only an allowlist of actions may run**, and GitHub itself rejects any
+  workflow referencing an action by tag instead of a commit SHA.
 
 The ruleset on `main` has **no bypass actors**, including you:
 

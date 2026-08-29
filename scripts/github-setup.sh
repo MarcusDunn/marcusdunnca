@@ -50,6 +50,42 @@ gh api -X PATCH "repos/${SLUG}" --input - >/dev/null <<'JSON'
 }
 JSON
 
+# ---------------------------------------------------------------------------
+# Who and what is allowed to run Actions.
+#
+# This repo is public, so any stranger can fork it and open a PR. Workflow runs
+# on such PRs must be approved by a maintainer first — not merely for first-time
+# contributors (GitHub's default), but for every external contributor, forever.
+# ---------------------------------------------------------------------------
+echo "==> Requiring approval for all external contributors' workflow runs"
+gh api -X PUT "repos/${SLUG}/actions/permissions/fork-pr-contributor-approval" \
+  -f approval_policy=all_external_contributors >/dev/null
+
+# An allowlist of exactly the third-party actions this repo uses. A compromised
+# action runs in a job holding an OIDC token, so "any action from anywhere" is
+# not an acceptable default. actions/* is covered by github_owned_allowed.
+#
+# sha_pinning_required makes GitHub reject a workflow referencing an action by
+# tag rather than commit SHA — enforcing at the platform level what the
+# workflows already do by convention, so it cannot regress in review.
+echo "==> Restricting allowed actions and enforcing SHA pinning"
+gh api -X PUT "repos/${SLUG}/actions/permissions" --input - >/dev/null <<'JSON'
+{ "enabled": true, "allowed_actions": "selected", "sha_pinning_required": true }
+JSON
+
+gh api -X PUT "repos/${SLUG}/actions/permissions/selected-actions" --input - >/dev/null <<'JSON'
+{
+  "github_owned_allowed": true,
+  "verified_allowed": false,
+  "patterns_allowed": [
+    "aws-actions/configure-aws-credentials@*",
+    "opentofu/setup-opentofu@*",
+    "dependabot/fetch-metadata@*",
+    "DeterminateSystems/nix-installer-action@*"
+  ]
+}
+JSON
+
 # Workflows get read-only tokens unless they ask for more in their `permissions`
 # block. Every workflow in this repo declares exactly what it needs.
 echo "==> Restricting default workflow token to read-only"
