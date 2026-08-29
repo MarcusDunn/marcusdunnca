@@ -37,6 +37,19 @@ gh api -X PATCH "repos/${SLUG}" \
   >/dev/null
 echo "    Squash-only merges (keeps history linear), auto-merge enabled."
 
+# Free on public repositories. Push protection is the useful half: it rejects a
+# commit containing a recognised credential at push time, rather than telling you
+# about it after it is already in a public history and must be treated as burned.
+echo "==> Enabling secret scanning and push protection"
+gh api -X PATCH "repos/${SLUG}" --input - >/dev/null <<'JSON'
+{
+  "security_and_analysis": {
+    "secret_scanning": { "status": "enabled" },
+    "secret_scanning_push_protection": { "status": "enabled" }
+  }
+}
+JSON
+
 # Workflows get read-only tokens unless they ask for more in their `permissions`
 # block. Every workflow in this repo declares exactly what it needs.
 echo "==> Restricting default workflow token to read-only"

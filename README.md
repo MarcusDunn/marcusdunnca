@@ -85,6 +85,21 @@ the two is how state gets confusing.
 
 ## Branch protection
 
+This repository is **public**. GitHub does not offer rulesets on private
+repositories below the Pro plan, and enforced branch protection was judged
+worth more than keeping the topology unpublished. Nothing here is a
+credential — CI authenticates with per-job OIDC tokens — so what is exposed is
+reconnaissance value (account ID, role and bucket names), not access.
+
+Two consequences follow from being public, both handled:
+
+- **Fork PRs cannot reach the plan role.** The OIDC subject for a PR is
+  `repo:MarcusDunn/marcusdunnca:pull_request` no matter which fork the branch
+  came from. GitHub withholds `id-token: write` from fork PRs, but the plan job
+  additionally refuses to run unless the PR head is this repository.
+- **Secret scanning with push protection is enabled**, so a recognised
+  credential is rejected at push time rather than after it is public.
+
 The ruleset on `main` has **no bypass actors**, including you:
 
 - All changes via pull request (0 required approvals — solo repo, and GitHub

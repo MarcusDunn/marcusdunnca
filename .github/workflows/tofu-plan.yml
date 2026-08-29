@@ -24,6 +24,15 @@ jobs:
     name: plan
     runs-on: ubuntu-latest
 
+    # This repo is public, so anyone can fork it and open a PR. GitHub already
+    # withholds `id-token: write` from fork PRs, which alone would stop them
+    # minting an OIDC token — but the OIDC subject for a PR is
+    # `repo:MarcusDunn/marcusdunnca:pull_request` regardless of which fork the
+    # branch came from, so that single control is the only thing standing
+    # between a fork and the plan role. Refuse fork PRs outright rather than
+    # depending on one GitHub-side behaviour never changing.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+
     strategy:
       fail-fast: false
       matrix:
