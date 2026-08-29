@@ -44,7 +44,7 @@ resource "aws_budgets_budget" "monthly_cost" {
     threshold                  = 1
     threshold_type             = "ABSOLUTE_VALUE"
     notification_type          = "ACTUAL"
-    subscriber_email_addresses = [var.cost_alert_email]
+    subscriber_email_addresses = var.cost_alert_emails
   }
 
   notification {
@@ -52,7 +52,7 @@ resource "aws_budgets_budget" "monthly_cost" {
     threshold                  = 100
     threshold_type             = "PERCENTAGE"
     notification_type          = "ACTUAL"
-    subscriber_email_addresses = [var.cost_alert_email]
+    subscriber_email_addresses = var.cost_alert_emails
   }
 
   notification {
@@ -60,7 +60,7 @@ resource "aws_budgets_budget" "monthly_cost" {
     threshold                  = 100
     threshold_type             = "PERCENTAGE"
     notification_type          = "FORECASTED"
-    subscriber_email_addresses = [var.cost_alert_email]
+    subscriber_email_addresses = var.cost_alert_emails
   }
 }
 
@@ -121,13 +121,24 @@ resource "aws_sns_topic_policy" "cost_alerts" {
   policy = data.aws_iam_policy_document.cost_alerts_topic.json
 }
 
-# AWS emails a confirmation link; alerts do not flow until it is clicked.
+# One subscription per address, deliberately more than one.
+#
+# A security alert channel should not depend on a mail-forwarding rule you
+# cannot monitor. aws-root@marcusdunn.ca is a Cloudflare-forwarded alias: if the
+# routing rule is missing, or the destination spam-filters it, the alert is lost
+# silently and you find out from the bill. Subscribing the destination mailbox
+# directly as well removes that single point of failure.
+#
+# AWS emails a confirmation link per address; alerts do not flow to an address
+# until it is clicked. Unconfirmed subscriptions are visible via
+# `aws sns get-topic-attributes` → SubscriptionsPending.
 resource "aws_sns_topic_subscription" "cost_alerts_email" {
   provider = aws.us_east_1
+  for_each = toset(var.cost_alert_emails)
 
   topic_arn = aws_sns_topic.cost_alerts.arn
   protocol  = "email"
-  endpoint  = var.cost_alert_email
+  endpoint  = each.value
 }
 
 resource "aws_ce_anomaly_subscription" "immediate" {
