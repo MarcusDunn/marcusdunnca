@@ -270,6 +270,11 @@ Not free:
 - **SNS email** — first 1,000 notifications per month are free; alerts here are
   rare by construction.
 
+The managed budget is **$1/month**, alerting at 80% actual, 100% actual, and on
+a forecast breach. That is deliberately just above the real floor: a genuinely
+zero-spend threshold false-alarms every month on a few cents of S3 and data
+events, which trains you to ignore it.
+
 Realistically pennies per month while idle. GuardDuty, AWS Config, and Security
 Hub are deliberately **not** enabled. Set `state_bucket_use_cmk = true` in
 `bootstrap/` to encrypt state with a customer-managed KMS key (~$1/month) once

@@ -117,9 +117,17 @@ variable "account_alias" {
 }
 
 variable "monthly_budget_usd" {
-  description = "Monthly cost budget in USD. Alerts fire at $1 actual, at the limit, and on a forecast breach."
+  description = <<-EOT
+    Monthly cost budget in USD. Alerts fire at 80% actual, 100% actual, and on a
+    forecast breach of 100%.
+
+    $1 is chosen to sit just above the real floor. This account costs a few cents
+    a month at rest (S3 storage and CloudTrail data events), so a genuinely
+    zero-spend threshold produces a false alarm every month and trains you to
+    ignore it. A dollar of unexplained spend here is still a real signal.
+  EOT
   type        = string
-  default     = "5"
+  default     = "1"
 }
 
 variable "cost_alert_emails" {
