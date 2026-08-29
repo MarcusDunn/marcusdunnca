@@ -174,6 +174,101 @@ locals {
     "s3:ListBucket",
   ]
 
+  # Shared Deny groups. The guardrail policy and the permissions boundary both
+  # render from these.
+  #
+  # They were previously hand-copied, and the copies drifted: the boundary
+  # silently omitted account control and half the destruction list, so a role
+  # wearing it could close the account, hijack the console alias, silence every
+  # spend alert, and bypass Object Lock. A boundary that permits more than the
+  # guardrail is worse than none — it reads as a ceiling and is a hatch.
+  state_audit_destruction_actions = [
+    "s3:DeleteBucket",
+    "s3:DeleteObjectVersion",
+    "s3:PutBucketVersioning",
+    "s3:PutBucketPolicy",
+    "s3:DeleteBucketPolicy",
+    "s3:PutEncryptionConfiguration",
+    "s3:PutBucketPublicAccessBlock",
+    "s3:PutLifecycleConfiguration",
+    "s3:PutBucketObjectLockConfiguration",
+    # Without these, Object Lock GOVERNANCE mode is decorative.
+    "s3:BypassGovernanceRetention",
+    "s3:PutObjectRetention",
+    "s3:PutObjectLegalHold",
+  ]
+
+  audit_silencing_actions = [
+    "cloudtrail:StopLogging",
+    "cloudtrail:DeleteTrail",
+    "cloudtrail:UpdateTrail",
+    "cloudtrail:PutEventSelectors",
+    "cloudtrail:DeleteEventDataStore",
+    "cloudtrail:UpdateEventDataStore",
+  ]
+
+  key_destruction_actions = [
+    "kms:ScheduleKeyDeletion",
+    "kms:DisableKey",
+    "kms:DisableKeyRotation",
+    "kms:PutKeyPolicy",
+    "kms:CreateGrant",
+    "kms:RetireGrant",
+    "kms:RevokeGrant",
+  ]
+
+  # Account-level control, plus the spend tripwires. budgets:* and ce:* are
+  # exempt from the region lock, and silencing the alarm is the first move after
+  # starting to burn money.
+  account_control_actions = [
+    "sso:*",
+    "sso-directory:*",
+    "identitystore:*",
+    "organizations:*",
+    "budgets:ModifyBudget",
+    "budgets:UpdateBudget",
+    "budgets:DeleteBudget",
+    "budgets:DeleteBudgetAction",
+    "budgets:DeleteNotification",
+    "budgets:DeleteSubscriber",
+    "budgets:UpdateSubscriber",
+    "budgets:UpdateNotification",
+    "ce:DeleteAnomalyMonitor",
+    "ce:DeleteAnomalySubscription",
+    "ce:UpdateAnomalyMonitor",
+    "ce:UpdateAnomalySubscription",
+    "ce:CreateAnomalySubscription",
+    "sns:DeleteTopic",
+    "sns:RemovePermission",
+    "sns:SetTopicAttributes",
+    # A FilterPolicy that drops everything leaves the subscription looking
+    # healthy while delivering nothing.
+    "sns:SetSubscriptionAttributes",
+    "sns:Unsubscribe",
+    "account:CloseAccount",
+    "account:PutAlternateContact",
+    "account:DeleteAlternateContact",
+    "iam:DeleteAccountPasswordPolicy",
+    "iam:UpdateAccountPasswordPolicy",
+    "iam:CreateAccountAlias",
+    "iam:DeleteAccountAlias",
+    "s3:PutAccountPublicAccessBlock",
+    "ec2:DisableEbsEncryptionByDefault",
+    "access-analyzer:DeleteAnalyzer",
+  ]
+
+  # Taking over a pre-existing unbounded role is how a boundary-wearing
+  # principal escapes: rewrite that role's trust policy to trust itself, assume
+  # it, and the boundary no longer applies. DenyRoleCreationWithoutThisBoundary
+  # only covers roles being created.
+  role_takeover_actions = [
+    "iam:UpdateAssumeRolePolicy",
+    "iam:AttachRolePolicy",
+    "iam:PutRolePolicy",
+    "iam:DetachRolePolicy",
+    "iam:DeleteRolePolicy",
+  ]
+
   iam_mutating_actions = [
     "iam:Create*",
     "iam:Delete*",
@@ -317,19 +412,6 @@ data "aws_iam_policy_document" "ci_guardrails" {
     resources = ["*"]
   }
 
-  # Account aliases are a GLOBAL, first-come namespace, and iam:* is exempt from
-  # the region lock. Deleting the alias frees `marcusdunnca` for anyone to claim,
-  # turning the bookmarked console sign-in URL into an attacker-controlled page
-  # that this account can never reclaim. The alias is set once, in bootstrap.
-  statement {
-    sid    = "DenyAccountAliasHijack"
-    effect = "Deny"
-    actions = [
-      "iam:CreateAccountAlias",
-      "iam:DeleteAccountAlias",
-    ]
-    resources = ["*"]
-  }
 
   # State is the map of the account and its version history is the record of
   # every change. Neither may be destroyed or re-encrypted under a key CI holds.
@@ -338,29 +420,25 @@ data "aws_iam_policy_document" "ci_guardrails" {
   # destruction blocked merely by absence from the allowlist. One careless
   # future PR adding s3:Delete* would have silently re-opened it.
   statement {
-    sid    = "DenyStateAndAuditDestruction"
-    effect = "Deny"
-    actions = [
-      "s3:DeleteBucket",
-      "s3:DeleteObjectVersion",
-      "s3:PutBucketVersioning",
-      "s3:PutBucketPolicy",
-      "s3:DeleteBucketPolicy",
-      "s3:PutEncryptionConfiguration",
-      "s3:PutBucketPublicAccessBlock",
-      "s3:PutLifecycleConfiguration",
-      "s3:PutBucketObjectLockConfiguration",
-      # Without this, Object Lock GOVERNANCE mode is decorative for CI.
-      "s3:BypassGovernanceRetention",
-      "s3:PutObjectRetention",
-      "s3:PutObjectLegalHold",
-    ]
+    sid     = "DenyStateAndAuditDestruction"
+    effect  = "Deny"
+    actions = local.state_audit_destruction_actions
     resources = [
       local.state_bucket_arn,
       "${local.state_bucket_arn}/*",
       local.trail_bucket_arn,
       "${local.trail_bucket_arn}/*",
     ]
+  }
+
+  # DeleteObject is granted on the state bucket for the .tflock key, so it can
+  # only be denied on the trail bucket. Previously the audit log was protected
+  # from DeleteObjectVersion but not from a plain delete marker.
+  statement {
+    sid       = "DenyDeletingAuditLogs"
+    effect    = "Deny"
+    actions   = ["s3:DeleteObject"]
+    resources = ["${local.trail_bucket_arn}/*"]
   }
 
   # Defence in depth behind the key-scoped grant above: even if the apply
@@ -376,15 +454,9 @@ data "aws_iam_policy_document" "ci_guardrails" {
   }
 
   statement {
-    sid    = "DenySilencingTheAuditTrail"
-    effect = "Deny"
-    actions = [
-      "cloudtrail:StopLogging",
-      "cloudtrail:DeleteTrail",
-      "cloudtrail:UpdateTrail",
-      "cloudtrail:PutEventSelectors",
-      "cloudtrail:DeleteEventDataStore",
-    ]
+    sid       = "DenySilencingTheAuditTrail"
+    effect    = "Deny"
+    actions   = local.audit_silencing_actions
     resources = ["*"]
   }
 
@@ -392,51 +464,16 @@ data "aws_iam_policy_document" "ci_guardrails" {
   # to hold data hostage, and a policy that cannot be rewritten cannot be
   # narrowed to an attacker-held principal.
   statement {
-    sid    = "DenyKeyDestruction"
-    effect = "Deny"
-    actions = [
-      "kms:ScheduleKeyDeletion",
-      "kms:DisableKey",
-      "kms:DisableKeyRotation",
-      "kms:PutKeyPolicy",
-      "kms:CreateGrant",
-      "kms:RetireGrant",
-      "kms:RevokeGrant",
-    ]
+    sid       = "DenyKeyDestruction"
+    effect    = "Deny"
+    actions   = local.key_destruction_actions
     resources = ["*"]
   }
 
   statement {
-    sid    = "DenyAccountAndIdentityCenterControl"
-    effect = "Deny"
-    actions = [
-      "sso:*",
-      "sso-directory:*",
-      "identitystore:*",
-      "organizations:*",
-      # Spend tripwires. budgets:* and ce:* are exempt from the region lock, and
-      # an attacker's first move after starting to burn money is to silence the
-      # thing that would tell you.
-      "budgets:ModifyBudget",
-      "budgets:DeleteBudget",
-      "budgets:DeleteBudgetAction",
-      "ce:DeleteAnomalyMonitor",
-      "ce:DeleteAnomalySubscription",
-      "ce:UpdateAnomalyMonitor",
-      "ce:UpdateAnomalySubscription",
-      "sns:DeleteTopic",
-      "sns:RemovePermission",
-      "sns:SetTopicAttributes",
-      "sns:Unsubscribe",
-      "account:CloseAccount",
-      "account:PutAlternateContact",
-      "account:DeleteAlternateContact",
-      "iam:DeleteAccountPasswordPolicy",
-      "iam:UpdateAccountPasswordPolicy",
-      "s3:PutAccountPublicAccessBlock",
-      "ec2:DisableEbsEncryptionByDefault",
-      "access-analyzer:DeleteAnalyzer",
-    ]
+    sid       = "DenyAccountAndIdentityCenterControl"
+    effect    = "Deny"
+    actions   = local.account_control_actions
     resources = ["*"]
   }
 }
@@ -482,19 +519,35 @@ data "aws_iam_policy_document" "plan_permissions" {
     resources = [local.state_bucket_arn, local.trail_bucket_arn]
   }
 
+  # IAM reads scoped to the four objects this repo manages. Previously these
+  # were Resource "*", so a compromised plan job could enumerate every policy
+  # in the account — well beyond "reads needed to refresh what this repo owns".
+  statement {
+    sid    = "ReadManagedIAMObjects"
+    effect = "Allow"
+    actions = [
+      "iam:GetRole",
+      "iam:GetRolePolicy",
+      "iam:ListRolePolicies",
+      "iam:ListAttachedRolePolicies",
+      "iam:ListRoleTags",
+      "iam:GetPolicy",
+      "iam:GetPolicyVersion",
+      "iam:ListPolicyVersions",
+    ]
+    resources = [
+      local.plan_role_arn,
+      local.apply_role_arn,
+      local.boundary_arn,
+      local.guardrail_arn,
+    ]
+  }
+
   statement {
     sid    = "DescribeManagedResources"
     effect = "Allow"
     actions = [
       "sts:GetCallerIdentity",
-      "iam:GetRole",
-      "iam:GetRolePolicy",
-      "iam:GetPolicy",
-      "iam:GetPolicyVersion",
-      "iam:ListRolePolicies",
-      "iam:ListAttachedRolePolicies",
-      "iam:ListRoleTags",
-      "iam:ListPolicyVersions",
       "iam:GetOpenIDConnectProvider",
       "iam:ListOpenIDConnectProviders",
       "iam:ListAccountAliases",
@@ -591,12 +644,22 @@ data "aws_iam_policy_document" "apply_permissions" {
       "s3:GetObject",
       "s3:GetObjectVersion",
       "s3:PutObject",
-      "s3:DeleteObject",
     ]
     resources = [
       "${local.state_bucket_arn}/infra/terraform.tfstate",
       "${local.state_bucket_arn}/infra/terraform.tfstate.tflock",
     ]
+  }
+
+  # DeleteObject is needed ONLY to release the state lock. Granting it on the
+  # state object too let CI put a delete marker over live infra state — a free
+  # disruption primitive with no operational purpose. Recoverable, since prior
+  # versions are Object-Lock retained, but pointless to allow.
+  statement {
+    sid       = "ReleaseStateLock"
+    effect    = "Allow"
+    actions   = ["s3:DeleteObject"]
+    resources = ["${local.state_bucket_arn}/infra/terraform.tfstate.tflock"]
   }
 
   statement {
@@ -751,26 +814,46 @@ data "aws_iam_policy_document" "ci_permissions_boundary" {
     }
   }
 
+  # Rendered from the same lists as the guardrail. "*" rather than the bucket
+  # ARNs: a role wearing this boundary has no legitimate reason to destroy
+  # state, logs, or keys anywhere in the account.
   statement {
-    sid    = "DenyStateAndAuditDestruction"
-    effect = "Deny"
-    actions = [
-      "s3:DeleteBucket",
-      "s3:DeleteObjectVersion",
-      "s3:PutBucketVersioning",
-      "s3:PutBucketPolicy",
-      "s3:DeleteBucketPolicy",
-      "s3:PutEncryptionConfiguration",
-      "cloudtrail:StopLogging",
-      "cloudtrail:DeleteTrail",
-      "cloudtrail:UpdateTrail",
-      "cloudtrail:PutEventSelectors",
-      "kms:ScheduleKeyDeletion",
-      "kms:DisableKey",
-      "kms:PutKeyPolicy",
-    ]
-    # "*" rather than the two bucket ARNs: a role wearing this boundary has no
-    # legitimate reason to destroy state, logs, or keys anywhere in the account.
+    sid       = "DenyStateAndAuditDestruction"
+    effect    = "Deny"
+    actions   = local.state_audit_destruction_actions
+    resources = ["*"]
+  }
+
+  statement {
+    sid       = "DenySilencingTheAuditTrail"
+    effect    = "Deny"
+    actions   = local.audit_silencing_actions
+    resources = ["*"]
+  }
+
+  statement {
+    sid       = "DenyKeyDestruction"
+    effect    = "Deny"
+    actions   = local.key_destruction_actions
+    resources = ["*"]
+  }
+
+  # This whole group was absent. Most starkly, iam:DeleteAccountAlias was
+  # permitted — the boundary allowed the exact permanent console-URL hijack the
+  # guardrail spends a paragraph explaining.
+  statement {
+    sid       = "DenyAccountAndIdentityCenterControl"
+    effect    = "Deny"
+    actions   = local.account_control_actions
+    resources = ["*"]
+  }
+
+  # Closes the escape where a boundary-wearing role rewrites a pre-existing
+  # unbounded role's trust policy to trust itself, assumes it, and steps out.
+  statement {
+    sid       = "DenyRoleTakeover"
+    effect    = "Deny"
+    actions   = local.role_takeover_actions
     resources = ["*"]
   }
 
