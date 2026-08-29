@@ -209,7 +209,14 @@ jobs:
             --query 'Attributes.SubscriptionsPending' --output text)
           echo "confirmed=$confirmed pending=$pending"
           if [ "$confirmed" = "0" ]; then
-            echo "::warning::Cost-anomaly alerting is DEAD — $confirmed confirmed, $pending pending."
+            echo "::error::Cost-anomaly alerting is DEAD — 0 confirmed, $pending pending."
             echo "Anomalies publish to a topic that delivers to nobody. Click the"
             echo "confirmation links in the most recent AWS emails."
+            exit 1
+          fi
+          if [ "$pending" != "0" ]; then
+            echo "::warning::$pending cost-alert subscription(s) unconfirmed (of $((confirmed + pending)))."
+            echo "Alerts still reach the $confirmed confirmed address(es), so this is"
+            echo "redundancy loss rather than an outage. Editing cost_alert_emails"
+            echo "recreates subscriptions and resets them to unconfirmed."
           fi
