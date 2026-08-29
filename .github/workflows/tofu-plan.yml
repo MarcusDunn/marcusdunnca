@@ -89,7 +89,7 @@ jobs:
         working-directory: ${{ matrix.module }}
 
       - name: Init
-        run: tofu init -input=false -backend-config=backend.hcl
+        run: tofu init -input=false -lockfile=readonly -backend-config=backend.hcl
         working-directory: ${{ matrix.module }}
 
       - name: Validate
@@ -109,9 +109,14 @@ jobs:
           set -e
           echo "exitcode=$code" >> "$GITHUB_OUTPUT"
           cat plan.txt
-          if [ "$code" -eq 1 ]; then
-            exit 1
-          fi
+          # Only 0 (no changes) and 2 (changes pending) are successes. Anything
+          # else — 1, but also 127 (binary missing), 137 (OOM), 139, 143 — must
+          # fail. Testing only for 1 left those green and the required check
+          # passing on a plan that never ran.
+          case "$code" in
+            0|2) ;;
+            *) exit 1 ;;
+          esac
 
       - name: Publish plan to job summary
         if: always() && steps.plan.outcome != 'skipped'

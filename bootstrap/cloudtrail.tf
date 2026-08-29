@@ -158,10 +158,22 @@ data "aws_iam_policy_document" "trail_bucket" {
     }
   }
 
-  # CloudTrail itself is a service principal in this account, so restricting to
-  # this account's principals does not lock the service out.
+  # Restrict to this account's principals — but ONLY for IAM principals.
+  #
+  # The earlier version of this statement had just the aws:PrincipalAccount
+  # condition, copied from the state bucket where it is harmless. On THIS bucket
+  # it broke CloudTrail delivery for ~105 minutes: aws:PrincipalAccount is not
+  # populated for AWS service principals, and StringNotEquals against a missing
+  # key evaluates TRUE, so the deny matched cloudtrail.amazonaws.com's own
+  # PutObject. The trail kept reporting IsLogging: true the whole time, with
+  # LatestDeliveryError: AccessDenied.
+  #
+  # aws:PrincipalIsAWSService is false for IAM principals and true for service
+  # principals, so requiring it to be false confines this deny to the case it
+  # was written for. CloudTrail's writes are still constrained — by the
+  # aws:SourceArn condition on AllowCloudTrailWrite above.
   statement {
-    sid    = "DenyPrincipalsOutsideThisAccount"
+    sid    = "DenyIAMPrincipalsOutsideThisAccount"
     effect = "Deny"
 
     principals {
@@ -176,6 +188,12 @@ data "aws_iam_policy_document" "trail_bucket" {
       test     = "StringNotEquals"
       variable = "aws:PrincipalAccount"
       values   = [local.account_id]
+    }
+
+    condition {
+      test     = "Bool"
+      variable = "aws:PrincipalIsAWSService"
+      values   = ["false"]
     }
   }
 }

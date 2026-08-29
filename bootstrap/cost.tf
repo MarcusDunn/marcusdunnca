@@ -111,6 +111,41 @@ data "aws_iam_policy_document" "cost_alerts_topic" {
 
     actions   = ["SNS:Publish"]
     resources = [aws_sns_topic.cost_alerts.arn]
+
+    # Confused-deputy protection. Without these, ANY account could point a Cost
+    # Explorer anomaly subscription at this topic ARN — CE only checks that the
+    # topic policy permits costalerts.amazonaws.com. A stranger's anomalies
+    # would then deliver here, which is alert fatigue aimed at the one signal
+    # that catches denial-of-wallet.
+    #
+    # The CloudTrail bucket policy in cloudtrail.tf got this right; this file
+    # did not. Same pattern, applied consistently.
+    condition {
+      test     = "StringEquals"
+      variable = "aws:SourceAccount"
+      values   = [local.account_id]
+    }
+
+    condition {
+      test     = "ArnLike"
+      variable = "aws:SourceArn"
+      values   = ["arn:${local.partition}:ce::${local.account_id}:anomalysubscription/*"]
+    }
+  }
+
+  # Replacing the topic policy drops SNS's implicit owner statement. Restore it
+  # explicitly, or future integrations fail with a confusing AccessDenied.
+  statement {
+    sid    = "AllowAccountOwnerFullControl"
+    effect = "Allow"
+
+    principals {
+      type        = "AWS"
+      identifiers = [local.account_id]
+    }
+
+    actions   = ["SNS:GetTopicAttributes", "SNS:SetTopicAttributes", "SNS:Subscribe", "SNS:Publish", "SNS:ListSubscriptionsByTopic"]
+    resources = [aws_sns_topic.cost_alerts.arn]
   }
 }
 

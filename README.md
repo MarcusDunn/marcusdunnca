@@ -191,7 +191,7 @@ hashes in `.terraform.lock.hcl`, nixpkgs in `flake.lock`.
 | --- | --- | --- |
 | GitHub Actions SHAs | Dependabot, 14-day cooldown | auto-merged if non-major |
 | Provider constraints | Dependabot, 14-day cooldown | auto-merged if non-major |
-| `.terraform.lock.hcl`, `flake.lock` | `update-locks.yml`, weekly | manual |
+| `.terraform.lock.hcl`, `flake.lock` |  Dependabot `nix` ecosystem, 14-day cooldown | manual |
 
 The 14-day cooldown means a release must survive two weeks in public before it
 is proposed here — long enough for a malicious or broken publish to be caught.

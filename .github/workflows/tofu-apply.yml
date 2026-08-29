@@ -64,7 +64,7 @@ jobs:
       # Only infra/ is applied by CI. bootstrap/ owns these very credentials and
       # is applied by a human from a workstation.
       - name: Init
-        run: tofu init -input=false -backend-config=backend.hcl
+        run: tofu init -input=false -lockfile=readonly -backend-config=backend.hcl
         working-directory: infra
 
       - name: Apply

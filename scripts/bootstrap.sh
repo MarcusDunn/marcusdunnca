@@ -104,7 +104,7 @@ else
   # Make sure the backend block comes back even if apply fails.
   trap 'mv -f "$BOOTSTRAP_DIR/backend.tf.disabled" "$BOOTSTRAP_DIR/backend.tf" 2>/dev/null || true' EXIT
 
-  tofu init -input=false
+  tofu init -input=false -lockfile=readonly
   tofu apply -input=false
 
   echo "==> Generating backend configuration"
@@ -115,7 +115,7 @@ else
   trap - EXIT
 
   echo "==> Migrating bootstrap state into s3://${STATE_BUCKET}"
-  tofu init -input=false -migrate-state -force-copy -backend-config=backend.hcl
+  tofu init -input=false -lockfile=readonly -migrate-state -force-copy -backend-config=backend.hcl
 
   echo "==> Removing local state copies (now authoritative in S3)"
   rm -f terraform.tfstate terraform.tfstate.backup
