@@ -234,8 +234,23 @@ resource "aws_cloudtrail" "management" {
     }
   }
 
+  # STATE BUCKET ONLY — the trail bucket is deliberately excluded.
+  #
+  # Including it created a feedback loop: CloudTrail delivers log files to this
+  # bucket with PutObject, that PutObject is itself an S3 data event, so it gets
+  # logged, which produces another log file, and so on. Log files were observed
+  # whose entire contents were PutObject events on the trail bucket. Data events
+  # are billed per event ($0.10/100k) on top of the S3 storage and PUT requests,
+  # so this was a self-sustaining cost leak as well as pure noise polluting the
+  # audit record.
+  #
+  # Nothing of value is lost. The trail bucket is write-once by CloudTrail;
+  # deletion is explicitly denied to both CI roles, it is versioned, and log file
+  # validation makes tampering detectable. The state bucket is where the real
+  # signal is — that is where state poisoning or exfiltration would appear, and
+  # its object operations are a handful per CI run.
   advanced_event_selector {
-    name = "State and audit bucket object events"
+    name = "State bucket object events"
 
     field_selector {
       field  = "eventCategory"
@@ -248,11 +263,8 @@ resource "aws_cloudtrail" "management" {
     }
 
     field_selector {
-      field = "resources.ARN"
-      starts_with = [
-        "${aws_s3_bucket.state.arn}/",
-        "${aws_s3_bucket.trail.arn}/",
-      ]
+      field       = "resources.ARN"
+      starts_with = ["${aws_s3_bucket.state.arn}/"]
     }
   }
 
