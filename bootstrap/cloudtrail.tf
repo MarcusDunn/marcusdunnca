@@ -136,6 +136,48 @@ data "aws_iam_policy_document" "trail_bucket" {
       values   = ["false"]
     }
   }
+
+  # Mirrors the state bucket's policy. The audit log deserves at least the
+  # protection the state file gets; the asymmetry here was an oversight.
+  statement {
+    sid    = "DenyOutdatedTLS"
+    effect = "Deny"
+
+    principals {
+      type        = "*"
+      identifiers = ["*"]
+    }
+
+    actions   = ["s3:*"]
+    resources = [aws_s3_bucket.trail.arn, "${aws_s3_bucket.trail.arn}/*"]
+
+    condition {
+      test     = "NumericLessThan"
+      variable = "s3:TlsVersion"
+      values   = ["1.2"]
+    }
+  }
+
+  # CloudTrail itself is a service principal in this account, so restricting to
+  # this account's principals does not lock the service out.
+  statement {
+    sid    = "DenyPrincipalsOutsideThisAccount"
+    effect = "Deny"
+
+    principals {
+      type        = "*"
+      identifiers = ["*"]
+    }
+
+    actions   = ["s3:*"]
+    resources = [aws_s3_bucket.trail.arn, "${aws_s3_bucket.trail.arn}/*"]
+
+    condition {
+      test     = "StringNotEquals"
+      variable = "aws:PrincipalAccount"
+      values   = [local.account_id]
+    }
+  }
 }
 
 resource "aws_s3_bucket_policy" "trail" {

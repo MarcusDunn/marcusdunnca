@@ -86,6 +86,34 @@ resource "aws_s3_bucket_ownership_controls" "state" {
   }
 }
 
+# Object Lock makes version immutability a property of the BUCKET rather than
+# something resting solely on an identity policy. Without it, "state versions
+# cannot be deleted" held only because the guardrail says so — one policy edit
+# away from being untrue.
+#
+# GOVERNANCE rather than COMPLIANCE deliberately: COMPLIANCE cannot be overridden
+# by anyone including the account root, so a fat-fingered object could never be
+# cleaned up. GOVERNANCE can be bypassed only with s3:BypassGovernanceRetention,
+# which the guardrail denies to both CI roles — so it binds CI absolutely while
+# leaving a human admin an escape hatch.
+#
+# 7 days sits comfortably under the 90-day noncurrent expiry below, so the
+# lifecycle rule can still do its job. Deleting a locked object version is not
+# required for normal operation: OpenTofu releases its lock by writing a delete
+# marker, which Object Lock permits.
+resource "aws_s3_bucket_object_lock_configuration" "state" {
+  bucket = aws_s3_bucket.state.id
+
+  rule {
+    default_retention {
+      mode = "GOVERNANCE"
+      days = 7
+    }
+  }
+
+  depends_on = [aws_s3_bucket_versioning.state]
+}
+
 resource "aws_s3_bucket_lifecycle_configuration" "state" {
   bucket = aws_s3_bucket.state.id
 

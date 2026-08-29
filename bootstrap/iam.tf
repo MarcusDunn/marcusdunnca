@@ -121,6 +121,18 @@ locals {
     "snowdevicemanagement:*",
     "aws-marketplace:Subscribe",
     "aws-marketplace:AcceptAgreementApprovalRequest",
+    # CloudFront and Route53 are exempt from the region lock (they are global),
+    # and are the two most likely first additions for a personal website — so
+    # they are exactly where the region lock provides no cost containment.
+    # CloudFront data-transfer-out is genuinely unbounded spend.
+    "cloudfront:CreateDistribution",
+    "cloudfront:CreateDistributionWithTags",
+    "cloudfront:UpdateDistribution",
+    "cloudfront:CreateStreamingDistribution",
+    "route53:CreateHostedZone",
+    "route53domains:RegisterDomain",
+    "route53domains:RenewDomain",
+    "route53domains:TransferDomain",
   ]
 
   long_lived_credential_actions = [
@@ -338,6 +350,10 @@ data "aws_iam_policy_document" "ci_guardrails" {
       "s3:PutBucketPublicAccessBlock",
       "s3:PutLifecycleConfiguration",
       "s3:PutBucketObjectLockConfiguration",
+      # Without this, Object Lock GOVERNANCE mode is decorative for CI.
+      "s3:BypassGovernanceRetention",
+      "s3:PutObjectRetention",
+      "s3:PutObjectLegalHold",
     ]
     resources = [
       local.state_bucket_arn,
@@ -398,6 +414,20 @@ data "aws_iam_policy_document" "ci_guardrails" {
       "sso-directory:*",
       "identitystore:*",
       "organizations:*",
+      # Spend tripwires. budgets:* and ce:* are exempt from the region lock, and
+      # an attacker's first move after starting to burn money is to silence the
+      # thing that would tell you.
+      "budgets:ModifyBudget",
+      "budgets:DeleteBudget",
+      "budgets:DeleteBudgetAction",
+      "ce:DeleteAnomalyMonitor",
+      "ce:DeleteAnomalySubscription",
+      "ce:UpdateAnomalyMonitor",
+      "ce:UpdateAnomalySubscription",
+      "sns:DeleteTopic",
+      "sns:RemovePermission",
+      "sns:SetTopicAttributes",
+      "sns:Unsubscribe",
       "account:CloseAccount",
       "account:PutAlternateContact",
       "account:DeleteAlternateContact",
