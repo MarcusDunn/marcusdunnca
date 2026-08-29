@@ -1,43 +1,167 @@
 # ---------------------------------------------------------------------------
 # CI identities.
 #
-# Two roles, deliberately asymmetric:
+# Threat model: assume the CI pipeline is compromised — an attacker has write
+# access to the repository and can therefore modify workflows, open and merge
+# pull requests, and reach both roles. The goal is not that nothing happens; it
+# is that the blast radius is small, bounded, and fully recorded.
 #
-#   plan  — read-only, assumable by any pull_request job. Runs untrusted-ish
-#           branch code, so it can observe the account but change nothing.
-#   apply — privileged, assumable ONLY by a job declaring the protected
-#           `production` GitHub Environment. That environment is pinned to main,
-#           so the trust policy itself enforces "apply only from main".
+# Consequences of that assumption, each implemented below:
 #
-# ARNs below are built from locals rather than resource references. The boundary
-# policy names the roles, the roles' guardrails name the boundary — referencing
-# the resources directly would be a dependency cycle. Names are deterministic,
-# so string-building is safe here.
+#   * Neither role uses an AWS managed policy. AdministratorAccess and
+#     ReadOnlyAccess are both far wider than this account needs, and AWS can
+#     widen them further without notice. Every permission is enumerated.
+#   * The apply role holds NO IAM role or policy write permission whatsoever.
+#     It cannot create a role, attach a policy, or edit its own grants, so
+#     privilege escalation has no first step.
+#   * Everything is region-locked. The standard denial-of-wallet play is to
+#     launch compute in every region simultaneously; here all but two regions
+#     reject the call outright.
+#   * Expensive service families are denied explicitly, on top of not being
+#     allowlisted, so that carelessly widening the allowlist later cannot
+#     silently re-enable them.
+#   * State and audit history are append-mostly: object versions cannot be
+#     deleted and logging cannot be stopped, so an attacker cannot encrypt or
+#     erase the record of what they did.
+#
+# Expanding scope is meant to be a deliberate, reviewable act: add the specific
+# actions to the allowlist below, in a pull request.
 # ---------------------------------------------------------------------------
 
 locals {
   plan_role_name  = "${var.project}-gha-plan"
   apply_role_name = "${var.project}-gha-apply"
   boundary_name   = "${var.project}-ci-permissions-boundary"
+  guardrail_name  = "${var.project}-ci-guardrails"
 
   iam_root = "arn:${local.partition}:iam::${local.account_id}"
 
   plan_role_arn  = "${local.iam_root}:role/${local.plan_role_name}"
   apply_role_arn = "${local.iam_root}:role/${local.apply_role_name}"
   boundary_arn   = "${local.iam_root}:policy/${local.boundary_name}"
+  guardrail_arn  = "${local.iam_root}:policy/${local.guardrail_name}"
   oidc_arn       = "${local.iam_root}:oidc-provider/token.actions.githubusercontent.com"
 
-  # The four things CI must never be able to touch: its own two identities, the
-  # boundary that constrains everything it creates, and the trust anchor itself.
+  # The things CI must never be able to touch: its own identities, the policies
+  # that constrain it, and the trust anchor.
   ci_control_plane_arns = [
     local.plan_role_arn,
     local.apply_role_arn,
     local.boundary_arn,
+    local.guardrail_arn,
     local.oidc_arn,
   ]
 
-  # Mutating IAM verbs. Used instead of a blunt `iam:*` deny so that read calls
-  # (GetRole, ListAttachedRolePolicies) still work during plan/refresh.
+  state_bucket_arn = aws_s3_bucket.state.arn
+  trail_bucket_arn = aws_s3_bucket.trail.arn
+
+  # Immutable-form subject. See var.github_owner_id.
+  github_sub_prefix = "repo:${var.github_owner}@${var.github_owner_id}/${var.github_repo}@${var.github_repo_id}"
+
+  # Services whose API calls are not region-scoped, and so must be exempt from
+  # the region lock or they would break entirely.
+  global_service_actions = [
+    "iam:*",
+    "sts:*",
+    "account:*",
+    "organizations:*",
+    "route53:*",
+    "cloudfront:*",
+    "support:*",
+    "health:*",
+    "budgets:*",
+    "ce:*",
+    "s3:ListAllMyBuckets",
+    "s3:GetAccountPublicAccessBlock",
+    "s3:PutAccountPublicAccessBlock",
+  ]
+
+  # Service families that can generate serious spend very quickly. None are
+  # allowlisted, so these denies are redundant today — they exist so that a
+  # future careless widening of the allowlist cannot quietly re-enable them.
+  expensive_service_actions = [
+    "ec2:RunInstances",
+    "ec2:StartInstances",
+    "ec2:RequestSpotInstances",
+    "ec2:RequestSpotFleet",
+    "ec2:CreateFleet",
+    "ec2:CreateCapacityReservation",
+    "ec2:PurchaseReservedInstancesOffering",
+    "ec2:PurchaseCapacityBlock",
+    "ec2:PurchaseHostReservation",
+    "ec2:AllocateHosts",
+    "savingsplans:*",
+    "sagemaker:*",
+    "bedrock:*",
+    "emr:*",
+    "elasticmapreduce:*",
+    "redshift:*",
+    "rds:*",
+    "elasticache:*",
+    "es:*",
+    "opensearch:*",
+    "eks:*",
+    "ecs:*",
+    "batch:*",
+    "lightsail:*",
+    "workspaces:*",
+    "appstream:*",
+    "braket:*",
+    "quicksight:*",
+    "glue:*",
+    "kinesis:*",
+    "kinesisanalytics:*",
+    "mediaconvert:*",
+    "medialive:*",
+    "mediapackage:*",
+    "datapipeline:*",
+    "dms:*",
+    "outposts:*",
+    "snowball:*",
+    "snowdevicemanagement:*",
+    "aws-marketplace:Subscribe",
+    "aws-marketplace:AcceptAgreementApprovalRequest",
+  ]
+
+  long_lived_credential_actions = [
+    "iam:CreateUser",
+    "iam:CreateAccessKey",
+    "iam:CreateLoginProfile",
+    "iam:UpdateLoginProfile",
+    "iam:CreateServiceSpecificCredential",
+    "iam:UploadSSHPublicKey",
+    "iam:UploadSigningCertificate",
+  ]
+
+  # The AWS provider refreshes a bucket by reading every sub-resource, whether
+  # or not this configuration sets it. All are read-only metadata calls — none
+  # return object contents, so this does not widen data exposure.
+  s3_bucket_read_actions = [
+    "s3:GetBucketAcl",
+    "s3:GetBucketCORS",
+    "s3:GetBucketLocation",
+    "s3:GetBucketLogging",
+    "s3:GetBucketNotification",
+    "s3:GetBucketObjectLockConfiguration",
+    "s3:GetBucketOwnershipControls",
+    "s3:GetBucketPolicy",
+    "s3:GetBucketPolicyStatus",
+    "s3:GetBucketPublicAccessBlock",
+    "s3:GetBucketRequestPayment",
+    "s3:GetBucketTagging",
+    "s3:GetBucketVersioning",
+    "s3:GetBucketWebsite",
+    "s3:GetAccelerateConfiguration",
+    "s3:GetAnalyticsConfiguration",
+    "s3:GetEncryptionConfiguration",
+    "s3:GetIntelligentTieringConfiguration",
+    "s3:GetInventoryConfiguration",
+    "s3:GetLifecycleConfiguration",
+    "s3:GetMetricsConfiguration",
+    "s3:GetReplicationConfiguration",
+    "s3:ListBucket",
+  ]
+
   iam_mutating_actions = [
     "iam:Create*",
     "iam:Delete*",
@@ -51,20 +175,6 @@ locals {
     "iam:Tag*",
     "iam:Untag*",
   ]
-
-  # Credential types that outlive a CI job. Creating any of these would defeat
-  # the entire point of OIDC federation.
-  long_lived_credential_actions = [
-    "iam:CreateUser",
-    "iam:CreateAccessKey",
-    "iam:CreateLoginProfile",
-    "iam:UpdateLoginProfile",
-    "iam:CreateServiceSpecificCredential",
-    "iam:UploadSSHPublicKey",
-    "iam:UploadSigningCertificate",
-  ]
-
-  github_sub_prefix = "repo:${var.github_owner}/${var.github_repo}"
 }
 
 # ---------------------------------------------------------------------------
@@ -87,8 +197,9 @@ data "aws_iam_policy_document" "plan_assume_role" {
       values   = ["sts.amazonaws.com"]
     }
 
-    # PR tokens carry exactly this sub — no branch component, which is fine
-    # because this role cannot change anything.
+    # Note this subject is identical for a pull request opened from a fork —
+    # GitHub does not distinguish them here. That is precisely why this role is
+    # read-only and cannot read application data.
     condition {
       test     = "StringEquals"
       variable = "token.actions.githubusercontent.com:sub"
@@ -113,10 +224,6 @@ data "aws_iam_policy_document" "apply_assume_role" {
       values   = ["sts.amazonaws.com"]
     }
 
-    # The environment claim is the whole security boundary for apply. A job that
-    # does not declare `environment: production` gets a token whose sub does not
-    # match, and STS refuses it. Combined with the environment's branch
-    # restriction on the GitHub side, apply is reachable only from main.
     condition {
       test     = "StringEquals"
       variable = "token.actions.githubusercontent.com:sub"
@@ -126,7 +233,343 @@ data "aws_iam_policy_document" "apply_assume_role" {
 }
 
 # ---------------------------------------------------------------------------
-# Permissions boundary applied to every role CI creates
+# Shared guardrails — attached to BOTH roles.
+#
+# These are pure Deny. An explicit Deny always beats any Allow, so nothing added
+# to either role's allowlist later can override what is refused here.
+# ---------------------------------------------------------------------------
+
+data "aws_iam_policy_document" "ci_guardrails" {
+  statement {
+    sid         = "DenyAllOutsideAllowedRegions"
+    effect      = "Deny"
+    not_actions = local.global_service_actions
+    resources   = ["*"]
+
+    condition {
+      test     = "StringNotEquals"
+      variable = "aws:RequestedRegion"
+      values   = var.allowed_regions
+    }
+  }
+
+  statement {
+    sid       = "DenyExpensiveServices"
+    effect    = "Deny"
+    actions   = local.expensive_service_actions
+    resources = ["*"]
+  }
+
+  statement {
+    sid       = "DenyLongLivedCredentials"
+    effect    = "Deny"
+    actions   = local.long_lived_credential_actions
+    resources = ["*"]
+  }
+
+  statement {
+    sid       = "DenyTamperingWithCIControlPlane"
+    effect    = "Deny"
+    actions   = local.iam_mutating_actions
+    resources = local.ci_control_plane_arns
+  }
+
+  # Belt and braces. The apply role is not granted any of these in the first
+  # place; this makes re-granting them impossible without also editing the
+  # guardrail policy, which requires human-applied bootstrap access.
+  statement {
+    sid    = "DenyRoleAndPolicyCreation"
+    effect = "Deny"
+    actions = [
+      "iam:CreateRole",
+      "iam:CreatePolicy",
+      "iam:CreatePolicyVersion",
+      "iam:PutRolePolicy",
+      "iam:AttachRolePolicy",
+      "iam:UpdateAssumeRolePolicy",
+      "iam:DeleteRolePermissionsBoundary",
+      "iam:PutRolePermissionsBoundary",
+    ]
+    resources = ["*"]
+  }
+
+  # State is the map of the account and its version history is the record of
+  # every change. Neither may be destroyed or re-encrypted under a key CI holds.
+  statement {
+    sid    = "DenyStateAndAuditDestruction"
+    effect = "Deny"
+    actions = [
+      "s3:DeleteBucket",
+      "s3:DeleteObjectVersion",
+      "s3:PutBucketVersioning",
+      "s3:PutBucketPolicy",
+      "s3:DeleteBucketPolicy",
+      "s3:PutEncryptionConfiguration",
+      "s3:PutBucketPublicAccessBlock",
+      "s3:PutLifecycleConfiguration",
+    ]
+    resources = [
+      local.state_bucket_arn,
+      "${local.state_bucket_arn}/*",
+    ]
+  }
+
+  statement {
+    sid    = "DenySilencingTheAuditTrail"
+    effect = "Deny"
+    actions = [
+      "cloudtrail:StopLogging",
+      "cloudtrail:DeleteTrail",
+      "cloudtrail:UpdateTrail",
+      "cloudtrail:PutEventSelectors",
+      "cloudtrail:DeleteEventDataStore",
+    ]
+    resources = ["*"]
+  }
+
+  # Ransomware defence: a key that cannot be deleted or disabled cannot be used
+  # to hold data hostage, and a policy that cannot be rewritten cannot be
+  # narrowed to an attacker-held principal.
+  statement {
+    sid    = "DenyKeyDestruction"
+    effect = "Deny"
+    actions = [
+      "kms:ScheduleKeyDeletion",
+      "kms:DisableKey",
+      "kms:DisableKeyRotation",
+      "kms:PutKeyPolicy",
+      "kms:CreateGrant",
+      "kms:RetireGrant",
+      "kms:RevokeGrant",
+    ]
+    resources = ["*"]
+  }
+
+  statement {
+    sid    = "DenyAccountAndIdentityCenterControl"
+    effect = "Deny"
+    actions = [
+      "sso:*",
+      "sso-directory:*",
+      "identitystore:*",
+      "organizations:*",
+      "account:CloseAccount",
+      "account:PutAlternateContact",
+      "account:DeleteAlternateContact",
+      "iam:DeleteAccountPasswordPolicy",
+      "iam:UpdateAccountPasswordPolicy",
+      "s3:PutAccountPublicAccessBlock",
+      "ec2:DisableEbsEncryptionByDefault",
+      "access-analyzer:DeleteAnalyzer",
+    ]
+    resources = ["*"]
+  }
+}
+
+resource "aws_iam_policy" "ci_guardrails" {
+  name        = local.guardrail_name
+  description = "Deny-only guardrails attached to both CI roles. Explicit Deny beats any Allow, so these bound the blast radius of a compromised pipeline."
+  policy      = data.aws_iam_policy_document.ci_guardrails.json
+}
+
+# ---------------------------------------------------------------------------
+# Plan role — enumerated read-only.
+#
+# Deliberately NOT ReadOnlyAccess. That managed policy grants s3:GetObject on
+# every bucket in the account, so a compromised plan job could exfiltrate all
+# application data. Here object reads are confined to the state bucket.
+# ---------------------------------------------------------------------------
+
+data "aws_iam_policy_document" "plan_permissions" {
+  statement {
+    sid       = "ReadState"
+    effect    = "Allow"
+    actions   = ["s3:GetObject", "s3:GetObjectVersion"]
+    resources = ["${local.state_bucket_arn}/*"]
+  }
+
+  statement {
+    sid       = "ListStateBucket"
+    effect    = "Allow"
+    actions   = ["s3:ListBucket", "s3:GetBucketLocation"]
+    resources = [local.state_bucket_arn]
+  }
+
+  # Describe-level reads needed to refresh the resources this repo manages.
+  # None of these return object contents or secret material.
+  # Bucket metadata for the two buckets this repo manages. Scoped to those
+  # buckets rather than "*", so a compromised plan job cannot enumerate the
+  # configuration of buckets the application may hold later.
+  statement {
+    sid       = "ReadManagedBucketMetadata"
+    effect    = "Allow"
+    actions   = local.s3_bucket_read_actions
+    resources = [local.state_bucket_arn, local.trail_bucket_arn]
+  }
+
+  statement {
+    sid    = "DescribeManagedResources"
+    effect = "Allow"
+    actions = [
+      "sts:GetCallerIdentity",
+      "iam:GetRole",
+      "iam:GetRolePolicy",
+      "iam:GetPolicy",
+      "iam:GetPolicyVersion",
+      "iam:ListRolePolicies",
+      "iam:ListAttachedRolePolicies",
+      "iam:ListRoleTags",
+      "iam:ListPolicyVersions",
+      "iam:GetOpenIDConnectProvider",
+      "iam:ListOpenIDConnectProviders",
+      "iam:ListAccountAliases",
+      "iam:GetAccountPasswordPolicy",
+      # Per-bucket metadata is granted separately, scoped to the two managed
+      # buckets. These two are account-level and have no bucket to scope to.
+      "s3:GetAccountPublicAccessBlock",
+      "s3:ListAllMyBuckets",
+      "cloudtrail:DescribeTrails",
+      "cloudtrail:GetTrail",
+      "cloudtrail:GetTrailStatus",
+      "cloudtrail:GetEventSelectors",
+      "cloudtrail:GetInsightSelectors",
+      "cloudtrail:ListTags",
+      "access-analyzer:GetAnalyzer",
+      "access-analyzer:ListAnalyzers",
+      "access-analyzer:ListTagsForResource",
+      "ec2:GetEbsEncryptionByDefault",
+      "ec2:GetEbsDefaultKmsKeyId",
+      "account:GetAlternateContact",
+      "kms:DescribeKey",
+      "kms:GetKeyRotationStatus",
+      "kms:GetKeyPolicy",
+      "kms:ListAliases",
+      "kms:ListResourceTags",
+      "tag:GetResources",
+    ]
+    resources = ["*"]
+  }
+}
+
+resource "aws_iam_role" "plan" {
+  name                 = local.plan_role_name
+  description          = "Enumerated read-only role assumed by pull_request jobs to run `tofu plan`."
+  assume_role_policy   = data.aws_iam_policy_document.plan_assume_role.json
+  max_session_duration = 3600
+}
+
+resource "aws_iam_role_policy" "plan_permissions" {
+  name   = "permissions"
+  role   = aws_iam_role.plan.id
+  policy = data.aws_iam_policy_document.plan_permissions.json
+}
+
+resource "aws_iam_role_policy_attachment" "plan_guardrails" {
+  role       = aws_iam_role.plan.name
+  policy_arn = aws_iam_policy.ci_guardrails.arn
+}
+
+# ---------------------------------------------------------------------------
+# Apply role — enumerated write access, deliberately narrow.
+#
+# The account's security floor (CloudTrail, public access block, password
+# policy, EBS encryption default, alternate contacts) lives in this bootstrap
+# module and is applied by a human. CI is not granted permission to change any
+# of it, so a compromised pipeline cannot weaken the account's defences or hide
+# what it did. CI owns operational and, in future, application resources.
+# ---------------------------------------------------------------------------
+
+data "aws_iam_policy_document" "apply_permissions" {
+  # State backend. DeleteObject is required to release the S3 native lock.
+  statement {
+    sid    = "ReadWriteState"
+    effect = "Allow"
+    actions = [
+      "s3:GetObject",
+      "s3:GetObjectVersion",
+      "s3:PutObject",
+      "s3:DeleteObject",
+    ]
+    resources = ["${local.state_bucket_arn}/*"]
+  }
+
+  statement {
+    sid       = "ListStateBucket"
+    effect    = "Allow"
+    actions   = ["s3:ListBucket", "s3:GetBucketLocation", "s3:GetBucketVersioning"]
+    resources = [local.state_bucket_arn]
+  }
+
+  statement {
+    sid     = "Identity"
+    effect  = "Allow"
+    actions = ["sts:GetCallerIdentity", "tag:GetResources"]
+
+    resources = ["*"]
+  }
+
+  # Everything CI currently manages in infra/. Expand this list, in a pull
+  # request, when the application needs more.
+  statement {
+    sid    = "ManageOperationalResources"
+    effect = "Allow"
+    actions = [
+      "access-analyzer:GetAnalyzer",
+      "access-analyzer:ListAnalyzers",
+      "access-analyzer:ListTagsForResource",
+      "access-analyzer:CreateAnalyzer",
+      "access-analyzer:TagResource",
+      "access-analyzer:UntagResource",
+      "iam:ListAccountAliases",
+      "iam:CreateAccountAlias",
+      "iam:DeleteAccountAlias",
+    ]
+    resources = ["*"]
+  }
+
+  # Access Analyzer provisions its own service-linked role on first use. This is
+  # narrowly conditioned so it cannot be used to create a service-linked role
+  # for any other service.
+  statement {
+    sid       = "AccessAnalyzerServiceLinkedRole"
+    effect    = "Allow"
+    actions   = ["iam:CreateServiceLinkedRole"]
+    resources = ["*"]
+
+    condition {
+      test     = "StringEquals"
+      variable = "iam:AWSServiceName"
+      values   = ["access-analyzer.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "apply" {
+  name                 = local.apply_role_name
+  description          = "Enumerated write role assumed by main-branch apply jobs via the protected `${var.apply_environment}` environment."
+  assume_role_policy   = data.aws_iam_policy_document.apply_assume_role.json
+  max_session_duration = 3600
+}
+
+resource "aws_iam_role_policy" "apply_permissions" {
+  name   = "permissions"
+  role   = aws_iam_role.apply.id
+  policy = data.aws_iam_policy_document.apply_permissions.json
+}
+
+resource "aws_iam_role_policy_attachment" "apply_guardrails" {
+  role       = aws_iam_role.apply.name
+  policy_arn = aws_iam_policy.ci_guardrails.arn
+}
+
+# ---------------------------------------------------------------------------
+# Permissions boundary.
+#
+# Unused today: the apply role cannot create roles at all, which is a stronger
+# guarantee than bounding what the roles it creates may do. Kept because the
+# moment iam:CreateRole is added to the allowlist — when the application needs
+# an execution role — the boundary and the condition enforcing it must already
+# exist, or that expansion silently becomes an escalation path.
 # ---------------------------------------------------------------------------
 
 data "aws_iam_policy_document" "ci_permissions_boundary" {
@@ -141,6 +584,13 @@ data "aws_iam_policy_document" "ci_permissions_boundary" {
     sid       = "DenyLongLivedCredentials"
     effect    = "Deny"
     actions   = local.long_lived_credential_actions
+    resources = ["*"]
+  }
+
+  statement {
+    sid       = "DenyExpensiveServices"
+    effect    = "Deny"
+    actions   = local.expensive_service_actions
     resources = ["*"]
   }
 
@@ -162,202 +612,10 @@ data "aws_iam_policy_document" "ci_permissions_boundary" {
     actions   = local.iam_mutating_actions
     resources = local.ci_control_plane_arns
   }
-
-  statement {
-    sid    = "DenyAuditAndAccountControl"
-    effect = "Deny"
-    actions = [
-      "cloudtrail:StopLogging",
-      "cloudtrail:DeleteTrail",
-      "cloudtrail:DeleteEventDataStore",
-      "sso:*",
-      "sso-directory:*",
-      "identitystore:*",
-      "organizations:LeaveOrganization",
-      "account:CloseAccount",
-    ]
-    resources = ["*"]
-  }
-
-  statement {
-    sid    = "DenyStateBucketControl"
-    effect = "Deny"
-    actions = [
-      "s3:PutBucketPolicy",
-      "s3:DeleteBucketPolicy",
-      "s3:DeleteBucket",
-      "s3:PutBucketVersioning",
-      "s3:PutBucketPublicAccessBlock",
-      "s3:PutEncryptionConfiguration",
-      "s3:DeleteObjectVersion",
-    ]
-    resources = [
-      aws_s3_bucket.state.arn,
-      "${aws_s3_bucket.state.arn}/*",
-    ]
-  }
 }
 
 resource "aws_iam_policy" "ci_permissions_boundary" {
   name        = local.boundary_name
-  description = "Maximum privilege any CI-created role may hold. Enforced on CreateRole by the apply role's guardrails."
+  description = "Maximum privilege any future CI-created role may hold. Not yet in use — the apply role cannot create roles."
   policy      = data.aws_iam_policy_document.ci_permissions_boundary.json
-}
-
-# ---------------------------------------------------------------------------
-# Plan role — read-only
-# ---------------------------------------------------------------------------
-
-resource "aws_iam_role" "plan" {
-  name                 = local.plan_role_name
-  description          = "Read-only role assumed by pull_request jobs to run `tofu plan`."
-  assume_role_policy   = data.aws_iam_policy_document.plan_assume_role.json
-  max_session_duration = 3600
-}
-
-resource "aws_iam_role_policy_attachment" "plan_readonly" {
-  role       = aws_iam_role.plan.name
-  policy_arn = "arn:${local.partition}:iam::aws:policy/ReadOnlyAccess"
-}
-
-data "aws_iam_policy_document" "plan_extra_denies" {
-  # ReadOnlyAccess does not grant GetSecretValue today, but it is a managed
-  # policy AWS can widen at any time. Plan jobs run branch code from PRs, so
-  # nail this shut rather than trusting AWS's future edits.
-  statement {
-    sid       = "DenySecretMaterial"
-    effect    = "Deny"
-    actions   = ["secretsmanager:GetSecretValue"]
-    resources = ["*"]
-  }
-}
-
-resource "aws_iam_role_policy" "plan_extra_denies" {
-  name   = "extra-denies"
-  role   = aws_iam_role.plan.id
-  policy = data.aws_iam_policy_document.plan_extra_denies.json
-}
-
-# ---------------------------------------------------------------------------
-# Apply role — privileged, but fenced in
-# ---------------------------------------------------------------------------
-
-resource "aws_iam_role" "apply" {
-  name                 = local.apply_role_name
-  description          = "Privileged role assumed by main-branch apply jobs via the protected `${var.apply_environment}` environment."
-  assume_role_policy   = data.aws_iam_policy_document.apply_assume_role.json
-  max_session_duration = 3600
-}
-
-resource "aws_iam_role_policy_attachment" "apply_admin" {
-  role       = aws_iam_role.apply.name
-  policy_arn = "arn:${local.partition}:iam::aws:policy/AdministratorAccess"
-}
-
-data "aws_iam_policy_document" "apply_guardrails" {
-  # Explicit Deny beats the AdministratorAccess Allow, so everything below holds
-  # regardless of what the managed policy grants now or later.
-
-  statement {
-    sid       = "DenyTamperingWithCIControlPlane"
-    effect    = "Deny"
-    actions   = local.iam_mutating_actions
-    resources = local.ci_control_plane_arns
-  }
-
-  statement {
-    sid       = "DenyLongLivedCredentials"
-    effect    = "Deny"
-    actions   = local.long_lived_credential_actions
-    resources = ["*"]
-  }
-
-  # Every role CI creates must carry the boundary. On CreateRole the condition
-  # key holds the boundary being set; if none is set the key is absent, and an
-  # absent key makes StringNotEquals true — so the deny fires. That is exactly
-  # the behaviour we want: no boundary, no role.
-  statement {
-    sid    = "DenyRoleWorkWithoutPermissionsBoundary"
-    effect = "Deny"
-    actions = [
-      "iam:CreateRole",
-      "iam:PutRolePolicy",
-      "iam:AttachRolePolicy",
-      "iam:PutRolePermissionsBoundary",
-    ]
-    resources = ["${local.iam_root}:role/*"]
-
-    condition {
-      test     = "StringNotEquals"
-      variable = "iam:PermissionsBoundary"
-      values   = [local.boundary_arn]
-    }
-  }
-
-  statement {
-    sid    = "DenyBoundaryRemoval"
-    effect = "Deny"
-    actions = [
-      "iam:DeleteRolePermissionsBoundary",
-      "iam:DeleteUserPermissionsBoundary",
-    ]
-    resources = ["*"]
-  }
-
-  # The state bucket is bootstrap-owned. CI reads and writes state objects, but
-  # must not be able to reconfigure the bucket or erase state history — that is
-  # the forensic record of every change it has ever made.
-  statement {
-    sid    = "DenyStateBucketControl"
-    effect = "Deny"
-    actions = [
-      "s3:PutBucketPolicy",
-      "s3:DeleteBucketPolicy",
-      "s3:DeleteBucket",
-      "s3:PutBucketVersioning",
-      "s3:PutBucketPublicAccessBlock",
-      "s3:PutEncryptionConfiguration",
-      "s3:PutLifecycleConfiguration",
-      "s3:DeleteObjectVersion",
-    ]
-    resources = [
-      aws_s3_bucket.state.arn,
-      "${aws_s3_bucket.state.arn}/*",
-    ]
-  }
-
-  # CI creates and updates the trail (see infra/), but can never silence it.
-  # This also means `tofu destroy` cannot remove the trail — intentional.
-  statement {
-    sid    = "DenyAuditTampering"
-    effect = "Deny"
-    actions = [
-      "cloudtrail:StopLogging",
-      "cloudtrail:DeleteTrail",
-      "cloudtrail:DeleteEventDataStore",
-    ]
-    resources = ["*"]
-  }
-
-  # CI must never be able to hand a human (or an attacker) console access, nor
-  # touch the account's existence.
-  statement {
-    sid    = "DenyIdentityCenterAndAccountControl"
-    effect = "Deny"
-    actions = [
-      "sso:*",
-      "sso-directory:*",
-      "identitystore:*",
-      "organizations:LeaveOrganization",
-      "account:CloseAccount",
-      "iam:DeleteAccountPasswordPolicy",
-    ]
-    resources = ["*"]
-  }
-}
-
-resource "aws_iam_role_policy" "apply_guardrails" {
-  name   = "guardrails"
-  role   = aws_iam_role.apply.id
-  policy = data.aws_iam_policy_document.apply_guardrails.json
 }

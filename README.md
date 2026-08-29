@@ -6,46 +6,112 @@ No long-lived AWS credentials exist anywhere in this system. CI authenticates
 with short-lived OIDC tokens minted per job; the only human credentials are
 IAM Identity Center sessions.
 
+## Threat model
+
+**Assume the CI pipeline is compromised** — an attacker has write access to this
+repository, and can therefore modify workflows, open and merge pull requests,
+and reach both CI roles.
+
+The goal is not that nothing happens. It is that the blast radius is small,
+bounded, and fully recorded. Concretely, an attacker who owns this pipeline
+still cannot:
+
+- escalate privileges — the apply role holds **no IAM role or policy write
+  permission at all**, so there is no first step
+- mint anything that outlives the job — no IAM users, access keys, or console
+  logins
+- run up a bill — every region but `ca-central-1`/`us-east-1` is denied, and
+  expensive service families are denied by name on top of not being allowlisted
+- destroy or ransom the record — state object versions cannot be deleted, and
+  CloudTrail cannot be stopped, deleted, or retargeted
+- weaken the account's defences — the security floor is human-applied and CI is
+  denied permission to touch it
+- read application data — the plan role's object reads are confined to the state
+  bucket
+
 ## Layout
 
 | Path | Applied by | Holds |
 | --- | --- | --- |
-| `bootstrap/` | **a human, from a workstation** | State bucket, GitHub OIDC provider, the two CI roles, the CI permissions boundary |
-| `infra/` | **CI, on push to `main`** | Account security baseline: CloudTrail, Access Analyzer, account-wide S3 public access block, EBS default encryption, password policy |
-| `.github/workflows/` | — | plan on PR, apply on main, Dependabot auto-merge, lock refresh |
+| `bootstrap/` | **a human, from a workstation** | State bucket, GitHub OIDC provider, the two CI roles, the guardrail policy, **and the account security floor** |
+| `infra/` | **CI, on push to `main`** | Operational resources CI is trusted with; where application infrastructure will go |
 | `scripts/` | — | One-shot bootstrap and GitHub configuration |
 
-`bootstrap/` is separate because it creates the very credentials CI runs as.
-CI can plan it (to catch drift) but can never apply it.
+The security floor — CloudTrail, the account-wide S3 public access block, the
+password policy, EBS encryption defaults, alternate contacts — lives in
+`bootstrap/`, not `infra/`. Under the threat model above, the controls that
+would let an attacker weaken the account or conceal their activity must not be
+writable by the thing being attacked.
 
 ## The trust chain
 
 ```
-PR opened          →  OIDC sub = repo:MarcusDunn/marcusdunnca:pull_request
-                   →  assumes marcusdunnca-gha-plan   (ReadOnlyAccess)
+PR opened      →  sub = repo:MarcusDunn@51931484/marcusdunnca@1350868756:pull_request
+               →  assumes marcusdunnca-gha-plan   (enumerated read-only)
 
-push to main       →  job declares `environment: production`
-                   →  OIDC sub = repo:MarcusDunn/marcusdunnca:environment:production
-                   →  assumes marcusdunnca-gha-apply  (Admin + guardrails)
+push to main   →  job declares `environment: production`
+               →  sub = repo:MarcusDunn@51931484/marcusdunnca@1350868756:environment:production
+               →  assumes marcusdunnca-gha-apply  (enumerated write)
 ```
 
-The apply role's trust policy accepts *only* the environment subject. The
-`production` environment is restricted to `main`. So apply is unreachable from
-any branch, any fork, and any PR — enforced by AWS, not just by GitHub.
+Subjects are in GitHub's **immutable form**, with the owner and repository IDs
+embedded, pinned via the `actions/oidc/customization/sub` API. Binding trust to
+numeric IDs rather than names means renaming this repository — or a third party
+later claiming the freed-up name `MarcusDunn/marcusdunnca` — cannot produce a
+token this account will accept.
 
-### What the apply role cannot do
+The apply role's trust policy accepts *only* the environment subject, and the
+`production` environment is restricted to `main`. So "apply only from main" is
+enforced by AWS, not merely by GitHub.
 
-`AdministratorAccess` is attached, then fenced in by an inline deny policy.
-Explicit deny always wins, so these hold no matter how AWS widens the managed
-policy later:
+### Expanding scope
 
-- Modify its own role, the plan role, the permissions boundary, or the OIDC
-  provider — **CI cannot grant itself more power**
-- Create IAM users, access keys, or console logins — **no long-lived credentials**
-- Create any role without attaching the CI permissions boundary
-- Stop or delete CloudTrail — **it cannot erase its own audit trail**
-- Reconfigure the state bucket or delete state object versions
-- Touch Identity Center, close the account, or leave an organization
+Both roles are enumerated allowlists — neither uses an AWS managed policy.
+`AdministratorAccess` and `ReadOnlyAccess` are both far wider than this account
+needs, and AWS can widen them further without notice.
+
+When the application needs a new service, add the specific actions to
+`bootstrap/iam.tf` in a pull request. That review *is* the control. Note the
+guardrail policy is pure `Deny` and attached to both roles, so anything it
+refuses stays refused no matter what is added to an allowlist.
+
+If `iam:CreateRole` is ever added, the permissions boundary in `bootstrap/iam.tf`
+must be wired to it at the same time — otherwise that one addition converts the
+apply role into a privilege-escalation path.
+
+## Branch protection
+
+This repository is **public**. GitHub does not offer rulesets on private
+repositories below the Pro plan, and enforced branch protection was judged worth
+more than keeping the topology unpublished. Nothing here is a credential, so
+what is exposed is reconnaissance value, not access.
+
+The ruleset on `main` has **no bypass actors**, including you:
+
+- all changes via pull request (0 required approvals — solo repo, and GitHub
+  forbids self-approval, so requiring one would force routine bypasses and train
+  the habit of ignoring the rules)
+- signed commits required
+- linear history, squash merges only
+- force-push and deletion blocked
+- `plan (bootstrap)` and `plan (infra)` must pass, against current `main`
+
+Alongside it: secret scanning with push protection; workflow runs require
+approval from **all** external contributors; only an allowlist of actions may
+run; and GitHub rejects any workflow referencing an action by tag rather than a
+commit SHA.
+
+### A note on the fork guard
+
+`tofu-plan.yml` refuses to run when the PR head is not this repository. This is
+**defence in depth, not a boundary**: for `pull_request` events GitHub runs the
+workflow file from the PR head, so a fork author can simply delete that check in
+their own copy.
+
+What actually holds is that GitHub withholds `id-token: write` from fork PRs — a
+workflow's `permissions:` block cannot elevate it — plus the external-contributor
+approval requirement. And should both fail, the plan role is read-only and
+cannot read application data.
 
 ## First-time setup
 
@@ -58,7 +124,7 @@ here — apply your home-manager config first so the profile exists.
 nix develop                     # opentofu, awscli2, gh, jq; sets AWS_PROFILE
 aws sso login
 
-./scripts/bootstrap.sh          # creates state bucket, OIDC provider, CI roles
+./scripts/bootstrap.sh          # state bucket, OIDC provider, CI roles, security floor
 ./scripts/github-setup.sh       # repo settings, ruleset, environment, role ARNs
 ```
 
@@ -66,49 +132,17 @@ aws sso login
 run otherwise — this machine has a dozen work profiles configured, and an
 admin-level IAM apply against the wrong one is not a recoverable mistake.
 
-`bootstrap.sh` handles the chicken-and-egg problem: the first apply runs against
-local state because the bucket it creates does not exist yet, then migrates that
-state into the bucket and deletes the local copy.
-
 ## Day-to-day
 
 ```bash
 nix develop
 cd infra
 tofu init -backend-config=backend.hcl
-tofu plan                       # against real state; requires an SSO session
+tofu plan
 ```
 
-Then open a PR. Merging to `main` applies. Do not apply from your workstation —
-the SSO admin role can, but the CI role is the intended path and drift between
-the two is how state gets confusing.
-
-## Branch protection
-
-This repository is **public**. GitHub does not offer rulesets on private
-repositories below the Pro plan, and enforced branch protection was judged
-worth more than keeping the topology unpublished. Nothing here is a
-credential — CI authenticates with per-job OIDC tokens — so what is exposed is
-reconnaissance value (account ID, role and bucket names), not access.
-
-Two consequences follow from being public, both handled:
-
-- **Fork PRs cannot reach the plan role.** The OIDC subject for a PR is
-  `repo:MarcusDunn/marcusdunnca:pull_request` no matter which fork the branch
-  came from. GitHub withholds `id-token: write` from fork PRs, but the plan job
-  additionally refuses to run unless the PR head is this repository.
-- **Secret scanning with push protection is enabled**, so a recognised
-  credential is rejected at push time rather than after it is public.
-
-The ruleset on `main` has **no bypass actors**, including you:
-
-- All changes via pull request (0 required approvals — solo repo, and GitHub
-  forbids self-approval, so requiring one would force routine bypasses and
-  train the habit of ignoring the rules)
-- Signed commits required
-- Linear history, squash merges only
-- Force-push and deletion blocked
-- `plan (bootstrap)` and `plan (infra)` must pass, against current `main`
+Then open a PR. Merging to `main` applies. Changes to `bootstrap/` are planned by
+CI but never applied by it — run `./scripts/bootstrap.sh` yourself.
 
 ## Dependency updates
 
@@ -128,7 +162,7 @@ is proposed here — long enough for a malicious or broken publish to be caught.
 immediately, so a Dependabot PR that would actually change AWS resources fails
 its check and waits for you. A no-op version bump merges itself.
 
-The lock-refresh PRs are merged by hand on purpose. They are authored with
+Lock-refresh PRs are merged by hand on purpose. They are authored with
 `GITHUB_TOKEN`, and GitHub does not trigger workflow runs for such PRs, so their
 checks do not start automatically. Fixing that would need either a long-lived
 token or a ruleset bypass actor; neither is worth it for a lockfile bump. Close
