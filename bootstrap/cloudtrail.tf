@@ -156,6 +156,46 @@ resource "aws_cloudtrail" "management" {
   # Lets you prove after the fact that no log file was altered or deleted.
   enable_log_file_validation = true
 
+  # Management events alone leave the state bucket as an unrecorded read/write
+  # channel: s3:GetObject/PutObject/DeleteObject are *data* events. Without this,
+  # reading every state file, or tampering with state, produces no audit record
+  # at all — which would undercut the "fully recorded" property the whole design
+  # leans on.
+  #
+  # Scoped to the two managed buckets rather than all of S3, which is what keeps
+  # this affordable: data events are billed per event, and these buckets see a
+  # handful of operations per CI run.
+  advanced_event_selector {
+    name = "Management events"
+
+    field_selector {
+      field  = "eventCategory"
+      equals = ["Management"]
+    }
+  }
+
+  advanced_event_selector {
+    name = "State and audit bucket object events"
+
+    field_selector {
+      field  = "eventCategory"
+      equals = ["Data"]
+    }
+
+    field_selector {
+      field  = "resources.type"
+      equals = ["AWS::S3::Object"]
+    }
+
+    field_selector {
+      field = "resources.ARN"
+      starts_with = [
+        "${aws_s3_bucket.state.arn}/",
+        "${aws_s3_bucket.trail.arn}/",
+      ]
+    }
+  }
+
   lifecycle {
     prevent_destroy = true
   }

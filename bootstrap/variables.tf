@@ -109,3 +109,9 @@ variable "security_contact" {
   })
   default = null
 }
+
+variable "account_alias" {
+  description = "IAM account alias, which also becomes the friendly console sign-in URL."
+  type        = string
+  default     = "marcusdunnca"
+}

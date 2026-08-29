@@ -46,8 +46,10 @@ jobs:
       # against an empty role ARN until the job times out, which reads as a hang
       # rather than a misconfiguration.
       - name: Verify bootstrap has run
+        env:
+          ROLE_ARN: ${{ vars.AWS_APPLY_ROLE_ARN }}
         run: |
-          if [ -z "${{ vars.AWS_APPLY_ROLE_ARN }}" ]; then
+          if [ -z "$ROLE_ARN" ]; then
             echo "::error::AWS_APPLY_ROLE_ARN is unset. Run scripts/bootstrap.sh, then scripts/github-setup.sh."
             exit 1
           fi

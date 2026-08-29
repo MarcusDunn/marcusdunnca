@@ -18,10 +18,9 @@ locals {
 # bootstrap/iam.tf — that expansion is intended to be a deliberate, reviewed act.
 # ---------------------------------------------------------------------------
 
-# Friendly console sign-in URL. Cosmetic; safe for CI to own.
-resource "aws_iam_account_alias" "this" {
-  account_alias = var.account_alias
-}
+# NOTE: the account alias moved to bootstrap/. Aliases are a global, first-come
+# namespace, so the ability to delete one is the ability to let a stranger claim
+# your console sign-in URL for good. CI is now denied both alias write actions.
 
 # Flags any resource policy granting access outside this account. Free, and the
 # highest-signal detection available at zero cost.

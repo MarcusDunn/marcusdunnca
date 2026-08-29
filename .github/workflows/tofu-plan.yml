@@ -24,14 +24,17 @@ jobs:
     name: plan
     runs-on: ubuntu-latest
 
-    # This repo is public, so anyone can fork it and open a PR. GitHub already
-    # withholds `id-token: write` from fork PRs, which alone would stop them
-    # minting an OIDC token — but the OIDC subject for a PR is
-    # `repo:MarcusDunn/marcusdunnca:pull_request` regardless of which fork the
-    # branch came from, so that single control is the only thing standing
-    # between a fork and the plan role. Refuse fork PRs outright rather than
-    # depending on one GitHub-side behaviour never changing.
-    if: github.event.pull_request.head.repo.full_name == github.repository
+    # NOTE: there is deliberately no job-level `if:` here.
+    #
+    # GitHub documents that "a job is skipped by a conditional" makes the job
+    # report **Success** to required status checks — unlike a skipped *workflow*,
+    # which stays pending and blocks. A job-level `if:` on a required check is
+    # therefore not a gate but a free pass: any PR that made the condition false
+    # would satisfy `plan (bootstrap)` and `plan (infra)` in seconds, having run
+    # no OpenTofu at all.
+    #
+    # The fork refusal is a failing STEP instead (below). A failing step fails
+    # the job; a skipped job passes it. That distinction is the whole point.
 
     strategy:
       fail-fast: false
@@ -42,6 +45,14 @@ jobs:
         module: [bootstrap, infra]
 
     steps:
+      # Must FAIL, not skip — see the note above the strategy block. Runs first,
+      # before any checkout, so untrusted branch content is never fetched.
+      - name: Refuse pull requests from forks
+        if: github.event.pull_request.head.repo.full_name != github.repository
+        run: |
+          echo "::error::Refusing to plan a PR from a fork (${{ github.event.pull_request.head.repo.full_name }})."
+          exit 1
+
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -58,8 +69,10 @@ jobs:
       # against an empty role ARN until the job times out, which reads as a hang
       # rather than a misconfiguration.
       - name: Verify bootstrap has run
+        env:
+          ROLE_ARN: ${{ vars.AWS_PLAN_ROLE_ARN }}
         run: |
-          if [ -z "${{ vars.AWS_PLAN_ROLE_ARN }}" ]; then
+          if [ -z "$ROLE_ARN" ]; then
             echo "::error::AWS_PLAN_ROLE_ARN is unset. Run scripts/bootstrap.sh, then scripts/github-setup.sh."
             exit 1
           fi
@@ -119,8 +132,12 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # Keyed on the PR's AUTHOR, not github.actor. github.actor becomes whoever
+      # last pushed to the branch, so an attacker pushing a commit to a
+      # dependabot/** branch would make this gate skip entirely while the armed
+      # auto-merge stayed live.
       - name: Block automated merges that would change infrastructure
-        if: github.actor == 'dependabot[bot]' && steps.plan.outputs.exitcode == '2'
+        if: github.event.pull_request.user.login == 'dependabot[bot]' && steps.plan.outputs.exitcode == '2'
         run: |
           echo "::error::Dependabot PR produces a non-empty plan for '${{ matrix.module }}'."
           echo "Auto-merge is only safe for dependency bumps that are a no-op against AWS,"

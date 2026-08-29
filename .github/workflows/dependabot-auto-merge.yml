@@ -20,10 +20,21 @@ jobs:
         id: meta
         uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
 
-      - name: Enable auto-merge for non-major updates
-        # Majors are excluded on purpose: they are exactly the updates most
-        # likely to change provider behaviour and therefore mutate AWS.
-        if: steps.meta.outputs.update-type != 'version-update:semver-major'
+      # `github_actions` is deliberately excluded, not an oversight.
+      #
+      # The empty-plan gate cannot protect that ecosystem: an action SHA bump
+      # always produces an empty plan, and worse, the bumped action executes
+      # BEFORE the gate evaluates — setup-opentofu runs in a job holding
+      # id-token: write and the plan role, and could shim `tofu` or write
+      # exitcode=0 into $GITHUB_OUTPUT to neuter the check. Once merged, the same
+      # unreviewed SHA runs alongside the apply role.
+      #
+      # So the one ecosystem whose code actually executes in CI is the one the
+      # gate is structurally blind to. Those PRs get read by a human.
+      - name: Enable auto-merge for non-major, non-Actions updates
+        if: >-
+          steps.meta.outputs.update-type != 'version-update:semver-major' &&
+          steps.meta.outputs.package-ecosystem != 'github_actions'
         run: gh pr merge --auto --squash "$PR_URL"
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}

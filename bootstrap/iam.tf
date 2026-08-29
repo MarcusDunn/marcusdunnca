@@ -284,17 +284,47 @@ data "aws_iam_policy_document" "ci_guardrails" {
       "iam:CreateRole",
       "iam:CreatePolicy",
       "iam:CreatePolicyVersion",
+      "iam:SetDefaultPolicyVersion",
       "iam:PutRolePolicy",
       "iam:AttachRolePolicy",
       "iam:UpdateAssumeRolePolicy",
       "iam:DeleteRolePermissionsBoundary",
       "iam:PutRolePermissionsBoundary",
+      # The wildcard verb list above does not match these, and each is a
+      # documented escalation primitive on its own.
+      "iam:PassRole",
+      "iam:PutUserPolicy",
+      "iam:AttachUserPolicy",
+      "iam:PutGroupPolicy",
+      "iam:AttachGroupPolicy",
+      "iam:CreateGroup",
+      "iam:AddUserToGroup",
+      "iam:CreateInstanceProfile",
+      "iam:AddRoleToInstanceProfile",
+    ]
+    resources = ["*"]
+  }
+
+  # Account aliases are a GLOBAL, first-come namespace, and iam:* is exempt from
+  # the region lock. Deleting the alias frees `marcusdunnca` for anyone to claim,
+  # turning the bookmarked console sign-in URL into an attacker-controlled page
+  # that this account can never reclaim. The alias is set once, in bootstrap.
+  statement {
+    sid    = "DenyAccountAliasHijack"
+    effect = "Deny"
+    actions = [
+      "iam:CreateAccountAlias",
+      "iam:DeleteAccountAlias",
     ]
     resources = ["*"]
   }
 
   # State is the map of the account and its version history is the record of
   # every change. Neither may be destroyed or re-encrypted under a key CI holds.
+  # Covers the CloudTrail bucket too — the sid promised audit protection but the
+  # resource list previously named only the state bucket, leaving log
+  # destruction blocked merely by absence from the allowlist. One careless
+  # future PR adding s3:Delete* would have silently re-opened it.
   statement {
     sid    = "DenyStateAndAuditDestruction"
     effect = "Deny"
@@ -307,11 +337,26 @@ data "aws_iam_policy_document" "ci_guardrails" {
       "s3:PutEncryptionConfiguration",
       "s3:PutBucketPublicAccessBlock",
       "s3:PutLifecycleConfiguration",
+      "s3:PutBucketObjectLockConfiguration",
     ]
     resources = [
       local.state_bucket_arn,
       "${local.state_bucket_arn}/*",
+      local.trail_bucket_arn,
+      "${local.trail_bucket_arn}/*",
     ]
+  }
+
+  # Defence in depth behind the key-scoped grant above: even if the apply
+  # allowlist is widened later, bootstrap's state stays unwritable by CI.
+  statement {
+    sid    = "DenyWritingBootstrapState"
+    effect = "Deny"
+    actions = [
+      "s3:PutObject",
+      "s3:DeleteObject",
+    ]
+    resources = ["${local.state_bucket_arn}/bootstrap/*"]
   }
 
   statement {
@@ -480,9 +525,24 @@ resource "aws_iam_role_policy_attachment" "plan_guardrails" {
 # ---------------------------------------------------------------------------
 
 data "aws_iam_policy_document" "apply_permissions" {
-  # State backend. DeleteObject is required to release the S3 native lock.
+  # State backend, scoped to the EXACT keys infra/ uses.
+  #
+  # This was `${state_bucket_arn}/*`, which included bootstrap/terraform.tfstate
+  # and was a critical hole. bootstrap/ is applied by a human holding
+  # AdministratorAccess, and OpenTofu gathers provider requirements from STATE,
+  # not only from configuration. A compromised CI job could therefore write a
+  # reference to an attacker-published provider into bootstrap's state; the next
+  # `scripts/bootstrap.sh` run would download and execute that provider binary
+  # during `init`/`plan` — remote code execution on the operator's workstation,
+  # inside a live admin session, before the apply prompt is ever shown. The
+  # committed .terraform.lock.hcl does not prevent this; init simply adds the
+  # state-referenced provider to it.
+  #
+  # Enumerating the two keys also removes CI's ability to use the state bucket
+  # as an unbounded blob store, which was a denial-of-wallet path through an
+  # otherwise-allowed action.
   statement {
-    sid    = "ReadWriteState"
+    sid    = "ReadWriteInfraState"
     effect = "Allow"
     actions = [
       "s3:GetObject",
@@ -490,7 +550,10 @@ data "aws_iam_policy_document" "apply_permissions" {
       "s3:PutObject",
       "s3:DeleteObject",
     ]
-    resources = ["${local.state_bucket_arn}/*"]
+    resources = [
+      "${local.state_bucket_arn}/infra/terraform.tfstate",
+      "${local.state_bucket_arn}/infra/terraform.tfstate.tflock",
+    ]
   }
 
   statement {
@@ -520,9 +583,9 @@ data "aws_iam_policy_document" "apply_permissions" {
       "access-analyzer:CreateAnalyzer",
       "access-analyzer:TagResource",
       "access-analyzer:UntagResource",
+      # Read-only. The alias itself is owned by bootstrap — see
+      # DenyAccountAliasHijack for why CI must not be able to release it.
       "iam:ListAccountAliases",
-      "iam:CreateAccountAlias",
-      "iam:DeleteAccountAlias",
     ]
     resources = ["*"]
   }
@@ -603,6 +666,68 @@ data "aws_iam_policy_document" "ci_permissions_boundary" {
       "iam:PutRolePermissionsBoundary",
       "iam:PutUserPermissionsBoundary",
     ]
+    resources = ["*"]
+  }
+
+  # Without this the boundary was an escape hatch, not a ceiling: a principal
+  # holding it could iam:CreateRole a NEW, unbounded role and attach
+  # AdministratorAccess to it. DenyBoundaryEscape above only stops removing a
+  # boundary from an existing principal — it never required a new one to carry
+  # the boundary in the first place. A missing iam:PermissionsBoundary key makes
+  # StringNotEquals true, so no-boundary fails closed.
+  statement {
+    sid    = "DenyRoleCreationWithoutThisBoundary"
+    effect = "Deny"
+    actions = [
+      "iam:CreateRole",
+      "iam:PutRolePermissionsBoundary",
+    ]
+    resources = ["*"]
+
+    condition {
+      test     = "StringNotEquals"
+      variable = "iam:PermissionsBoundary"
+      values   = [local.boundary_arn]
+    }
+  }
+
+  # The boundary previously omitted the region lock and the destruction denies
+  # entirely, so a boundary-constrained role was free in every region and could
+  # delete state versions and silence the trail. Reuse the same statements the
+  # guardrail applies to the CI roles themselves.
+  statement {
+    sid         = "DenyAllOutsideAllowedRegions"
+    effect      = "Deny"
+    not_actions = local.global_service_actions
+    resources   = ["*"]
+
+    condition {
+      test     = "StringNotEquals"
+      variable = "aws:RequestedRegion"
+      values   = var.allowed_regions
+    }
+  }
+
+  statement {
+    sid    = "DenyStateAndAuditDestruction"
+    effect = "Deny"
+    actions = [
+      "s3:DeleteBucket",
+      "s3:DeleteObjectVersion",
+      "s3:PutBucketVersioning",
+      "s3:PutBucketPolicy",
+      "s3:DeleteBucketPolicy",
+      "s3:PutEncryptionConfiguration",
+      "cloudtrail:StopLogging",
+      "cloudtrail:DeleteTrail",
+      "cloudtrail:UpdateTrail",
+      "cloudtrail:PutEventSelectors",
+      "kms:ScheduleKeyDeletion",
+      "kms:DisableKey",
+      "kms:PutKeyPolicy",
+    ]
+    # "*" rather than the two bucket ARNs: a role wearing this boundary has no
+    # legitimate reason to destroy state, logs, or keys anywhere in the account.
     resources = ["*"]
   }
 
