@@ -53,6 +53,7 @@ locals {
   ]
 
   state_bucket_arn = aws_s3_bucket.state.arn
+  trail_bucket_arn = aws_s3_bucket.trail.arn
 
   # Immutable-form subject. See var.github_owner_id.
   github_sub_prefix = "repo:${var.github_owner}@${var.github_owner_id}/${var.github_repo}@${var.github_repo_id}"
@@ -130,6 +131,35 @@ locals {
     "iam:CreateServiceSpecificCredential",
     "iam:UploadSSHPublicKey",
     "iam:UploadSigningCertificate",
+  ]
+
+  # The AWS provider refreshes a bucket by reading every sub-resource, whether
+  # or not this configuration sets it. All are read-only metadata calls — none
+  # return object contents, so this does not widen data exposure.
+  s3_bucket_read_actions = [
+    "s3:GetBucketAcl",
+    "s3:GetBucketCORS",
+    "s3:GetBucketLocation",
+    "s3:GetBucketLogging",
+    "s3:GetBucketNotification",
+    "s3:GetBucketObjectLockConfiguration",
+    "s3:GetBucketOwnershipControls",
+    "s3:GetBucketPolicy",
+    "s3:GetBucketPolicyStatus",
+    "s3:GetBucketPublicAccessBlock",
+    "s3:GetBucketRequestPayment",
+    "s3:GetBucketTagging",
+    "s3:GetBucketVersioning",
+    "s3:GetBucketWebsite",
+    "s3:GetAccelerateConfiguration",
+    "s3:GetAnalyticsConfiguration",
+    "s3:GetEncryptionConfiguration",
+    "s3:GetIntelligentTieringConfiguration",
+    "s3:GetInventoryConfiguration",
+    "s3:GetLifecycleConfiguration",
+    "s3:GetMetricsConfiguration",
+    "s3:GetReplicationConfiguration",
+    "s3:ListBucket",
   ]
 
   iam_mutating_actions = [
@@ -367,6 +397,16 @@ data "aws_iam_policy_document" "plan_permissions" {
 
   # Describe-level reads needed to refresh the resources this repo manages.
   # None of these return object contents or secret material.
+  # Bucket metadata for the two buckets this repo manages. Scoped to those
+  # buckets rather than "*", so a compromised plan job cannot enumerate the
+  # configuration of buckets the application may hold later.
+  statement {
+    sid       = "ReadManagedBucketMetadata"
+    effect    = "Allow"
+    actions   = local.s3_bucket_read_actions
+    resources = [local.state_bucket_arn, local.trail_bucket_arn]
+  }
+
   statement {
     sid    = "DescribeManagedResources"
     effect = "Allow"
@@ -384,17 +424,8 @@ data "aws_iam_policy_document" "plan_permissions" {
       "iam:ListOpenIDConnectProviders",
       "iam:ListAccountAliases",
       "iam:GetAccountPasswordPolicy",
-      "s3:GetBucketVersioning",
-      "s3:GetBucketPolicy",
-      "s3:GetBucketPublicAccessBlock",
-      "s3:GetBucketOwnershipControls",
-      "s3:GetBucketTagging",
-      "s3:GetBucketLogging",
-      "s3:GetBucketObjectLockConfiguration",
-      "s3:GetEncryptionConfiguration",
-      "s3:GetLifecycleConfiguration",
-      "s3:GetAccelerateConfiguration",
-      "s3:GetReplicationConfiguration",
+      # Per-bucket metadata is granted separately, scoped to the two managed
+      # buckets. These two are account-level and have no bucket to scope to.
       "s3:GetAccountPublicAccessBlock",
       "s3:ListAllMyBuckets",
       "cloudtrail:DescribeTrails",
