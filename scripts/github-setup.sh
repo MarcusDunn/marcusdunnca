@@ -142,7 +142,39 @@ RULESET_JSON="$(cat <<'JSON'
 JSON
 )"
 
-EXISTING_ID="$(gh api "repos/${SLUG}/rulesets" --jq '.[] | select(.name=="main") | .id' 2>/dev/null || true)"
+# Rulesets on a private repo need GitHub Pro. Detect that specifically rather
+# than letting the error JSON get interpolated into the next request URL.
+if ! RULESETS="$(gh api "repos/${SLUG}/rulesets" 2>&1)"; then
+  if echo "$RULESETS" | grep -q "Upgrade to GitHub Pro"; then
+    cat >&2 <<EOF
+
+    UNABLE TO APPLY BRANCH PROTECTION.
+
+    GitHub does not offer rulesets or branch protection on private
+    repositories for accounts on the Free plan.
+
+    Until this is resolved, main is UNPROTECTED: no required PR, no signed
+    commit enforcement, no required status checks, and force-push is allowed.
+    The OIDC apply gate still holds — the 'production' environment is
+    restricted to main and the apply role trusts nothing else — but nothing
+    stops a direct push to main from reaching it.
+
+    Two ways forward:
+      * GitHub Pro (~\$4/month), keeping the repo private
+      * make the repo public, where rulesets are free
+
+EOF
+    exit 3
+  fi
+  echo "$RULESETS" >&2
+  exit 1
+fi
+
+EXISTING_ID="$(echo "$RULESETS" | jq -r '.[] | select(.name=="main") | .id' | head -1)"
+# Guard against a non-numeric id ever being spliced into the URL below.
+case "$EXISTING_ID" in
+  '' | *[!0-9]*) EXISTING_ID="" ;;
+esac
 
 if [ -n "$EXISTING_ID" ]; then
   echo "$RULESET_JSON" | gh api -X PUT "repos/${SLUG}/rulesets/${EXISTING_ID}" --input - >/dev/null

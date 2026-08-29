@@ -45,6 +45,16 @@ jobs:
           # The wrapper rewrites exit codes, which would break -detailed-exitcode.
           tofu_wrapper: false
 
+      # Without this, an unset variable makes configure-aws-credentials retry
+      # against an empty role ARN until the job times out, which reads as a hang
+      # rather than a misconfiguration.
+      - name: Verify bootstrap has run
+        run: |
+          if [ -z "${{ vars.AWS_PLAN_ROLE_ARN }}" ]; then
+            echo "::error::AWS_PLAN_ROLE_ARN is unset. Run scripts/bootstrap.sh, then scripts/github-setup.sh."
+            exit 1
+          fi
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
         with:
