@@ -122,14 +122,16 @@ variable "monthly_budget_usd" {
   default     = "5"
 }
 
-variable "cost_alert_email" {
+variable "cost_alert_emails" {
   description = <<-EOT
-    Where budget and cost-anomaly alerts go. Cloudflare forwards
-    aws-root@marcusdunn.ca to the personal mailbox.
+    Where budget and cost-anomaly alerts go. More than one on purpose: the
+    marcusdunn.ca alias is Cloudflare-forwarded, and an alerting channel that
+    depends on a forwarding rule you cannot monitor will fail silently exactly
+    when it matters.
 
-    Note AWS sends a one-time SNS-style confirmation for anomaly subscriptions
-    to this address; alerts do not flow until it is confirmed.
+    Each address gets a one-time SNS confirmation email; alerts do not flow to
+    an address until its link is clicked.
   EOT
-  type        = string
-  default     = "aws-root@marcusdunn.ca"
+  type        = list(string)
+  default     = ["aws-root@marcusdunn.ca", "marcus.s.dunn@gmail.com"]
 }
