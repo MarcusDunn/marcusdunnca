@@ -10,6 +10,14 @@
 # Every resource here is free.
 # ---------------------------------------------------------------------------
 
+# Friendly console sign-in URL. Owned here rather than in infra/ because
+# account aliases live in a global, first-come namespace: releasing this one
+# lets anyone claim `marcusdunnca` and stand up a convincing sign-in page at the
+# URL you have bookmarked, permanently.
+resource "aws_iam_account_alias" "this" {
+  account_alias = var.account_alias
+}
+
 # Overrides any per-bucket setting anywhere in the account. Even a bucket
 # created by hand with a public ACL stays private.
 resource "aws_s3_account_public_access_block" "this" {

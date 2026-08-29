@@ -31,12 +31,18 @@ updates:
           - patch
 
   # ---------------------------------------------------------------------------
-  # OpenTofu provider constraints in required_providers.
+  # OpenTofu providers.
   #
-  # Note: Dependabot updates the version *constraints* in .tf files, not
-  # .terraform.lock.hcl. Because our constraints are `~> 6.0`, only a new major
-  # produces a PR here. Refreshing the actual pinned versions and hashes in the
-  # lock files is handled by .github/workflows/update-locks.yml.
+  # Dependabot's terraform updater maintains .terraform.lock.hcl as well as the
+  # constraints: it runs `terraform providers lock -platform=<arch>` for each
+  # architecture already present in the lockfile, so the linux_amd64 /
+  # darwin_arm64 / darwin_amd64 set committed here is preserved.
+  #
+  # Caveat worth watching on the first real provider bump: our lockfiles pin
+  # `registry.opentofu.org`, and Dependabot shells out to Terraform. If it
+  # resolves hashes against registry.terraform.io instead, its PR will produce a
+  # lockfile `tofu init` rejects — noisy rather than silent, but it will need a
+  # manual `tofu providers lock` to fix.
   # ---------------------------------------------------------------------------
   - package-ecosystem: terraform
     directories:
@@ -58,3 +64,24 @@ updates:
         update-types:
           - minor
           - patch
+
+  # ---------------------------------------------------------------------------
+  # Nix flake inputs (flake.lock). Supported by Dependabot since April 2026,
+  # which is what made .github/workflows/update-locks.yml redundant — deleting
+  # that workflow removed a scheduled job holding contents+pull-requests write
+  # and the machinery that minted GitHub-signed commits outside review.
+  #
+  # Version updates only; no security updates for this ecosystem.
+  # ---------------------------------------------------------------------------
+  - package-ecosystem: nix
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 14
+    commit-message:
+      prefix: nix
+    labels:
+      - dependencies
+      - nix

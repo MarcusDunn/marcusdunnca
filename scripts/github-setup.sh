@@ -45,10 +45,21 @@ gh api -X PATCH "repos/${SLUG}" --input - >/dev/null <<'JSON'
 {
   "security_and_analysis": {
     "secret_scanning": { "status": "enabled" },
-    "secret_scanning_push_protection": { "status": "enabled" }
+    "secret_scanning_push_protection": { "status": "enabled" },
+    "secret_scanning_non_provider_patterns": { "status": "enabled" },
+    "secret_scanning_validity_checks": { "status": "enabled" }
   }
 }
 JSON
+
+# Without these, a published CVE in an action that runs alongside the apply role
+# produces no alert and no out-of-cycle PR — the only cadence would be the weekly
+# version-update run plus the 14-day cooldown, so ~21 days to notice a KNOWN
+# vulnerability. The cooldown is right for unknown badness and wrong for known
+# badness; security updates are the path that bypasses it.
+echo "==> Enabling Dependabot alerts and security updates"
+gh api -X PUT "repos/${SLUG}/vulnerability-alerts" >/dev/null
+gh api -X PUT "repos/${SLUG}/automated-security-fixes" >/dev/null
 
 # ---------------------------------------------------------------------------
 # Who and what is allowed to run Actions.
@@ -89,13 +100,21 @@ JSON
 # Workflows get read-only tokens unless they ask for more in their `permissions`
 # block. Every workflow in this repo declares exactly what it needs.
 echo "==> Restricting default workflow token to read-only"
+#
+# can_approve_pull_request_reviews is now FALSE. It was true only so the
+# (deleted) lock-refresh workflow could `gh pr create` — GitHub gates PR
+# creation by Actions behind the same toggle as PR approval. Leaving it on was a
+# trap: the setting is "create AND approve", so any workflow holding
+# pull-requests: write could POST an approving review as github-actions[bot].
+# That is harmless at 0 required approvals, but it would have silently defeated
+# the obvious fix of raising the approval count to 1 — the requirement would be
+# self-satisfiable from inside a PR, and GitHub's self-approval prohibition does
+# not apply to bots.
 gh api -X PUT "repos/${SLUG}/actions/permissions/workflow" \
   -F default_workflow_permissions=read \
-  -F can_approve_pull_request_reviews=true \
+  -F can_approve_pull_request_reviews=false \
   >/dev/null
-echo "    Note: can_approve_pull_request_reviews must stay true so the"
-echo "    lock-refresh workflow can open PRs. It grants nothing here because"
-echo "    the ruleset requires 0 approvals, so a bot approval is worthless."
+echo "    Workflow token read-only; Actions cannot approve pull requests."
 
 # ---------------------------------------------------------------------------
 # CI role ARNs, read from bootstrap outputs
@@ -181,8 +200,8 @@ RULESET_JSON="$(cat <<'JSON'
       "parameters": {
         "strict_required_status_checks_policy": true,
         "required_status_checks": [
-          { "context": "plan (bootstrap)" },
-          { "context": "plan (infra)" }
+          { "context": "plan (bootstrap)", "integration_id": 15368 },
+          { "context": "plan (infra)", "integration_id": 15368 }
         ]
       }
     }
