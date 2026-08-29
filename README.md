@@ -249,14 +249,28 @@ and reopen the PR to run its checks.
 
 ## Cost
 
-The baseline is free-tier by design, given the 1-cent budget alert:
+Near zero, but **not exactly zero**, and the difference is worth knowing.
 
-- CloudTrail — first management-events trail per account is free
-- IAM Access Analyzer, account public access block, EBS encryption default,
-  password policy — free
-- S3 — pennies, bounded by lifecycle rules (state versions expire at 90 days,
-  CloudTrail logs at 400)
+Free: the first CloudTrail management-events trail, IAM Access Analyzer, the
+account public access block, EBS encryption defaults, the password policy,
+S3 Object Lock, Cost Explorer anomaly detection, and the first two AWS Budgets
+(two exist — this repo's and the console-created zero-spend one).
 
-GuardDuty, AWS Config, and Security Hub are deliberately **not** enabled.
-Set `state_bucket_use_cmk = true` in `bootstrap/` to encrypt state with a
-customer-managed KMS key (~$1/month) once state holds anything sensitive.
+Not free:
+
+- **CloudTrail S3 data events** — billed per event ($0.10 per 100,000), not
+  covered by the free management-events trail. Scoped to the state bucket only,
+  which sees a handful of object operations per CI run, so this is fractions of
+  a cent per month. It was briefly scoped to the CloudTrail bucket as well,
+  which created a feedback loop: log delivery is itself a data event, so
+  CloudTrail logged its own writes and generated more of them. Do not put the
+  trail bucket back in that selector.
+- **S3 storage and requests** — a few hundred KB across both buckets, bounded by
+  lifecycle rules (state versions expire at 90 days, logs at 400).
+- **SNS email** — first 1,000 notifications per month are free; alerts here are
+  rare by construction.
+
+Realistically pennies per month while idle. GuardDuty, AWS Config, and Security
+Hub are deliberately **not** enabled. Set `state_bucket_use_cmk = true` in
+`bootstrap/` to encrypt state with a customer-managed KMS key (~$1/month) once
+state holds anything sensitive.
