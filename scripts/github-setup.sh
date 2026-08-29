@@ -95,30 +95,33 @@ gh api -X PUT "repos/${SLUG}/actions/permissions" --input - >/dev/null <<'JSON'
 { "enabled": true, "allowed_actions": "selected", "sha_pinning_required": true }
 JSON
 
-# Exact SHAs, not `owner/repo@*`.
+# Repository-scoped patterns, NOT exact SHAs — reverted deliberately.
 #
-# A wildcard pattern permits ANY commit in that action's repository — including
-# commits from unmerged fork pull requests, which GitHub will happily serve,
-# because Actions resolves a reference by fetching that object from the repo's
-# network. An attacker could open a PR against an allowlisted action, never get
-# it merged, and reference its SHA here: 40 hex characters satisfies
-# sha_pinning_required, and the owner matches the pattern.
+# Exact SHAs here looked stricter and were a trap. Every Dependabot SHA bump
+# produces a PR whose own workflow references a SHA absent from this list, so
+# the run is rejected, the required checks never report, and the PR becomes
+# unmergeable by anyone — bypass_actors is empty. The sharpest edge: Dependabot
+# security updates are enabled, so a published CVE in configure-aws-credentials
+# produces exactly that deadlock. The emergency path is the one that jams.
 #
-# github_owned_allowed is off for the same reason — it blanket-permitted every
-# action under actions/*. actions/checkout is enumerated explicitly instead.
+# What the strictness bought was narrow: it stopped a workflow referencing an
+# unmerged fork-PR commit inside an allowlisted action's repo. But editing the
+# workflow to do that requires repository write access, which is accepted to
+# grant the apply role anyway. So it defended against nothing reachable, and
+# cost a guaranteed outage on the security-fix path.
 #
-# Cost: these must be updated in lockstep with Dependabot's SHA bumps. That is
-# the friction being bought deliberately, and it is why github_actions is
-# excluded from auto-merge — those PRs need a human anyway.
+# Still enforced: sha_pinning_required (workflows must use SHAs, not tags), and
+# github_owned_allowed stays false so this is four named repositories rather
+# than all of actions/*.
 gh api -X PUT "repos/${SLUG}/actions/permissions/selected-actions" --input - >/dev/null <<'JSON'
 {
   "github_owned_allowed": false,
   "verified_allowed": false,
   "patterns_allowed": [
-    "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
-    "opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4",
-    "aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c",
-    "dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98"
+    "actions/checkout@*",
+    "opentofu/setup-opentofu@*",
+    "aws-actions/configure-aws-credentials@*",
+    "dependabot/fetch-metadata@*"
   ]
 }
 JSON
@@ -172,27 +175,34 @@ fi
 # main is what stops any other branch from doing so.
 # ---------------------------------------------------------------------------
 #
-# The required reviewer is the single most important control in this repo.
+# NO required reviewer, and NO wait timer — deliberately removed.
 #
-# Everything on the GitHub side is reachable by someone with repository write
-# access: they can open and merge their own PR (0 approvals), and for
-# pull_request events the workflow file comes from the PR head, so the checks
-# guarding a change can be redefined by that change. Environment protection
-# rules are different — they live outside the repository contents and cannot be
-# altered by a PR or by GITHUB_TOKEN. Approving a deployment requires an
-# interactive click in a session the pipeline does not have.
+# They were added to put a human between "merge" and "apply". An audit showed
+# that was never true here: approving a deployment is an API call authorized by
+# the `repo` scope, and the token holding it lives on the same machine as the
+# pipeline. An attacker who owns the pipeline reads the token and self-approves
+# for the cost of one request and a five-minute wait. The approval records for
+# runs 33275353685 and 33276218610 show exactly that shape.
 #
-# prevent_self_review is false on purpose: this is a solo repo, and the point is
-# not a second pair of eyes but that apply requires an out-of-band human action.
-# wait_timer gives a window to cancel a deployment you did not expect.
-OWNER_ID="$(gh api "users/${OWNER}" --jq .id)"
-echo "==> Creating protected '${ENVIRONMENT}' environment (reviewer: ${OWNER}, id ${OWNER_ID})"
-gh api -X PUT "repos/${SLUG}/environments/${ENVIRONMENT}" --input - >/dev/null <<JSON
+# A control that is bypassable by the attacker it is meant to stop, while
+# reading as a human gate in the README, is worse than no control: it buys
+# false confidence and five minutes per deploy. The accepted position is that
+# repository write access grants the apply role. The real containment is the
+# IAM blast radius in bootstrap/iam.tf, not anything on the GitHub side.
+#
+# If a genuine gate is ever wanted, the approver must be an identity the
+# pipeline host cannot reach — a separate account whose credentials exist only
+# on a phone, with prevent_self_review: true. Any approval path terminating in a
+# token on the CI host is theatre by construction.
+#
+# The branch policy below is NOT theatre and stays: it is what stops a workflow
+# on a non-main branch declaring `environment: production` and thereby minting
+# an OIDC token whose subject the apply role trusts.
+echo "==> Creating '${ENVIRONMENT}' environment (branch-scoped to main; no reviewer)"
+gh api -X PUT "repos/${SLUG}/environments/${ENVIRONMENT}" --input - >/dev/null <<'JSON'
 {
-  "wait_timer": 5,
-  "prevent_self_review": false,
-  "reviewers": [{ "type": "User", "id": ${OWNER_ID} }],
-  "can_admins_bypass": false,
+  "wait_timer": 0,
+  "reviewers": [],
   "deployment_branch_policy": {
     "protected_branches": false,
     "custom_branch_policies": true

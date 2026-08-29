@@ -95,22 +95,35 @@ repositories below the Pro plan, and enforced branch protection was judged worth
 more than keeping the topology unpublished. Nothing here is a credential, so
 what is exposed is reconnaissance value, not access.
 
-### Apply requires a human
+### Repository write access grants the apply role. This is accepted.
 
-`main` → apply is **not** automatic. The `production` environment has a required
-reviewer, a 5-minute wait timer, and `can_admins_bypass: false`. Merging queues a
-deployment; it runs when you approve it.
+There is **no human gate** between merging to `main` and `tofu apply`. That is a
+deliberate position, not an oversight, and the GitHub-side rules below should be
+read as hygiene rather than as a security boundary.
 
-This is the one control an attacker with repository write access cannot reach.
-Everything else on the GitHub side they can: open and merge their own PR (0
-approvals), and — because `pull_request` runs the workflow file from the PR head
-— redefine the very checks meant to gate the change. Environment protection
-rules live outside the repository contents, so neither a PR nor `GITHUB_TOKEN`
-can alter them, and approving needs an interactive session the pipeline has not
-got.
+A required reviewer on the `production` environment was tried and removed. It
+did not work: approving a deployment is an API call authorized by the `repo`
+scope, and the token holding that scope lives on the same machine as the
+pipeline. An attacker who owns the pipeline reads the token and approves their
+own deployment. It cost five minutes per deploy and bought false confidence.
 
-`prevent_self_review` is deliberately false. This is a solo repo; the point is
-not a second pair of eyes, it is that apply requires an out-of-band human action.
+More generally, everything on the GitHub side is reachable by someone with write
+access. They can open and merge their own PR (0 required approvals). Because
+`pull_request` runs the workflow file **from the PR head**, they can redefine the
+checks meant to gate their own change — and `integration_id` pinning does not
+help, because the `github-actions` app is what runs every workflow here,
+including a hostile one named `plan (bootstrap)`.
+
+**The containment is in AWS, not in GitHub.** See the threat model above: the
+apply role cannot escalate, cannot mint durable credentials, cannot leave two
+regions, cannot silence the audit trail or the spend alarms, and cannot touch
+the security floor. An attacker who owns this pipeline gets to change the
+account alias and the Access Analyzer, and everything they do is recorded.
+
+A genuine gate would require an approver identity the pipeline host cannot
+reach — a separate account whose credentials exist only on a phone, with
+`prevent_self_review: true`. Any approval path terminating in a token on the CI
+host is theatre by construction.
 
 The ruleset on `main` has **no bypass actors**, including you:
 
@@ -120,15 +133,18 @@ The ruleset on `main` has **no bypass actors**, including you:
 - signed commits required
 - linear history, squash merges only
 - force-push and deletion blocked
-- `plan (bootstrap)` and `plan (infra)` must pass, against current `main`,
-  **and must be reported by the `github-actions` app** (`integration_id` is
-  pinned — without that, anyone with write access could satisfy them directly
-  through the Statuses API)
+- `plan (bootstrap)` and `plan (infra)` must pass, against current `main`, and
+  must be reported by the `github-actions` app (`integration_id` pinned, which
+  stops Statuses-API forgery but *not* a hostile workflow in the PR itself)
 
 Alongside it: secret scanning with push protection; Dependabot alerts and
 security updates; workflow runs require approval from **all** external
-contributors; only four exact action SHAs may run; and GitHub rejects any
-workflow referencing an action by tag.
+contributors; only four named action repositories may run; and GitHub
+rejects any workflow referencing an action by tag rather than a commit SHA.
+
+Exact-SHA allowlisting was tried and reverted: every Dependabot SHA bump made
+its own PR unmergeable, and with Dependabot security updates enabled that meant
+the emergency path was the one that jammed.
 
 ### Two things that are weaker than they look
 
@@ -150,6 +166,31 @@ gets Verified commits without holding a key. And with squash-only merges GitHub
 authors the merge commit itself. The rule is kept — it costs nothing and stops
 naive direct pushes — but do not build an argument on it. Commit authenticity
 comes from the environment reviewer above.
+
+### Controls that can fail silently
+
+Two have already done so, which is why `tofu-plan.yml` has a `health` job:
+
+- **CloudTrail delivered nothing for 108 minutes** while reporting
+  `IsLogging: true`. A bucket-policy statement copied from the state bucket
+  denied CloudTrail's own writes, because `aws:PrincipalAccount` is unset for
+  service principals and `StringNotEquals` against a missing key is true. Only
+  `LatestDeliveryError` showed it.
+- **The cost-alert SNS topic can sit at zero confirmed subscribers** while
+  `tofu apply` reports success. Email subscriptions need a human to click a
+  link, and any edit to `cost_alert_emails` recreates them — silently reverting
+  alerting to dead. OpenTofu cannot detect this: a pending subscription's ARN is
+  the literal string `PendingConfirmation`, so there is nothing to diff.
+
+Check both by hand with:
+
+```bash
+aws cloudtrail get-trail-status --name marcusdunnca-management-events \
+  --query '{Logging:IsLogging,Err:LatestDeliveryError}'
+aws sns get-topic-attributes --region us-east-1 \
+  --topic-arn arn:aws:sns:us-east-1:812642122818:marcusdunnca-cost-alerts \
+  --query 'Attributes.{Confirmed:SubscriptionsConfirmed,Pending:SubscriptionsPending}'
+```
 
 ## First-time setup
 
