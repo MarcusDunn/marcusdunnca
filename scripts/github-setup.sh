@@ -24,7 +24,7 @@ echo "==> Target repository: $SLUG"
 # Fail loudly and early. `tofu` is only needed midway through, to read the role
 # ARNs from bootstrap outputs — without this check the script aborts there under
 # `set -e`, having already applied half the settings, and the later steps
-# (notably the environment's required reviewer) are silently skipped.
+# (the environment and the ruleset) are silently skipped.
 for cmd in gh tofu jq; do
   command -v "$cmd" >/dev/null || {
     echo "Missing '$cmd'. Run this from inside 'nix develop'." >&2
@@ -256,7 +256,8 @@ RULESET_JSON="$(cat <<'JSON'
         "strict_required_status_checks_policy": true,
         "required_status_checks": [
           { "context": "plan (bootstrap)", "integration_id": 15368 },
-          { "context": "plan (infra)", "integration_id": 15368 }
+          { "context": "plan (infra)", "integration_id": 15368 },
+          { "context": "health", "integration_id": 15368 }
         ]
       }
     }
