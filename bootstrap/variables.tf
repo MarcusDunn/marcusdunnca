@@ -115,3 +115,21 @@ variable "account_alias" {
   type        = string
   default     = "marcusdunnca"
 }
+
+variable "monthly_budget_usd" {
+  description = "Monthly cost budget in USD. Alerts fire at $1 actual, at the limit, and on a forecast breach."
+  type        = string
+  default     = "5"
+}
+
+variable "cost_alert_email" {
+  description = <<-EOT
+    Where budget and cost-anomaly alerts go. Cloudflare forwards
+    aws-root@marcusdunn.ca to the personal mailbox.
+
+    Note AWS sends a one-time SNS-style confirmation for anomaly subscriptions
+    to this address; alerts do not flow until it is confirmed.
+  EOT
+  type        = string
+  default     = "aws-root@marcusdunn.ca"
+}

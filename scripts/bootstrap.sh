@@ -87,7 +87,12 @@ if [ -f backend.hcl ] && aws s3api head-bucket --bucket "$STATE_BUCKET" >/dev/nu
   # Normal path: bucket and backend config already exist.
   # --------------------------------------------------------------------------
   echo "==> State bucket exists; initialising against S3 backend"
-  tofu init -input=false -reconfigure -backend-config=backend.hcl
+  # -lockfile=readonly makes init FAIL rather than silently adding a provider
+  # that appeared in state but not in the committed lockfile. That is the
+  # detection for state-injected providers: this module is applied by a human
+  # holding AdministratorAccess, and init/plan execute provider binaries before
+  # the apply prompt is ever shown.
+  tofu init -input=false -reconfigure -lockfile=readonly -backend-config=backend.hcl
   tofu apply -input=false
 else
   # --------------------------------------------------------------------------

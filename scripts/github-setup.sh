@@ -21,6 +21,17 @@ ENVIRONMENT="production"
 
 echo "==> Target repository: $SLUG"
 
+# Fail loudly and early. `tofu` is only needed midway through, to read the role
+# ARNs from bootstrap outputs — without this check the script aborts there under
+# `set -e`, having already applied half the settings, and the later steps
+# (notably the environment's required reviewer) are silently skipped.
+for cmd in gh tofu jq; do
+  command -v "$cmd" >/dev/null || {
+    echo "Missing '$cmd'. Run this from inside 'nix develop'." >&2
+    exit 1
+  }
+done
+
 # ---------------------------------------------------------------------------
 # Repository settings
 # ---------------------------------------------------------------------------
@@ -74,7 +85,7 @@ gh api -X PUT "repos/${SLUG}/actions/permissions/fork-pr-contributor-approval" \
 
 # An allowlist of exactly the third-party actions this repo uses. A compromised
 # action runs in a job holding an OIDC token, so "any action from anywhere" is
-# not an acceptable default. actions/* is covered by github_owned_allowed.
+# not an acceptable default.
 #
 # sha_pinning_required makes GitHub reject a workflow referencing an action by
 # tag rather than commit SHA — enforcing at the platform level what the
@@ -84,15 +95,30 @@ gh api -X PUT "repos/${SLUG}/actions/permissions" --input - >/dev/null <<'JSON'
 { "enabled": true, "allowed_actions": "selected", "sha_pinning_required": true }
 JSON
 
+# Exact SHAs, not `owner/repo@*`.
+#
+# A wildcard pattern permits ANY commit in that action's repository — including
+# commits from unmerged fork pull requests, which GitHub will happily serve,
+# because Actions resolves a reference by fetching that object from the repo's
+# network. An attacker could open a PR against an allowlisted action, never get
+# it merged, and reference its SHA here: 40 hex characters satisfies
+# sha_pinning_required, and the owner matches the pattern.
+#
+# github_owned_allowed is off for the same reason — it blanket-permitted every
+# action under actions/*. actions/checkout is enumerated explicitly instead.
+#
+# Cost: these must be updated in lockstep with Dependabot's SHA bumps. That is
+# the friction being bought deliberately, and it is why github_actions is
+# excluded from auto-merge — those PRs need a human anyway.
 gh api -X PUT "repos/${SLUG}/actions/permissions/selected-actions" --input - >/dev/null <<'JSON'
 {
-  "github_owned_allowed": true,
+  "github_owned_allowed": false,
   "verified_allowed": false,
   "patterns_allowed": [
-    "aws-actions/configure-aws-credentials@*",
-    "opentofu/setup-opentofu@*",
-    "dependabot/fetch-metadata@*",
-    "DeterminateSystems/nix-installer-action@*"
+    "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+    "opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4",
+    "aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c",
+    "dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98"
   ]
 }
 JSON
@@ -145,9 +171,28 @@ fi
 # which the apply role's trust policy demands; restricting the environment to
 # main is what stops any other branch from doing so.
 # ---------------------------------------------------------------------------
-echo "==> Creating protected '${ENVIRONMENT}' environment"
-gh api -X PUT "repos/${SLUG}/environments/${ENVIRONMENT}" --input - >/dev/null <<'JSON'
+#
+# The required reviewer is the single most important control in this repo.
+#
+# Everything on the GitHub side is reachable by someone with repository write
+# access: they can open and merge their own PR (0 approvals), and for
+# pull_request events the workflow file comes from the PR head, so the checks
+# guarding a change can be redefined by that change. Environment protection
+# rules are different — they live outside the repository contents and cannot be
+# altered by a PR or by GITHUB_TOKEN. Approving a deployment requires an
+# interactive click in a session the pipeline does not have.
+#
+# prevent_self_review is false on purpose: this is a solo repo, and the point is
+# not a second pair of eyes but that apply requires an out-of-band human action.
+# wait_timer gives a window to cancel a deployment you did not expect.
+OWNER_ID="$(gh api "users/${OWNER}" --jq .id)"
+echo "==> Creating protected '${ENVIRONMENT}' environment (reviewer: ${OWNER}, id ${OWNER_ID})"
+gh api -X PUT "repos/${SLUG}/environments/${ENVIRONMENT}" --input - >/dev/null <<JSON
 {
+  "wait_timer": 5,
+  "prevent_self_review": false,
+  "reviewers": [{ "type": "User", "id": ${OWNER_ID} }],
+  "can_admins_bypass": false,
   "deployment_branch_policy": {
     "protected_branches": false,
     "custom_branch_policies": true

@@ -23,7 +23,16 @@ still cannot:
 - run up a bill — every region but `ca-central-1`/`us-east-1` is denied, and
   expensive service families are denied by name on top of not being allowlisted
 - destroy or ransom the record — state object versions cannot be deleted, and
-  CloudTrail cannot be stopped, deleted, or retargeted
+  CloudTrail cannot be stopped, deleted, or retargeted. The state bucket also has
+  S3 Object Lock in GOVERNANCE mode (7 days), so version immutability is a
+  property of the bucket rather than resting solely on an identity policy;
+  `s3:BypassGovernanceRetention` is denied to both roles
+- poison the human's apply — CI cannot write `bootstrap/terraform.tfstate`.
+  OpenTofu resolves providers from *state*, not only config, so a writable
+  bootstrap state would mean arbitrary code execution on the operator's
+  workstation under `AdministratorAccess` at the next `bootstrap.sh` run
+- spend quietly — a budget and an immediate cost-anomaly subscription are managed
+  here as code, and CI is denied the ability to modify or delete either
 - weaken the account's defences — the security floor is human-applied and CI is
   denied permission to touch it
 - read application data — the plan role's object reads are confined to the state
@@ -86,6 +95,23 @@ repositories below the Pro plan, and enforced branch protection was judged worth
 more than keeping the topology unpublished. Nothing here is a credential, so
 what is exposed is reconnaissance value, not access.
 
+### Apply requires a human
+
+`main` → apply is **not** automatic. The `production` environment has a required
+reviewer, a 5-minute wait timer, and `can_admins_bypass: false`. Merging queues a
+deployment; it runs when you approve it.
+
+This is the one control an attacker with repository write access cannot reach.
+Everything else on the GitHub side they can: open and merge their own PR (0
+approvals), and — because `pull_request` runs the workflow file from the PR head
+— redefine the very checks meant to gate the change. Environment protection
+rules live outside the repository contents, so neither a PR nor `GITHUB_TOKEN`
+can alter them, and approving needs an interactive session the pipeline has not
+got.
+
+`prevent_self_review` is deliberately false. This is a solo repo; the point is
+not a second pair of eyes, it is that apply requires an out-of-band human action.
+
 The ruleset on `main` has **no bypass actors**, including you:
 
 - all changes via pull request (0 required approvals — solo repo, and GitHub
@@ -94,24 +120,36 @@ The ruleset on `main` has **no bypass actors**, including you:
 - signed commits required
 - linear history, squash merges only
 - force-push and deletion blocked
-- `plan (bootstrap)` and `plan (infra)` must pass, against current `main`
+- `plan (bootstrap)` and `plan (infra)` must pass, against current `main`,
+  **and must be reported by the `github-actions` app** (`integration_id` is
+  pinned — without that, anyone with write access could satisfy them directly
+  through the Statuses API)
 
-Alongside it: secret scanning with push protection; workflow runs require
-approval from **all** external contributors; only an allowlist of actions may
-run; and GitHub rejects any workflow referencing an action by tag rather than a
-commit SHA.
+Alongside it: secret scanning with push protection; Dependabot alerts and
+security updates; workflow runs require approval from **all** external
+contributors; only four exact action SHAs may run; and GitHub rejects any
+workflow referencing an action by tag.
 
-### A note on the fork guard
+### Two things that are weaker than they look
 
-`tofu-plan.yml` refuses to run when the PR head is not this repository. This is
-**defence in depth, not a boundary**: for `pull_request` events GitHub runs the
-workflow file from the PR head, so a fork author can simply delete that check in
-their own copy.
+**The fork guard is defence in depth, not a boundary.** For `pull_request`
+events GitHub runs the workflow file from the PR head, so a fork author can
+delete the check in their own copy. What actually holds is that GitHub withholds
+`id-token: write` from fork PRs — a `permissions:` block cannot elevate it — plus
+the external-contributor approval requirement. And if both failed, the plan role
+is read-only and cannot read application data.
 
-What actually holds is that GitHub withholds `id-token: write` from fork PRs — a
-workflow's `permissions:` block cannot elevate it — plus the external-contributor
-approval requirement. And should both fail, the plan role is read-only and
-cannot read application data.
+Note the guard is a failing **step**, never a job-level `if:`. GitHub reports a
+conditionally-skipped *job* as **Success** to required status checks, so a
+job-level `if:` on a required check is a free pass rather than a gate. This
+shipped as a live vulnerability once; do not reintroduce it.
+
+**`required_signatures` attests to origin, not authorship.** GitHub signs any
+commit created through its API or web editor, so an attacker with write access
+gets Verified commits without holding a key. And with squash-only merges GitHub
+authors the merge commit itself. The rule is kept — it costs nothing and stops
+naive direct pushes — but do not build an argument on it. Commit authenticity
+comes from the environment reviewer above.
 
 ## First-time setup
 
