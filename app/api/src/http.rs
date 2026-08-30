@@ -41,6 +41,31 @@ pub fn no_content(origin: &str) -> Response<Body> {
     base(origin, 204).body(Body::Empty).unwrap_or_default()
 }
 
+/// Every route other than the two registration routes, while the function is in
+/// registration mode.
+///
+/// 503 rather than 404, because the routes are not gone: they exist, they are
+/// simply unserveable until a credential is enrolled, and an operator staring at
+/// a broken deploy needs to be able to tell "not enrolled yet" from "wrong
+/// path". It says so in the body — which is a small amount of free information
+/// for a stranger, and worth it: the alternative is a silent 404 that looks
+/// identical to a routing bug, on the one deployment state where nobody can log
+/// in to investigate.
+///
+/// This includes `/health`. A deployment that cannot authenticate anyone is not
+/// healthy, and reporting otherwise would hide the exact condition this mode
+/// exists to signal.
+pub fn unavailable(origin: &str) -> Response<Body> {
+    const MESSAGE: &str = "no passkey is enrolled; this deployment is serving \
+                           registration only and no other route";
+
+    json(
+        origin,
+        503,
+        &serde_json::json!({ "message": MESSAGE, "error": MESSAGE }),
+    )
+}
+
 /// Map a domain error onto a status code and a body that is safe to show.
 ///
 /// `Aws` and `Json` deliberately collapse to a generic 500 message. Their
@@ -100,9 +125,22 @@ fn base(origin: &str, status: u16) -> lambda_http::http::response::Builder {
 pub fn preflight(origin: &str) -> Response<Body> {
     base(origin, 204)
         .header("access-control-allow-methods", "GET, POST, OPTIONS")
+        // `x-registration-token` is advertised unconditionally, even though only
+        // a deployment in registration mode reads it. Preflight is answered
+        // before the route — and therefore before the mode — is known, and the
+        // answer is cached by the browser for `max-age` seconds, so a
+        // mode-dependent list would hand a stale one to the very ceremony that
+        // needs it. Naming a header no live route reads costs nothing: CORS
+        // grants a browser permission to *send* it, not authority to do
+        // anything.
+        //
+        // NOTE: the Function URL has its own `cors` block, and AWS answers
+        // preflight from that configuration without invoking this function. This
+        // header must be in `allow_headers` there too or the browser will never
+        // get as far as the code above.
         .header(
             "access-control-allow-headers",
-            "authorization, content-type",
+            "authorization, content-type, x-registration-token",
         )
         .header("access-control-max-age", "600")
         .body(Body::Empty)

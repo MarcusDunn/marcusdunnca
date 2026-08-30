@@ -117,3 +117,29 @@ variable "max_upload_bytes" {
   type        = number
   default     = 4500000
 }
+
+
+variable "registration_token" {
+  description = <<-EOT
+    Shared secret gating the one-shot passkey enrolment routes. Empty disables
+    them entirely.
+
+    THIS IS SECRET AND MUST NOT BE COMMITTED. Note .gitignore ignores *.tfvars
+    but deliberately un-ignores *.auto.tfvars — so this must not go in an
+    auto.tfvars file.
+
+    Deliberately not wired to CI. Apply it locally for the ceremony
+    (`tofu apply -var=registration_token=...`), and the next CI apply reverts it
+    to empty, which closes the enrolment window automatically rather than
+    depending on anyone remembering.
+
+    Minimum 32 characters, enforced at cold start. Generate with
+    `openssl rand -base64 24`. Between enabling this and pasting credentials,
+    enrolment is protected only by this secret on an unauthenticated endpoint
+    whose sole throttle is the account concurrency limit of 10 — keep the window
+    to minutes.
+  EOT
+  type        = string
+  sensitive   = true
+  default     = ""
+}

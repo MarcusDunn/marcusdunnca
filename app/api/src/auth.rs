@@ -1,7 +1,9 @@
 //! WebAuthn assertion verification and JWT issue/verify.
 //!
-//! There is no password and no registration route. The only way in is a passkey
-//! whose public key is already in this function's configuration.
+//! There is no password. The only way in is a passkey whose public key is
+//! already in this function's configuration — and there is no route that can add
+//! one, except in the bootstrap mode in `register`, which exists only while that
+//! configuration is empty and cannot coexist with any of the routes here.
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
@@ -91,7 +93,7 @@ pub struct SessionResponse {
 pub async fn start_challenge(state: &AppState) -> Result<ChallengeResponse> {
     let (rcr, auth_state) = state
         .webauthn
-        .start_passkey_authentication(&state.credentials)
+        .start_passkey_authentication(state.credentials())
         .map_err(|e| {
             tracing::error!(error = ?e, "failed to start passkey authentication");
             Error::Unauthorized
@@ -205,7 +207,7 @@ pub async fn verify_assertion(
 
     // Deliberately no `Passkey::update_credential` call. Credentials are static
     // configuration here, so there is nowhere to write an updated counter, and
-    // synced passkeys report zero forever anyway. See `load_credentials`.
+    // synced passkeys report zero forever anyway. See `load_access`.
 
     issue_token(state)
 }

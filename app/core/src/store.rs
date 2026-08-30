@@ -544,12 +544,42 @@ impl Store {
     /// within 48 hours), so relying on it to enforce a 60-second window would
     /// give a 60-second window on paper and a two-day one in practice.
     pub async fn take_challenge(&self, challenge_b64: &str) -> Result<Option<ChallengeItem>> {
+        self.take_auth_item(keys::challenge_sk(challenge_b64)).await
+    }
+
+    // ---- passkey registration ---------------------------------------------
+    //
+    // Bootstrap only. Nothing writes these rows once `WEBAUTHN_CREDENTIALS` is
+    // non-empty — see the `api` crate's `register` module.
+
+    /// Store the state of a registration ceremony.
+    ///
+    /// The same write as [`Store::put_challenge`], named for what it stores so
+    /// the call site is not misleading; the sort key in `registration` is what
+    /// actually distinguishes the two.
+    pub async fn put_registration(&self, registration: &ChallengeItem) -> Result<()> {
+        self.put_challenge(registration).await
+    }
+
+    /// Consume a registration state, atomically.
+    ///
+    /// Single-use for the same reason a challenge is — see
+    /// [`Store::take_challenge`] — with the same expiry caveat: `expires_at` is
+    /// checked by the caller, because TTL is a sweep and not a deadline.
+    pub async fn take_registration(&self, id: &str) -> Result<Option<ChallengeItem>> {
+        self.take_auth_item(keys::registration_sk(id)).await
+    }
+
+    /// The delete-and-return shared by both ceremonies. `sk` is taken already
+    /// built so there is one code path and no chance of a caller passing a raw
+    /// id where a prefixed key belongs.
+    async fn take_auth_item(&self, sk: String) -> Result<Option<ChallengeItem>> {
         let out = self
             .client
             .delete_item()
             .table_name(&self.table)
             .key("pk", AttributeValue::S(keys::AUTH_PK.to_string()))
-            .key("sk", AttributeValue::S(keys::challenge_sk(challenge_b64)))
+            .key("sk", AttributeValue::S(sk))
             .return_values(ReturnValue::AllOld)
             .send()
             .await

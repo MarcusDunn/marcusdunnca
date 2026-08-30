@@ -53,10 +53,9 @@ pub struct AppState {
     pub jwt_key: JwtKeys,
 
     pub webauthn: Webauthn,
-    /// The registered credentials, from `WEBAUTHN_CREDENTIALS`. Public data —
-    /// a credential id and a public key are not secrets — which is why they can
-    /// live in Lambda configuration rather than in Parameter Store.
-    pub credentials: Vec<Passkey>,
+    /// Whether this deployment can log anyone in yet, and what it serves if it
+    /// cannot. See [`Access`].
+    pub access: Access,
 
     /// Exact origin allowed by CORS, and the origin WebAuthn assertions are
     /// checked against. One value, used for both, because a mismatch between
@@ -74,6 +73,32 @@ pub struct AppState {
 pub struct JwtKeys {
     pub encoding: jsonwebtoken::EncodingKey,
     pub decoding: jsonwebtoken::DecodingKey,
+}
+
+/// The two states this function can come up in.
+///
+/// An enum rather than a `Vec<Passkey>` plus an `Option<String>`, because the
+/// property that matters is that they are **mutually exclusive**: enrolment must
+/// be impossible the moment a real credential exists. Expressed as two fields,
+/// that invariant would live in whichever `if` happened to check it, and the
+/// failure mode of getting it wrong is a permanently reachable "add a passkey"
+/// endpoint on an unauthenticated Function URL. Expressed as this enum, it is
+/// established once in [`load_access`] and cannot be violated downstream.
+pub enum Access {
+    /// The normal state: at least one credential, no way to add another.
+    Live { credentials: Vec<Passkey> },
+
+    /// The bootstrap state, and the answer to a genuine deadlock: the only way
+    /// to produce a `WEBAUTHN_CREDENTIALS` value is to run a registration
+    /// ceremony, the ceremony is bound to origin `APP_ORIGIN` so it cannot be
+    /// run from a laptop, and the deployed function refuses to start without
+    /// credentials. So a deployment with none — and only a deployment with
+    /// none — serves the two `/auth/register/*` routes and nothing else.
+    ///
+    /// The token is what stops that window from being open enrolment for
+    /// whoever finds the URL first. It is a bearer secret: whoever presents it
+    /// owns the app.
+    Registration { token: String },
 }
 
 impl AppState {
@@ -117,7 +142,7 @@ impl AppState {
             .build()
             .map_err(|e| Error::Config(format!("webauthn configuration: {e}")))?;
 
-        let credentials = load_credentials()?;
+        let access = load_access()?;
 
         Ok(Self {
             store,
@@ -125,7 +150,7 @@ impl AppState {
             docs_bucket,
             jwt_key,
             webauthn,
-            credentials,
+            access,
             origin,
             max_upload_bytes,
         })
@@ -134,6 +159,28 @@ impl AppState {
     pub fn presigning(&self) -> Result<PresigningConfig> {
         PresigningConfig::expires_in(PRESIGN_TTL)
             .map_err(|e| Error::Config(format!("presigning config: {e}")))
+    }
+
+    /// The passkeys a login may be attempted against.
+    ///
+    /// Empty in registration mode, which the router makes unreachable from the
+    /// login routes — and which would fail closed anyway: an assertion against
+    /// an empty credential set matches nothing.
+    pub fn credentials(&self) -> &[Passkey] {
+        match &self.access {
+            Access::Live { credentials } => credentials,
+            Access::Registration { .. } => &[],
+        }
+    }
+
+    /// `Some` only in registration mode. This is the single test the router uses
+    /// to decide whether to serve the app or the enrolment ceremony, so there is
+    /// exactly one place where "is this deployment enrolled?" is answered.
+    pub fn registration_token(&self) -> Option<&str> {
+        match &self.access {
+            Access::Live { .. } => None,
+            Access::Registration { token } => Some(token),
+        }
     }
 }
 
@@ -172,14 +219,35 @@ async fn fetch_signing_key(ssm: &aws_sdk_ssm::Client, name: &str) -> Result<Stri
     Ok(value)
 }
 
-/// Parse `WEBAUTHN_CREDENTIALS`.
+/// Shortest `REGISTRATION_TOKEN` this will accept.
 ///
-/// The value is a JSON array of serialized webauthn-rs `Passkey`s, i.e.
-/// `[{"cred": {...}}, ...]`. There is no registration endpoint in this app by
-/// design — a personal tool with exactly one user does not need a permanently
-/// reachable "enrol a new credential" route, and having one is strictly a
-/// liability — so credentials are produced out of band and pasted into
-/// configuration.
+/// The registration routes sit on an unauthenticated Function URL with no rate
+/// limit in front of them, so the token is the only thing between an
+/// unenrolled deployment and whoever guesses it. Thirty-two characters is what
+/// `openssl rand -base64 24` produces, and refusing anything shorter at cold
+/// start is the only moment this code gets to have an opinion — after that the
+/// value is just a string being compared.
+const MIN_REGISTRATION_TOKEN_LEN: usize = 32;
+
+/// Decide between serving the app and serving the enrolment ceremony.
+///
+/// `WEBAUTHN_CREDENTIALS` is a JSON array of serialized webauthn-rs `Passkey`s,
+/// i.e. `[{"cred": {...}}, ...]`. There is no registration endpoint in this app
+/// by design — a personal tool with exactly one user does not need a
+/// permanently reachable "enrol a new credential" route, and having one is
+/// strictly a liability — so credentials are produced out of band and pasted
+/// into configuration.
+///
+/// The exception is the bootstrap, and it is narrow: a *non-empty* list is
+/// checked first and wins unconditionally, so `REGISTRATION_TOKEN` is dead
+/// configuration the instant a credential exists. Leaving the token set after
+/// enrolment is untidy, not dangerous. The reverse — clearing
+/// `WEBAUTHN_CREDENTIALS` — reopens enrolment, which is the correct behaviour
+/// for a deployment that can no longer authenticate anyone but is worth knowing.
+///
+/// A *malformed* list is an error in both modes. Falling through to registration
+/// mode on a parse failure would turn a typo in configuration into an open
+/// enrolment window on a running, previously-enrolled app.
 ///
 /// **The stored `counter` should be left at whatever registration produced,
 /// and is never updated by this app.** webauthn-rs only performs the signature
@@ -191,27 +259,59 @@ async fn fetch_signing_key(ssm: &aws_sdk_ssm::Client, name: &str) -> Result<Stri
 /// this app is used with, and it protects against cloning of *hardware* keys
 /// that synced passkeys are not.
 ///
-/// An empty list is refused. A deployment with no credentials cannot
-/// authenticate anyone, and failing at cold start says so, whereas starting
-/// successfully produces a login page that rejects every attempt for reasons
-/// that look like a passkey problem.
-fn load_credentials() -> Result<Vec<Passkey>> {
-    let raw = config::require("WEBAUTHN_CREDENTIALS")?;
+/// An empty list with no registration token is still refused. A deployment with
+/// no credentials cannot authenticate anyone, and failing at cold start says so,
+/// whereas starting successfully produces a login page that rejects every
+/// attempt for reasons that look like a passkey problem.
+fn load_access() -> Result<Access> {
+    // Not `config::require`: absent and `"[]"` are the same state — no
+    // credentials — and Terraform's default for this variable is `"[]"`, so
+    // both spellings reach here on a first deploy.
+    let raw = std::env::var("WEBAUTHN_CREDENTIALS").unwrap_or_default();
 
-    let creds: Vec<Passkey> = serde_json::from_str(&raw).map_err(|e| {
-        // The error deliberately does not echo `raw`. Credentials are public,
-        // but echoing configuration into logs is a habit that eventually
-        // echoes something that is not.
-        Error::Config(format!(
-            "WEBAUTHN_CREDENTIALS is not a JSON array of webauthn-rs Passkeys: {e}"
-        ))
-    })?;
+    let credentials: Vec<Passkey> = if raw.trim().is_empty() {
+        Vec::new()
+    } else {
+        serde_json::from_str(&raw).map_err(|e| {
+            // The error deliberately does not echo `raw`. Credentials are
+            // public, but echoing configuration into logs is a habit that
+            // eventually echoes something that is not.
+            Error::Config(format!(
+                "WEBAUTHN_CREDENTIALS is not a JSON array of webauthn-rs Passkeys: {e}"
+            ))
+        })?
+    };
 
-    if creds.is_empty() {
+    if !credentials.is_empty() {
+        return Ok(Access::Live { credentials });
+    }
+
+    let token = std::env::var("REGISTRATION_TOKEN").unwrap_or_default();
+    let token = token.trim();
+
+    if token.is_empty() {
         return Err(Error::Config(
-            "WEBAUTHN_CREDENTIALS is empty; no one could log in".into(),
+            "WEBAUTHN_CREDENTIALS is empty; no one could log in \
+             (set REGISTRATION_TOKEN to start in registration mode instead)"
+                .into(),
         ));
     }
 
-    Ok(creds)
+    // Length only. The value is never logged, never returned and never included
+    // in an error, for the same reason the JWT secret is not: this one grants
+    // enrolment, which grants everything.
+    if token.len() < MIN_REGISTRATION_TOKEN_LEN {
+        return Err(Error::Config(format!(
+            "REGISTRATION_TOKEN is shorter than {MIN_REGISTRATION_TOKEN_LEN} characters"
+        )));
+    }
+
+    // Deliberately loud, and the one log line that says this is happening. An
+    // operator who sees this on a deployment that was working has just wiped
+    // their credentials.
+    tracing::warn!("no credentials configured; serving passkey registration only");
+
+    Ok(Access::Registration {
+        token: token.to_string(),
+    })
 }
