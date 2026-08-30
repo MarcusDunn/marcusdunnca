@@ -337,7 +337,7 @@ if [ -f "${REPO_ROOT}/infra/backend.hcl" ]; then
     echo "==> Publishing application deploy targets"
     gh variable set SITE_BUCKET               --repo "$SLUG" --body "$(tofu output -raw site_bucket)"
     gh variable set CLOUDFRONT_DISTRIBUTION_ID --repo "$SLUG" --body "$(tofu output -raw cloudfront_distribution_id)"
-    gh variable set API_BASE_URL              --repo "$SLUG" --body "$(tofu output -raw api_function_url)"
+    gh variable set API_BASE_URL              --repo "$SLUG" --body "$(tofu output -raw api_base_url)"
     echo "    SITE_BUCKET, CLOUDFRONT_DISTRIBUTION_ID, API_BASE_URL"
   else
     echo "==> Skipping deploy targets (infra outputs not present yet)"

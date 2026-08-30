@@ -63,7 +63,42 @@ resource "aws_cloudfront_distribution" "site" {
     origin_access_control_id = aws_cloudfront_origin_access_control.site.id
   }
 
+  origin {
+    origin_id = "api"
+    # The Function URL host, without scheme or trailing slash.
+    domain_name              = replace(replace(aws_lambda_function_url.api.function_url, "https://", ""), "/", "")
+    origin_access_control_id = aws_cloudfront_origin_access_control.api.id
+
+    custom_origin_config {
+      http_port              = 80
+      https_port             = 443
+      origin_protocol_policy = "https-only"
+      origin_ssl_protocols   = ["TLSv1.2"]
+    }
+  }
+
+  ordered_cache_behavior {
+    path_pattern           = "/api/*"
+    target_origin_id       = "api"
+    viewer_protocol_policy = "https-only"
+    allowed_methods        = ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
+    cached_methods         = ["GET", "HEAD"]
+
+    cache_policy_id          = data.aws_cloudfront_cache_policy.caching_disabled.id
+    origin_request_policy_id = data.aws_cloudfront_origin_request_policy.all_viewer_except_host.id
+
+    function_association {
+      event_type   = "viewer-request"
+      function_arn = aws_cloudfront_function.strip_api_prefix.arn
+    }
+  }
+
   default_cache_behavior {
+    function_association {
+      event_type   = "viewer-request"
+      function_arn = aws_cloudfront_function.spa_rewrite.arn
+    }
+
     target_origin_id = "site"
 
     # Read-only. Writes go to the api Function URL directly, never through here.
@@ -84,19 +119,16 @@ resource "aws_cloudfront_distribution" "site" {
   # The cost of this is that genuinely missing assets also return 200 with HTML.
   # A short TTL keeps a transient origin problem from being cached as a
   # not-found for an hour.
-  custom_error_response {
-    error_code            = 403
-    response_code         = 200
-    response_page_path    = "/index.html"
-    error_caching_min_ttl = 10
-  }
-
-  custom_error_response {
-    error_code            = 404
-    response_code         = 200
-    response_page_path    = "/index.html"
-    error_caching_min_ttl = 10
-  }
+  # NO custom_error_response, deliberately.
+  #
+  # It is configured per-distribution, not per-behaviour, so mapping 403/404 to
+  # index.html rewrote the API's errors too: a 403 from the Function URL came
+  # back as index.html with a 200 and `server: AmazonS3`. That masked a real
+  # SigV4 failure completely — the handler was never invoked and there was
+  # nothing in its logs, while the response looked like a success.
+  #
+  # SPA deep links are handled by the rewrite function on the default behaviour
+  # instead, which only ever runs for the site origin.
 
   # Required block. No restriction: geo-blocking is not a security control and
   # would only get in the way of travelling.
@@ -166,4 +198,104 @@ output "cloudfront_distribution_domain_name" {
 output "cloudfront_distribution_id" {
   description = "Invalidation target for the site deploy workflow."
   value       = aws_cloudfront_distribution.site.id
+}
+
+# ---------------------------------------------------------------------------
+# The api, served from the same origin as the SPA.
+#
+# Routing /api/* through this distribution rather than calling the Function URL
+# directly removes CORS from the picture entirely — a same-origin request has no
+# preflight, no Access-Control-Allow-Origin, and therefore none of the failure
+# modes that cost most of an evening here: a duplicate ACAO header from two
+# layers both configuring CORS, a preflight cached for an hour against a config
+# that had since changed, and a custom header refused by a CORS block that
+# answers preflight without ever invoking the handler.
+#
+# It also closes a real exposure. The Function URL was AUTH_TYPE=NONE and
+# publicly invocable by anyone who knew it; with account concurrency capped at
+# 10, that is a trivially available exhaustion vector. Behind an Origin Access
+# Control with AWS_IAM, only this distribution can invoke it.
+# ---------------------------------------------------------------------------
+
+resource "aws_cloudfront_origin_access_control" "api" {
+  name                              = "${var.project}-api"
+  description                       = "Signs CloudFront requests to the api Function URL."
+  origin_access_control_origin_type = "lambda"
+  signing_behavior                  = "always"
+  signing_protocol                  = "sigv4"
+}
+
+# CloudFront forwards the full path, so /api/docs would arrive as /api/docs and
+# match no route. Stripping the prefix at the edge keeps the handler's routing
+# table identical whether it is reached directly or through the distribution —
+# the alternative, teaching the handler about a prefix that only exists in one
+# deployment topology, bakes the CDN into the application.
+resource "aws_cloudfront_function" "strip_api_prefix" {
+  name    = "${var.project}-strip-api-prefix"
+  runtime = "cloudfront-js-2.0"
+  publish = true
+  comment = "Removes the /api prefix before the request reaches the Function URL."
+
+  code = <<-JS
+    function handler(event) {
+      var request = event.request;
+      request.uri = request.uri.replace(/^\/api/, '');
+      if (request.uri === '') {
+        request.uri = '/';
+      }
+      return request;
+    }
+  JS
+}
+
+# Caching disabled, and Authorization forwarded. CloudFront strips Authorization
+# by default — the single most common way an API behind a distribution fails,
+# because every request simply arrives unauthenticated.
+data "aws_cloudfront_cache_policy" "caching_disabled" {
+  name = "Managed-CachingDisabled"
+}
+
+data "aws_cloudfront_origin_request_policy" "all_viewer_except_host" {
+  name = "Managed-AllViewerExceptHostHeader"
+}
+
+# Without this the OAC signs a request the function refuses. Scoped to this one
+# distribution by SourceArn, so another account's distribution cannot point at
+# the Function URL and inherit the permission.
+resource "aws_lambda_permission" "api_from_cloudfront" {
+  statement_id           = "AllowCloudFrontInvoke"
+  action                 = "lambda:InvokeFunctionUrl"
+  function_name          = aws_lambda_function.api.function_name
+  principal              = "cloudfront.amazonaws.com"
+  source_arn             = aws_cloudfront_distribution.site.arn
+  function_url_auth_type = "AWS_IAM"
+}
+
+output "api_base_url" {
+  description = "Same-origin path the SPA calls. Not the Function URL, which is no longer publicly invocable."
+  value       = "https://${var.app_domain}/api"
+}
+
+# Extensionless paths are client-side routes and must serve the SPA shell;
+# anything with an extension is a real asset and must 404 honestly if missing.
+#
+# Doing this as a rewrite rather than an error mapping keeps it scoped to the
+# default behaviour, so it cannot touch /api/* — see the note above.
+resource "aws_cloudfront_function" "spa_rewrite" {
+  name    = "${var.project}-spa-rewrite"
+  runtime = "cloudfront-js-2.0"
+  publish = true
+  comment = "Serves index.html for client-side routes without masking asset or API errors."
+
+  code = <<-JS
+    function handler(event) {
+      var request = event.request;
+      var uri = request.uri;
+      if (uri === '/' || uri.indexOf('.') !== -1) {
+        return request;
+      }
+      request.uri = '/index.html';
+      return request;
+    }
+  JS
 }
