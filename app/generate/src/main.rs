@@ -24,20 +24,26 @@ use trainer_core::model::DocStatus;
 use trainer_core::store::Store;
 use trainer_core::tags::TAG_VERSION;
 
-/// Claude Sonnet 4.6 on the global inference profile.
+/// Claude Sonnet 4.6 on the US cross-region inference profile.
 ///
 /// This replaced Nova Lite, and the tradeoff was made knowingly: Nova Lite was
 /// the only model with a genuine in-region (`ca.`) profile, so document text
-/// stayed in ca-central-1. A `global.` profile routes outside Canada. The
-/// reason it is worth it is question quality — measured on the same document,
-/// Nova produced questions answerable from general knowledge, no reasoning
-/// mode is available on the Nova family at any price, and structural failures
-/// persisted even under a JSON Schema. Sonnet with a thinking budget produced
-/// ten schema-clean questions anchored to the document's own tables.
+/// stayed in ca-central-1. A `us.` profile routes outside Canada. The reason it
+/// is worth it is question quality — measured on the same document, Nova
+/// produced questions answerable from general knowledge, no reasoning mode is
+/// available on the Nova family at any price, and structural failures persisted
+/// even under a JSON Schema. Sonnet with a thinking budget produced ten
+/// schema-clean questions anchored to the document's own tables.
+///
+/// `us.` and not `global.`, which is not a free choice: a global profile routes
+/// to a region-less model ARN that AWS authorizes with no `aws:RequestedRegion`
+/// in context, and the permissions boundary's region lock denies it — every
+/// generation fails with AccessDenied. See the note on `bedrock_model_id` in
+/// infra/variables.tf.
 ///
 /// Roughly 7c per document against Nova's 0.1c. At a handful of documents a
 /// month that is inside the noise of the budget.
-const DEFAULT_MODEL_ID: &str = "global.anthropic.claude-sonnet-4-6";
+const DEFAULT_MODEL_ID: &str = "us.anthropic.claude-sonnet-4-6";
 
 /// Thinking budget, in tokens. Zero disables it.
 ///
