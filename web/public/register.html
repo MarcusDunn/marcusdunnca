@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <!-- Same two tags as index.html, and for the same reasons: without the
+         viewport tag mobile Safari lays this out at 980px, and this page has to
+         be usable on the phone whose passkey is being enrolled. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <!-- This page must never be indexed. It is inert without the token, but a
+         search result pointing at "register a passkey" is an invitation. -->
+    <meta name="robots" content="noindex, nofollow" />
+    <title>Enrol a passkey — Reading Trainer</title>
+  </head>
+  <body>
+    <!--
+      Bootstrap only. This page exists to break one deadlock: WEBAUTHN_CREDENTIALS
+      can only be produced by a registration ceremony, the ceremony is bound to
+      this exact origin (RP ID marcusdunn.ca), and the API refuses to start
+      without credentials. So it runs here, on the deployed site, against an API
+      that is in registration mode — and once the credential is pasted into
+      tfvars and applied, the two routes it calls stop existing and this page
+      does nothing.
+
+      It is deliberately outside the SPA: no framework, no router, no build step,
+      no import of web/src. It is copied verbatim out of public/ by Vite, so it
+      cannot read VITE_API_BASE_URL the way src/lib/api.ts does — hence the base
+      URL input. That independence is the point. The ceremony has to work on a
+      deployment where the app itself cannot render a logged-in screen, and a
+      page that shares code with the app is a page that can be broken by the app.
+
+      Delete web/public/register.html and redeploy once both devices are
+      enrolled. Nothing else references it.
+    -->
+    <h1>Enrol a passkey</h1>
+
+    <p>
+      Run this once per device. Each run produces one credential; paste them all
+      into the <code>webauthn_credentials</code> array in tfvars, apply, and this
+      page stops working.
+    </p>
+
+    <form id="form">
+      <p>
+        <label>
+          API base URL (the Lambda Function URL, no trailing slash)<br />
+          <input
+            id="base"
+            type="url"
+            size="60"
+            required
+            placeholder="https://xxxxx.lambda-url.ca-central-1.on.aws"
+          />
+        </label>
+      </p>
+      <p>
+        <label>
+          Registration token (<code>REGISTRATION_TOKEN</code>)<br />
+          <!-- type=password so it is not shoulder-surfed or captured by a
+               screenshot of a failing ceremony. It is still a value typed into a
+               web page: treat it as burned after the enrolment window closes. -->
+          <input id="token" type="password" size="60" required autocomplete="off" />
+        </label>
+      </p>
+      <p><button type="submit" id="submit">Create passkey</button></p>
+    </form>
+
+    <p id="status" role="status"></p>
+
+    <div id="result" hidden>
+      <h2>Credential</h2>
+      <p>
+        One element of the <code>webauthn_credentials</code> array. Keep this if
+        you are enrolling a second device — you will need to merge both into one
+        array by hand.
+      </p>
+      <textarea id="credential" rows="8" cols="80" readonly></textarea>
+
+      <h2>tfvars line</h2>
+      <p>
+        Correct as-is for a <em>single</em> device. For two, put both credential
+        objects in the array before quoting it.
+      </p>
+      <textarea id="tfvars" rows="6" cols="80" readonly></textarea>
+
+      <h2>Then</h2>
+      <ol>
+        <li>Paste the line into your tfvars and <code>tofu apply</code>.</li>
+        <li>
+          Remove <code>REGISTRATION_TOKEN</code> from the function's environment.
+          It is dead configuration once credentials exist, but a token left lying
+          around is a token that gets reused.
+        </li>
+        <li>Load the app and sign in. Then delete this page.</li>
+      </ol>
+    </div>
+
+    <script>
+      // WebAuthn speaks ArrayBuffers; JSON speaks base64url. These two functions
+      // are the whole impedance mismatch — the same pair as web/src/lib/webauthn.ts,
+      // duplicated rather than imported because this file is served verbatim and
+      // has no build step to resolve an import through.
+      function base64UrlToBytes(value) {
+        const padded = value.replaceAll("-", "+").replaceAll("_", "/");
+        const binary = atob(padded.padEnd(Math.ceil(padded.length / 4) * 4, "="));
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+        return bytes;
+      }
+
+      function bytesToBase64Url(buffer) {
+        const bytes = new Uint8Array(buffer);
+        let binary = "";
+        for (const byte of bytes) binary += String.fromCharCode(byte);
+        return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+      }
+
+      const $ = (id) => document.getElementById(id);
+
+      function setStatus(text) {
+        $("status").textContent = text;
+      }
+
+      /**
+       * POST to the API with the token header.
+       *
+       * The header is what makes this a preflighted request, so the Function
+       * URL's CORS configuration must list `x-registration-token` in
+       * allow_headers. If it does not, this fails as an opaque network error
+       * with the real reason only in the browser console — which is why the
+       * catch below says so explicitly rather than reporting "failed to fetch".
+       */
+      async function post(base, path, token, body) {
+        let response;
+        try {
+          response = await fetch(base + path, {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              accept: "application/json",
+              "x-registration-token": token,
+            },
+            // allow_credentials is false on the Function URL; a credentialed
+            // request would be rejected outright.
+            credentials: "omit",
+            body: JSON.stringify(body),
+          });
+        } catch {
+          throw new Error(
+            "Network request failed. Check the base URL, and check that the " +
+              "Function URL's CORS allow_headers includes x-registration-token.",
+          );
+        }
+
+        const text = await response.text();
+        if (!response.ok) {
+          // The API returns {"message": ...} for every error it produces; fall
+          // back to the raw body so an error from anything in front of it
+          // (CloudFront, the Function URL itself) is still legible.
+          let message = text;
+          try {
+            message = JSON.parse(text).message ?? text;
+          } catch {
+            /* not JSON — show it as-is */
+          }
+          throw new Error(`${response.status}: ${message}`);
+        }
+        return JSON.parse(text);
+      }
+
+      $("form").addEventListener("submit", async (event) => {
+        event.preventDefault();
+        $("submit").disabled = true;
+        $("result").hidden = true;
+        setStatus("Starting…");
+
+        // Trailing slashes are stripped for the same reason api.ts strips them:
+        // the API normalises paths, but "//auth/register/begin" is a different
+        // request as far as the browser and any cache in front of it are
+        // concerned.
+        const base = $("base").value.trim().replace(/\/+$/, "");
+        const token = $("token").value;
+
+        try {
+          if (!window.isSecureContext || typeof window.PublicKeyCredential !== "function") {
+            throw new Error("This browser can't create passkeys, or the page isn't on HTTPS.");
+          }
+
+          const begin = await post(base, "/auth/register/begin", token, {});
+
+          // The server sends webauthn-rs's CreationChallengeResponse verbatim,
+          // so `publicKey` is already the right shape — every field except the
+          // binary ones can be passed straight through. Mutating the parsed
+          // object in place rather than rebuilding it means a field the server
+          // adds later (a new algorithm, an authenticatorSelection change)
+          // reaches the browser without an edit here.
+          const options = begin.publicKey;
+          options.challenge = base64UrlToBytes(options.challenge);
+          options.user.id = base64UrlToBytes(options.user.id);
+          if (Array.isArray(options.excludeCredentials)) {
+            for (const descriptor of options.excludeCredentials) {
+              descriptor.id = base64UrlToBytes(descriptor.id);
+            }
+          }
+
+          setStatus("Waiting for the authenticator…");
+          const credential = await navigator.credentials.create({ publicKey: options });
+          if (!credential) throw new Error("The passkey prompt was dismissed.");
+
+          const response = credential.response;
+
+          // Only credProps is forwarded, not the whole extension results object.
+          // These outputs are unsigned hints that the server stores and never
+          // trusts, but it parses them into typed fields — so a browser that
+          // reports, say, credProtect as a number where the server expects a
+          // string would fail the *whole* body parse and burn the ceremony for
+          // a value nothing reads. credProps is the one browsers actually
+          // return, and its shape ({rk: bool}) is stable.
+          const extensionResults = credential.getClientExtensionResults();
+          const clientExtensionResults =
+            extensionResults && typeof extensionResults.credProps === "object"
+              ? { credProps: extensionResults.credProps }
+              : {};
+
+          setStatus("Verifying…");
+          const finished = await post(base, "/auth/register/finish", token, {
+            registrationId: begin.registrationId,
+            credential: {
+              id: credential.id,
+              rawId: bytesToBase64Url(credential.rawId),
+              type: credential.type,
+              clientExtensionResults,
+              response: {
+                attestationObject: bytesToBase64Url(response.attestationObject),
+                clientDataJSON: bytesToBase64Url(response.clientDataJSON),
+                // Recorded at registration because it is the only time the
+                // authenticator reports it. The stored transports become the
+                // hints in allowCredentials at login, which is what tells a
+                // browser to offer the phone over hybrid rather than only
+                // looking for a local credential. Not available in every
+                // browser, and optional server-side.
+                ...(typeof response.getTransports === "function"
+                  ? { transports: response.getTransports() }
+                  : {}),
+              },
+            },
+          });
+
+          // Pretty-printed for reading; the tfvars value below is the compact
+          // form the server produced and round-tripped, and is the one that
+          // matters.
+          $("credential").value = JSON.stringify(finished.credential, null, 2);
+          // JSON.stringify of a string yields a quoted, escaped literal. HCL's
+          // quoted strings use the same escapes for " and \, so this is a
+          // correct tfvars value and there is no hand-escaping to get wrong.
+          $("tfvars").value =
+            "webauthn_credentials = " + JSON.stringify(finished.webauthnCredentials);
+          $("result").hidden = false;
+          setStatus("Done. Copy the value below before closing this tab.");
+        } catch (error) {
+          // NotAllowedError covers a dismissed prompt and a timeout alike.
+          const dismissed =
+            error instanceof DOMException &&
+            (error.name === "NotAllowedError" || error.name === "AbortError");
+          setStatus(dismissed ? "Passkey prompt dismissed." : `Failed — ${error.message}`);
+        } finally {
+          $("submit").disabled = false;
+        }
+      });
+    </script>
+  </body>
+</html>

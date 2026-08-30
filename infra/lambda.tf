@@ -308,6 +308,12 @@ resource "aws_lambda_function" "api" {
       # here — generate only ever sees a file that already exists.
       MAX_UPLOAD_BYTES = tostring(var.max_upload_bytes)
 
+      # Bootstrap only. Non-empty turns on passkey enrolment, and ONLY while
+      # webauthn_credentials is still empty — the handler models these as an
+      # either/or, so a deployment can never both hold credentials and accept
+      # new ones. Clearing this is what actually closes the window.
+      REGISTRATION_TOKEN = var.registration_token
+
       WEBAUTHN_CREDENTIALS = var.webauthn_credentials
     }
   }
@@ -346,9 +352,17 @@ resource "aws_lambda_function_url" "api" {
   authorization_type = "NONE"
 
   cors {
-    allow_origins     = ["https://${var.app_domain}"]
-    allow_methods     = ["GET", "POST", "PUT", "DELETE"]
-    allow_headers     = ["content-type", "authorization"]
+    allow_origins = ["https://${var.app_domain}"]
+    allow_methods = ["GET", "POST", "PUT", "DELETE"]
+    # x-registration-task is not optional while bootstrapping passkeys: AWS
+    # answers preflight from this block without ever invoking the handler, so a
+    # custom header the handler advertises is still refused by the browser
+    # unless it is listed here. The failure mode is an opaque "network request
+    # failed" with nothing in the logs, because the request never arrives.
+    #
+    # max_age below means a browser that preflighted before this landed can
+    # cache the refusal for an hour — use a fresh profile if that bites.
+    allow_headers     = ["content-type", "authorization", "x-registration-token"]
     allow_credentials = false
     max_age           = 3600
   }

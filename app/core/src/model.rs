@@ -289,15 +289,22 @@ pub struct Attempt {
     pub total: usize,
 }
 
-/// `AUTH` / `CHALLENGE#<b64url>`.
+/// `AUTH` / `CHALLENGE#<b64url>`, and — during the one-shot enrolment described
+/// in the `api` crate's `register` module — `AUTH` / `REGISTRATION#<uuid>`.
+///
+/// One type for both because the row *is* the same thing in both cases: an
+/// opaque serialized ceremony state, addressed by the id the client will hand
+/// back, that expires. Only `state`'s inner type differs, and neither side of
+/// this crate ever looks inside it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChallengeItem {
     pub pk: String,
     pub sk: String,
-    /// The serialized `PasskeyAuthentication` state. webauthn-rs requires this
-    /// to be held server-side between the two round trips; it binds the
-    /// challenge to the credential set and the user-verification policy that
-    /// were in force when it was issued.
+    /// The serialized `PasskeyAuthentication` (or, for a registration row,
+    /// `PasskeyRegistration`) state. webauthn-rs requires this to be held
+    /// server-side between the two round trips; it binds the challenge to the
+    /// credential set and the user-verification policy that were in force when
+    /// it was issued.
     pub state: String,
     /// Unix seconds. Doubles as the DynamoDB TTL attribute and as an explicit
     /// check in the handler — TTL deletion is best-effort and can lag by up to

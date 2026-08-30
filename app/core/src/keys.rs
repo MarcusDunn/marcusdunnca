@@ -43,6 +43,19 @@ pub fn challenge_sk(challenge_b64: &str) -> String {
     format!("CHALLENGE#{challenge_b64}")
 }
 
+/// Sort key of an in-flight passkey registration, in the same partition and
+/// with the same TTL treatment as the challenges above.
+///
+/// A separate prefix rather than reusing `CHALLENGE#`, because the two hold
+/// different serialized types — a `PasskeyRegistration` and a
+/// `PasskeyAuthentication` — and a row read as the wrong one is a
+/// deserialization failure at the least helpful moment. Rows under this prefix
+/// can only be written by a deployment that has no credentials at all; see the
+/// `api` crate's `register` module.
+pub fn registration_sk(id: &str) -> String {
+    format!("REGISTRATION#{id}")
+}
+
 /// Partition holding the daily generation counter.
 pub const QUOTA_PK: &str = "QUOTA";
 
