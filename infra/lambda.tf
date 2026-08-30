@@ -134,9 +134,16 @@ data "aws_iam_policy_document" "api" {
       "dynamodb:GetItem",
       "dynamodb:BatchGetItem",
       "dynamodb:Query",
+      # The handler lists with Scan, not Query — there is no GSI, deliberately:
+      # a secondary index is a second copy of the table with its own capacity,
+      # against a 5 RCU free-tier allowance. Granting Query without Scan is the
+      # kind of gap that type-checks, deploys, and then fails only on the one
+      # screen that lists anything.
+      "dynamodb:Scan",
       "dynamodb:PutItem",
       "dynamodb:UpdateItem",
       "dynamodb:DeleteItem",
+      "dynamodb:TransactWriteItems",
     ]
     resources = [aws_dynamodb_table.app.arn]
   }
@@ -209,9 +216,16 @@ data "aws_iam_policy_document" "generate" {
       "dynamodb:GetItem",
       "dynamodb:BatchGetItem",
       "dynamodb:Query",
+      # The handler lists with Scan, not Query — there is no GSI, deliberately:
+      # a secondary index is a second copy of the table with its own capacity,
+      # against a 5 RCU free-tier allowance. Granting Query without Scan is the
+      # kind of gap that type-checks, deploys, and then fails only on the one
+      # screen that lists anything.
+      "dynamodb:Scan",
       "dynamodb:PutItem",
       "dynamodb:UpdateItem",
       "dynamodb:DeleteItem",
+      "dynamodb:TransactWriteItems",
     ]
     resources = [aws_dynamodb_table.app.arn]
   }
