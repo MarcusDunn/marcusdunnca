@@ -46,3 +46,60 @@ variable "dynamodb_write_capacity" {
   type        = number
   default     = 5
 }
+
+variable "webauthn_credentials" {
+  description = <<-EOT
+    Registered passkeys, as a JSON array of {id, public_key} objects.
+
+    This is public data by construction — a WebAuthn credential ID and its
+    public key are what the browser hands any relying party during a ceremony,
+    and neither can be used to forge an assertion. It is a plain environment
+    variable rather than an SSM parameter for that reason: nothing here is worth
+    the KMS call on every cold start.
+
+    Empty by default. There is no self-service registration endpoint; enrolling
+    a passkey means pasting its record here and applying, which is the intended
+    friction for a single-user app.
+  EOT
+  type        = string
+  default     = "[]"
+}
+
+variable "bedrock_model_id" {
+  description = <<-EOT
+    Model the generate function invokes.
+
+    The `ca.` prefix is an in-region inference profile, not a foundation-model
+    ID: Nova Lite is one of the few models with a genuine Canadian profile, so
+    document text never leaves ca-central-1. Switching to a `us.` or `global.`
+    profile silently changes that, and would also need bedrock_allowed_models in
+    bootstrap/ widened to match.
+  EOT
+  type        = string
+  default     = "ca.amazon.nova-lite-v1:0"
+}
+
+variable "max_pages" {
+  description = <<-EOT
+    Pages of a document the generate function will read before giving up.
+
+    Bedrock bills per input token and a PDF page is on the order of a thousand
+    of them, so this is the per-document cost ceiling. It is enforced in the
+    handler because IAM has no condition key for token count.
+  EOT
+  type        = number
+  default     = 100
+}
+
+variable "daily_document_cap" {
+  description = <<-EOT
+    Documents the generate function will process in a rolling day.
+
+    The second half of the cost ceiling: max_pages bounds one invocation, this
+    bounds how many invocations a runaway upload loop can produce. Counted in
+    DynamoDB by the handler — S3 notifications have no throttle of their own,
+    and the account budget alarm fires hours after the money is gone.
+  EOT
+  type        = number
+  default     = 20
+}
