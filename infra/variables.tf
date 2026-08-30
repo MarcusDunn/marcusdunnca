@@ -80,19 +80,19 @@ variable "bedrock_model_id" {
     "ca.amazon.nova-lite-v1:0" and accepting those question-quality losses;
     nothing else in the stack depends on the choice.
 
-    **Do not change this to a `global.` profile without reading the region-lock
-    note in bootstrap/iam.tf.** It was briefly set to
-    "global.anthropic.claude-sonnet-4-6" and every generation failed with an
-    AccessDenied naming an explicit deny in the permissions boundary. A global
-    profile routes to a *region-less* model ARN —
-    `arn:aws:bedrock:::foundation-model/...` — and AWS authorizes that one with
-    no `aws:RequestedRegion` in context. `StringNotEquals` against a missing key
-    is true, so the region lock fires and denies it. Working as designed, and
-    invisible until a document fails.
+    **Any cross-region profile depends on the Bedrock exemption in
+    bootstrap/iam.tf's global_service_actions.** A cross-region inference
+    profile authorizes each of its routing targets with `aws:RequestedRegion`
+    set to *that target's* region, not the caller's: `us.` routes through
+    us-east-1, us-east-2, ca-central-1 and us-west-2, so a call made to the
+    ca-central-1 endpoint is authorized four times, twice against regions the
+    region lock does not allow. Every Sonnet profile does this, and a `global.`
+    profile additionally routes to a region-less ARN authorized with no
+    `aws:RequestedRegion` at all.
 
-    A `us.` profile has no such target: every model it routes to carries a real
-    region, the call is still made to the ca-central-1 endpoint, and the lock is
-    satisfied.
+    Without that exemption every generation fails with AccessDenied naming an
+    explicit deny in the permissions boundary — which is what happened, twice,
+    before it was added.
 
     Cost is roughly 7c per document against Nova's 0.1c — bounded by
     daily_document_cap and by the budget's spend brake, both unchanged.
