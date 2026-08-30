@@ -121,13 +121,11 @@ locals {
     "snowdevicemanagement:*",
     "aws-marketplace:Subscribe",
     "aws-marketplace:AcceptAgreementApprovalRequest",
-    # CloudFront and Route53 are exempt from the region lock (they are global),
-    # and are the two most likely first additions for a personal website — so
-    # they are exactly where the region lock provides no cost containment.
-    # CloudFront data-transfer-out is genuinely unbounded spend.
-    "cloudfront:CreateDistribution",
-    "cloudfront:CreateDistributionWithTags",
-    "cloudfront:UpdateDistribution",
+    # CloudFront distribution create/update was removed from this list when the
+    # application scope was agreed — it is now an allowlisted app service. Note
+    # the consequence: CloudFront is global, so the region lock gives it no cost
+    # containment, and data-transfer-out is genuinely unbounded. The $1 budget
+    # and the $1 anomaly subscription are what bound it now.
     "cloudfront:CreateStreamingDistribution",
     "route53:CreateHostedZone",
     "route53domains:RegisterDomain",
@@ -255,6 +253,35 @@ locals {
     "s3:PutAccountPublicAccessBlock",
     "ec2:DisableEbsEncryptionByDefault",
     "access-analyzer:DeleteAnalyzer",
+  ]
+
+  # Services an application role may EVER touch, whatever policies get attached
+  # to it. This is the whole point of the boundary: it is not a description of
+  # what a role does, it is a ceiling on what any role created by CI could do
+  # even if its inline policy said Action "*".
+  #
+  # Chosen to cover a small serverless app on free-tier-shaped services. logs is
+  # not optional — Lambda cannot write anything without it. Adding to this list
+  # widens every application role at once, so it deserves the same scrutiny as
+  # widening the apply role itself.
+  app_service_actions = [
+    "lambda:*",
+    "s3:*",
+    "sqs:*",
+    "sns:*",
+    "logs:*",
+    "cloudfront:*",
+    "xray:PutTraceSegments",
+    "xray:PutTelemetryRecords",
+  ]
+
+  # iam:PassRole is how a role gets handed to a service. Unconstrained it is a
+  # privilege-escalation primitive — pass a powerful role to a service you
+  # control and inherit it. Constrained to the services below, it is just
+  # ordinary wiring.
+  app_pass_role_services = [
+    "lambda.amazonaws.com",
+    "edgelambda.amazonaws.com",
   ]
 
   # Taking over a pre-existing unbounded role is how a boundary-wearing
@@ -388,18 +415,11 @@ data "aws_iam_policy_document" "ci_guardrails" {
     sid    = "DenyRoleAndPolicyCreation"
     effect = "Deny"
     actions = [
-      "iam:CreateRole",
-      "iam:CreatePolicy",
-      "iam:CreatePolicyVersion",
-      "iam:SetDefaultPolicyVersion",
-      "iam:PutRolePolicy",
-      "iam:AttachRolePolicy",
-      "iam:UpdateAssumeRolePolicy",
+      # Role creation is NO LONGER denied outright — the application needs
+      # execution roles. It is instead permitted only with the permissions
+      # boundary attached, by DenyRoleWorkWithoutBoundary below. Removing a
+      # boundary is still never allowed.
       "iam:DeleteRolePermissionsBoundary",
-      "iam:PutRolePermissionsBoundary",
-      # The wildcard verb list above does not match these, and each is a
-      # documented escalation primitive on its own.
-      "iam:PassRole",
       "iam:PutUserPolicy",
       "iam:AttachUserPolicy",
       "iam:PutGroupPolicy",
@@ -434,6 +454,47 @@ data "aws_iam_policy_document" "ci_guardrails" {
   # DeleteObject is granted on the state bucket for the .tflock key, so it can
   # only be denied on the trail bucket. Previously the audit log was protected
   # from DeleteObjectVersion but not from a plain delete marker.
+  # The control that makes iam:CreateRole safe to grant.
+  #
+  # Every role CI creates must carry the permissions boundary, which caps it at
+  # local.app_service_actions no matter what policy is attached. On CreateRole
+  # the condition key holds the boundary being set; if none is set the key is
+  # absent, and an absent key makes StringNotEquals TRUE — so the deny fires.
+  # No boundary, no role.
+  statement {
+    sid    = "DenyRoleWorkWithoutBoundary"
+    effect = "Deny"
+    actions = [
+      "iam:CreateRole",
+      "iam:PutRolePolicy",
+      "iam:AttachRolePolicy",
+      "iam:PutRolePermissionsBoundary",
+    ]
+    resources = ["${local.iam_root}:role/*"]
+
+    condition {
+      test     = "StringNotEquals"
+      variable = "iam:PermissionsBoundary"
+      values   = [local.boundary_arn]
+    }
+  }
+
+  # PassRole unconstrained is an escalation primitive: hand a powerful role to a
+  # service you control and inherit it. Constrained to the app services it is
+  # ordinary wiring. A missing iam:PassedToService key fails closed here too.
+  statement {
+    sid       = "DenyPassRoleExceptToAppServices"
+    effect    = "Deny"
+    actions   = ["iam:PassRole"]
+    resources = ["*"]
+
+    condition {
+      test     = "StringNotEquals"
+      variable = "iam:PassedToService"
+      values   = local.app_pass_role_services
+    }
+  }
+
   statement {
     sid       = "DenyDeletingAuditLogs"
     effect    = "Deny"
@@ -535,11 +596,13 @@ data "aws_iam_policy_document" "plan_permissions" {
       "iam:GetPolicyVersion",
       "iam:ListPolicyVersions",
     ]
+    # Widened from the four managed objects to all roles and policies, because
+    # CI now creates application execution roles and `tofu plan` must refresh
+    # them. Still read-only, and still excludes users and groups (there are
+    # none, and creating them is denied).
     resources = [
-      local.plan_role_arn,
-      local.apply_role_arn,
-      local.boundary_arn,
-      local.guardrail_arn,
+      "${local.iam_root}:role/*",
+      "${local.iam_root}:policy/*",
     ]
   }
 
@@ -696,6 +759,54 @@ data "aws_iam_policy_document" "apply_permissions" {
     resources = ["*"]
   }
 
+  # Application infrastructure. Same list the boundary caps created roles at, so
+  # CI cannot build something it could not also grant a role access to.
+  statement {
+    sid       = "ManageApplicationServices"
+    effect    = "Allow"
+    actions   = local.app_service_actions
+    resources = ["*"]
+  }
+
+  # Execution roles for the application. Safe to grant only because
+  # DenyRoleWorkWithoutBoundary forces every one of them to carry the boundary,
+  # and DenyPassRoleExceptToAppServices confines where they can be handed.
+  statement {
+    sid    = "ManageApplicationRoles"
+    effect = "Allow"
+    actions = [
+      "iam:CreateRole",
+      "iam:DeleteRole",
+      "iam:GetRole",
+      "iam:UpdateRole",
+      "iam:UpdateAssumeRolePolicy",
+      "iam:PassRole",
+      "iam:PutRolePolicy",
+      "iam:DeleteRolePolicy",
+      "iam:GetRolePolicy",
+      "iam:ListRolePolicies",
+      "iam:AttachRolePolicy",
+      "iam:DetachRolePolicy",
+      "iam:ListAttachedRolePolicies",
+      "iam:PutRolePermissionsBoundary",
+      "iam:TagRole",
+      "iam:UntagRole",
+      "iam:ListRoleTags",
+      "iam:CreatePolicy",
+      "iam:DeletePolicy",
+      "iam:CreatePolicyVersion",
+      "iam:DeletePolicyVersion",
+      "iam:GetPolicy",
+      "iam:GetPolicyVersion",
+      "iam:ListPolicyVersions",
+      "iam:ListEntitiesForPolicy",
+      "iam:TagPolicy",
+      "iam:UntagPolicy",
+      "iam:CreateServiceLinkedRole",
+    ]
+    resources = ["*"]
+  }
+
   # Access Analyzer provisions its own service-linked role on first use. This is
   # narrowly conditioned so it cannot be used to create a service-linked role
   # for any other service.
@@ -742,10 +853,13 @@ resource "aws_iam_role_policy_attachment" "apply_guardrails" {
 # ---------------------------------------------------------------------------
 
 data "aws_iam_policy_document" "ci_permissions_boundary" {
+  # The ceiling. A role wearing this boundary can never act outside these
+  # services, regardless of what policy CI attaches to it. This replaced a
+  # blanket Allow "*" — which made the boundary a formality rather than a limit.
   statement {
-    sid       = "AllowServiceAccessByDefault"
+    sid       = "AllowOnlyApplicationServices"
     effect    = "Allow"
-    actions   = ["*"]
+    actions   = local.app_service_actions
     resources = ["*"]
   }
 
@@ -817,6 +931,24 @@ data "aws_iam_policy_document" "ci_permissions_boundary" {
   # Rendered from the same lists as the guardrail. "*" rather than the bucket
   # ARNs: a role wearing this boundary has no legitimate reason to destroy
   # state, logs, or keys anywhere in the account.
+  # The control that makes iam:CreateRole safe to grant.
+  #
+  # PassRole unconstrained is an escalation primitive: hand a powerful role to a
+  # service you control and inherit it. Constrained to the app services, it is
+  # ordinary wiring. A missing iam:PassedToService key fails closed here too.
+  statement {
+    sid       = "DenyPassRoleExceptToAppServices"
+    effect    = "Deny"
+    actions   = ["iam:PassRole"]
+    resources = ["*"]
+
+    condition {
+      test     = "StringNotEquals"
+      variable = "iam:PassedToService"
+      values   = local.app_pass_role_services
+    }
+  }
+
   statement {
     sid       = "DenyStateAndAuditDestruction"
     effect    = "Deny"
