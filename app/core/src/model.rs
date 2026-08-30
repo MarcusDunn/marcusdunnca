@@ -203,6 +203,27 @@ pub struct DocMeta {
     /// abandoned" from "actually cost money".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub processed_at: Option<String>,
+
+    /// How many times generation has failed for infrastructure reasons.
+    ///
+    /// **This field is what stops a document being stranded.** An
+    /// infrastructure failure is retryable, so the handler puts the document
+    /// back to `pending` and fails the invocation so Lambda retries it. But
+    /// Lambda's retries are finite: once they are exhausted the event goes to
+    /// the dead-letter queue and *nothing* will ever deliver another S3 event
+    /// for an object that already exists. The document then sits at `pending`
+    /// for good — with no error text and, because the UI only offers Retry on
+    /// `failed`, no way for the reader to do anything about it.
+    ///
+    /// That is not hypothetical: it is exactly what an IAM misconfiguration
+    /// produced, and the symptom was a document that said "Queued" forever.
+    ///
+    /// Counting the failures here lets the handler recognise its own last
+    /// attempt and write `failed` instead of `pending`, which puts the document
+    /// back in reach of the Retry button. Reset on success and on a
+    /// user-initiated retry — it counts consecutive failures, not lifetime ones.
+    #[serde(default)]
+    pub generation_attempts: u32,
 }
 
 /// The projection used by `GET /docs`.

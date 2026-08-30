@@ -61,6 +61,18 @@ const DEFAULT_MAX_PAGES: usize = 100;
 /// Documents per UTC day.
 const DEFAULT_DAILY_CAP: u32 = 20;
 
+/// Consecutive infrastructure failures before a document is marked `failed`.
+///
+/// **This must be at least Lambda's total attempt count for the function**
+/// (`maximum_retry_attempts + 1`), or documents strand again: the handler would
+/// still be returning "put it back to pending, something will retry" on the
+/// very invocation that is the last one. Terraform derives the environment
+/// variable from the same input it configures Lambda with, precisely so the two
+/// cannot drift — see `generate_retry_attempts` in infra/variables.tf.
+///
+/// The default matches the default there (one retry, so two attempts).
+const DEFAULT_MAX_GENERATION_ATTEMPTS: u32 = 2;
+
 /// Ceiling on what is handed to Bedrock.
 ///
 /// The Converse API caps a single document block at roughly 4.5 MB, and exceeds
@@ -85,6 +97,7 @@ struct Config {
     max_pages: usize,
     daily_cap: u32,
     max_document_bytes: i64,
+    max_generation_attempts: u32,
 }
 
 impl Config {
@@ -107,6 +120,13 @@ impl Config {
             max_pages: config::parse_or("MAX_PAGES", DEFAULT_MAX_PAGES)?,
             daily_cap: config::parse_or("DAILY_DOCUMENT_CAP", DEFAULT_DAILY_CAP)?,
             max_document_bytes: config::parse_or("MAX_DOCUMENT_BYTES", DEFAULT_MAX_DOCUMENT_BYTES)?,
+            max_generation_attempts: config::parse_or(
+                "MAX_GENERATION_ATTEMPTS",
+                DEFAULT_MAX_GENERATION_ATTEMPTS,
+            )?
+            // Zero or one would mean "give up before Lambda stops retrying",
+            // which reintroduces the stranding this exists to prevent.
+            .max(1),
         })
     }
 }
@@ -196,11 +216,29 @@ async fn handle(config: &Config, event: S3Event) -> std::result::Result<(), lamb
 ///   more Bedrock calls if it got that far.
 /// - **Infrastructure** (`Aws`, `Json`, `Config`) may succeed on a retry. Put
 ///   the document back to `pending` so a retry can claim it, and return the
-///   error so the invocation fails.
+///   error so the invocation fails — *until the attempts run out*, at which
+///   point it becomes terminal too. See below.
 ///
 /// Getting this backwards is expensive in one direction and invisible in the
 /// other: retrying an unparseable PDF burns nothing but noise, while *not*
 /// retrying a transient DynamoDB throttle strands a document forever.
+///
+/// # Why retryable failures must eventually become terminal
+///
+/// "Retryable" was originally implemented as "always put it back to `pending`
+/// and fail the invocation", which is right exactly as long as something is
+/// still going to retry. Lambda's retries are finite, and when they are gone
+/// the event goes to the dead-letter queue — and there is no mechanism that
+/// delivers another `ObjectCreated` for an object that already exists. The
+/// document rests at `pending`, with no error text and no Retry button, and is
+/// unrecoverable without touching S3 by hand.
+///
+/// This is not a theoretical edge: an IAM misconfiguration produced it, and the
+/// document showed "Queued" indefinitely while nothing was queued.
+///
+/// So the last attempt writes `failed` instead of `pending`. The document then
+/// carries a message and a Retry button, which is the whole difference between
+/// a bad afternoon and a lost document.
 async fn record_outcome(config: &Config, doc_id: &str, err: Error) -> Option<Error> {
     match &err {
         Error::Invalid(msg) | Error::QuotaExceeded(msg) => {
@@ -213,12 +251,68 @@ async fn record_outcome(config: &Config, doc_id: &str, err: Error) -> Option<Err
         }
         _ => {
             tracing::error!(doc_id, error = %err, "processing failed");
-            if let Err(e) = config.store.reset_doc_to_pending(doc_id).await {
-                tracing::error!(doc_id, error = %e, "could not reset document for retry");
+
+            let attempts = match config.store.record_generation_failure(doc_id).await {
+                Ok(n) => n,
+                Err(e) => {
+                    // The counter could not be advanced, so this attempt cannot
+                    // be told apart from the last one. Fail the invocation and
+                    // let Lambda retry: over-retrying is recoverable, and
+                    // treating an unknown count as "give up" would fail
+                    // documents over a transient DynamoDB error.
+                    tracing::error!(doc_id, error = %e, "could not record the failed attempt");
+                    return Some(err);
+                }
+            };
+
+            if another_attempt_follows(attempts, config.max_generation_attempts) {
+                tracing::warn!(
+                    doc_id,
+                    attempts,
+                    max = config.max_generation_attempts,
+                    "returned to pending for another attempt"
+                );
+                return Some(err);
             }
-            Some(err)
+
+            // Out of attempts. The message carries the underlying error rather
+            // than a generic apology, which deviates from the usual rule that
+            // `error` holds only `Invalid`-grade text: this field is the only
+            // place a reader sees *why*, the app has exactly one user, and the
+            // identifiers in an AWS error chain are their own account's. It is
+            // bounded — `describe` truncates each link and `set_doc_failed`
+            // truncates the whole string.
+            let message = format!(
+                "Generation failed {attempts} times and was given up on. Last error — {err}"
+            );
+            tracing::error!(doc_id, attempts, "giving up on document");
+
+            if let Err(e) = config.store.set_doc_failed(doc_id, &message).await {
+                tracing::error!(doc_id, error = %e, "could not record final failure");
+                return Some(e);
+            }
+
+            // Deliberately `None`. The document is now visibly failed with a
+            // Retry button, so failing the invocation as well would buy a
+            // dead-letter message and a red metric for a situation already
+            // recorded where the reader can act on it.
+            None
         }
     }
+}
+
+/// Will anything invoke this function again for this document?
+///
+/// Extracted from [`record_outcome`] because it is a one-line comparison whose
+/// off-by-one has no safe direction, and because the surrounding function needs
+/// DynamoDB to run. Too eager and the document is failed while Lambda is still
+/// willing to retry; too lax and the last attempt says "put it back to pending,
+/// something will retry" when nothing will — which strands it exactly as
+/// before.
+///
+/// `attempts` is the post-increment count, so the first failure arrives as 1.
+fn another_attempt_follows(attempts: u32, max_attempts: u32) -> bool {
+    attempts < max_attempts
 }
 
 /// The pipeline for one document.
@@ -390,5 +484,49 @@ mod tests {
     #[test]
     fn objects_outside_the_docs_prefix_are_ignored() {
         assert!(keys::doc_id_from_s3_key("uploads/other.pdf").is_none());
+    }
+
+    /// The boundary that decides whether a document is recoverable.
+    ///
+    /// With Lambda's default of one retry there are two invocations. The first
+    /// failure must leave the document `pending` so the second can claim it;
+    /// the second must mark it `failed`, because nothing follows and a
+    /// `pending` document has no Retry button.
+    #[test]
+    fn the_last_attempt_knows_it_is_the_last() {
+        let max = super::DEFAULT_MAX_GENERATION_ATTEMPTS;
+        assert!(
+            super::another_attempt_follows(1, max),
+            "first failure: Lambda will retry, so keep the document retryable"
+        );
+        assert!(
+            !super::another_attempt_follows(2, max),
+            "second failure: nothing follows, so the document must be failed"
+        );
+    }
+
+    /// Over-counting must fail closed. If a duplicate delivery pushes the count
+    /// past the maximum, the document still ends up `failed` rather than
+    /// wrapping back into "retry forever".
+    #[test]
+    fn exceeding_the_maximum_still_gives_up() {
+        assert!(!super::another_attempt_follows(
+            99,
+            super::DEFAULT_MAX_GENERATION_ATTEMPTS
+        ));
+    }
+
+    /// The handler's default and Terraform's default describe the same
+    /// arrangement: `maximum_retry_attempts = 1`, so two attempts in total.
+    /// Terraform derives the environment variable from that same variable, but
+    /// the compiled-in fallback is what runs if the variable is ever missing —
+    /// and a fallback that disagrees would strand documents silently.
+    #[test]
+    fn the_compiled_default_matches_one_lambda_retry() {
+        assert_eq!(
+            super::DEFAULT_MAX_GENERATION_ATTEMPTS,
+            1 + 1,
+            "infra/variables.tf defaults generate_retry_attempts to 1"
+        );
     }
 }

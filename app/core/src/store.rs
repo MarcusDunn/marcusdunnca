@@ -173,9 +173,14 @@ impl Store {
             .table_name(&self.table)
             .key("pk", AttributeValue::S(keys::doc_pk(doc_id)))
             .key("sk", AttributeValue::S(keys::META_SK.to_string()))
+            // `generation_attempts` is cleared, not left to accumulate: it
+            // counts *consecutive* failures, so a document that failed twice
+            // and then succeeded must not carry two attempts into whatever
+            // happens next.
             .update_expression(
                 "SET #status = :ready, title = :t, topics = :topics, questions = :q, \
-                 question_count = :n, page_count = :p, tag_version = :v REMOVE #err",
+                 question_count = :n, page_count = :p, tag_version = :v \
+                 REMOVE #err, generation_attempts",
             )
             .expression_attribute_names("#status", "status")
             .expression_attribute_names("#err", "error")
@@ -308,22 +313,47 @@ impl Store {
     /// Unconditional on status by design: this is called from the generate
     /// handler's error path, where the document is known to be `processing`
     /// because this process put it there.
-    pub async fn reset_doc_to_pending(&self, doc_id: &str) -> Result<()> {
-        self.client
+    /// Put a document back to `pending` after a retryable failure, and report
+    /// how many consecutive failures it has now had.
+    ///
+    /// The count is returned rather than read separately because the caller's
+    /// decision — retry again, or give up and mark the document `failed` —
+    /// depends on it, and a read-then-write would race with a concurrent
+    /// delivery of the same event. `ADD` increments atomically and
+    /// `UPDATED_NEW` hands back the post-increment value, so every caller sees
+    /// a distinct number and exactly one of them sees the last one.
+    ///
+    /// A missing attribute starts at zero, so documents written before this
+    /// field existed need no migration.
+    pub async fn record_generation_failure(&self, doc_id: &str) -> Result<u32> {
+        let out = self
+            .client
             .update_item()
             .table_name(&self.table)
             .key("pk", AttributeValue::S(keys::doc_pk(doc_id)))
             .key("sk", AttributeValue::S(keys::META_SK.to_string()))
-            .update_expression("SET #status = :pending REMOVE #err")
+            .update_expression("SET #status = :pending REMOVE #err ADD generation_attempts :one")
             .condition_expression("attribute_exists(pk)")
             .expression_attribute_names("#status", "status")
             .expression_attribute_names("#err", "error")
             .expression_attribute_values(":pending", AttributeValue::S("pending".into()))
+            .expression_attribute_values(":one", AttributeValue::N("1".into()))
+            .return_values(ReturnValue::UpdatedNew)
             .send()
             .await
             .map_err(aws)?;
 
-        Ok(())
+        // If the attribute somehow comes back unreadable, report 1 rather than
+        // 0. Zero would mean "no failures yet" to the caller, which is the one
+        // answer that is certainly wrong here — this function only runs because
+        // a generation just failed, and reporting zero forever is how a
+        // document gets stranded.
+        Ok(out
+            .attributes()
+            .and_then(|a| a.get("generation_attempts"))
+            .and_then(|v| v.as_n().ok())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(1))
     }
 
     /// Arm a user-initiated retry: `failed` (or a stuck `processing`) → `pending`.
@@ -334,10 +364,25 @@ impl Store {
     /// it; a retry on a document already `pending` would arm a second generation
     /// for an object whose first one has not finished.
     ///
-    /// `processing` is included because that is where a document lands when the
-    /// generate handler hit an infrastructure error and exhausted its retries.
-    /// Excluding it would make exactly the zombie state the retry button exists
-    /// to clear the one state it cannot clear.
+    /// `processing` is included because a document can be left there by an
+    /// invocation that died mid-flight — a timeout, or the process being killed
+    /// after the claim but before any outcome was written. Excluding it would
+    /// make exactly the zombie state the retry button exists to clear the one
+    /// state it cannot clear.
+    ///
+    /// `pending` is deliberately *not* included, and that is safe only because
+    /// `record_generation_failure` and `MAX_GENERATION_ATTEMPTS` guarantee a
+    /// document stops at `failed` rather than resting at `pending`. Before that
+    /// existed, an exhausted retry left the document `pending` — a state this
+    /// condition rejects and the UI offers no button for — and the document was
+    /// unrecoverable. Widening this to `pending` would be the wrong fix: it
+    /// would also arm a retry for a document whose first generation is simply
+    /// still queued.
+    ///
+    /// The attempt counter is cleared, because a user-initiated retry is a
+    /// fresh start — often *because* the underlying cause has just been fixed,
+    /// which is precisely when the document deserves the full budget of
+    /// attempts again rather than the zero it has left.
     pub async fn arm_retry(&self, doc_id: &str) -> Result<bool> {
         let res = self
             .client
@@ -345,7 +390,7 @@ impl Store {
             .table_name(&self.table)
             .key("pk", AttributeValue::S(keys::doc_pk(doc_id)))
             .key("sk", AttributeValue::S(keys::META_SK.to_string()))
-            .update_expression("SET #status = :pending REMOVE #err")
+            .update_expression("SET #status = :pending REMOVE #err, generation_attempts")
             .condition_expression(
                 "attribute_exists(pk) AND (#status = :failed OR #status = :processing)",
             )

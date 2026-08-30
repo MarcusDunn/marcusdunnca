@@ -405,6 +405,11 @@ resource "aws_lambda_function" "generate" {
       MAX_PAGES          = tostring(var.max_pages)
       MAX_DOCUMENT_BYTES = tostring(var.max_upload_bytes)
       DAILY_DOCUMENT_CAP = tostring(var.daily_document_cap)
+
+      # Lambda's retries plus the original invocation. Derived rather than
+      # written out: if these two numbers disagree, documents strand at
+      # `pending` again, and that failure is invisible until someone uploads.
+      MAX_GENERATION_ATTEMPTS = tostring(var.generate_retry_attempts + 1)
     }
   }
 
@@ -505,9 +510,17 @@ resource "aws_iam_role_policy" "generate_dlq" {
 resource "aws_lambda_function_event_invoke_config" "generate" {
   function_name = aws_lambda_function.generate.function_name
 
-  # Two attempts total. A malformed PDF fails identically every time, and each
-  # retry is another Bedrock call against a $10 budget.
-  maximum_retry_attempts = 1
+  # A malformed PDF fails identically every time, and each retry is another
+  # Bedrock call against a $10 budget.
+  #
+  # The handler is told the resulting *total* attempt count via
+  # MAX_GENERATION_ATTEMPTS, derived from this same variable below. It has to
+  # know: a retryable failure normally returns the document to `pending` and
+  # fails the invocation so Lambda retries, and on the final attempt that is
+  # exactly wrong — nothing will retry, no further S3 event will ever arrive,
+  # and the document rests at `pending` with no Retry button. The handler
+  # recognises its last attempt and writes `failed` instead.
+  maximum_retry_attempts = var.generate_retry_attempts
 
   destination_config {
     on_failure {
