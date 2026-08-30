@@ -1,3 +1,4 @@
+import { useEffect, useRef } from "react";
 import { useForm } from "@tanstack/react-form";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useParams } from "@tanstack/react-router";
@@ -25,14 +26,38 @@ export function ReadScreen() {
   const url = useQuery(documentUrlQuery(documentId));
   const quiz = useQuery(quizQuery(documentId));
 
+  // Both of these are refs rather than memos because crypto.randomUUID() and
+  // Date.now() are impure and must not run during render — a re-render would
+  // silently produce a different id, which is exactly the property that has to
+  // hold. The React Compiler's purity lint catches this; it was right.
+  //
+  // The id is minted on the FIRST submit and reused by every retry of that
+  // submit, so a double-tap on a flaky connection is recognised server-side as
+  // a duplicate instead of writing a second attempt and skewing every rate.
+  const attemptIdRef = useRef<string | null>(null);
+  const startedAtRef = useRef<number | null>(null);
+
+  // Effects may be impure. The clock starts when the questions actually appear,
+  // not when the route mounts, so a slow quiz fetch is not counted as reading.
+  useEffect(() => {
+    if (quiz.data && startedAtRef.current === null) {
+      startedAtRef.current = Date.now();
+    }
+  }, [quiz.data]);
+
   const submit = useMutation({
-    mutationFn: (answers: Record<string, string>) =>
-      api.submitQuiz(documentId, {
+    mutationFn: (answers: Record<string, string>) => {
+      attemptIdRef.current ??= crypto.randomUUID();
+      const startedAt = startedAtRef.current;
+      return api.submitQuiz(documentId, {
+        attemptId: attemptIdRef.current,
+        ...(startedAt === null ? {} : { durationMs: Date.now() - startedAt }),
         answers: Object.entries(answers).map(([questionId, optionId]) => ({
           questionId,
           optionId,
         })),
-      }),
+      });
+    },
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: queryKeys.history });
       void queryClient.invalidateQueries({ queryKey: queryKeys.documents });

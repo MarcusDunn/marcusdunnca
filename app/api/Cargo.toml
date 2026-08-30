@@ -1,0 +1,48 @@
+[package]
+name = "api"
+description = "Reading-trainer HTTP API. One Lambda behind one Function URL, routed on path."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+trainer-core = { version = "0.1.0", path = "../core" }
+
+aws-config = { version = "1.11.0", features = ["behavior-version-latest"] }
+aws-sdk-dynamodb = "1.123.0"
+aws-sdk-s3 = "1.144.0"
+aws-sdk-ssm = "1.121.0"
+base64 = "0.23.1"
+jsonwebtoken = "11.0.0"
+lambda_http = "1.3.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+url = "2.5.8"
+urlencoding = "2.1.3"
+uuid = { version = "1.26.0", features = ["v4"] }
+# `danger-allow-state-serialisation` is required, not optional: the
+# authentication ceremony spans two stateless Lambda invocations, so
+# `PasskeyAuthentication` has to be persisted between them. The feature name is
+# a warning against holding that state anywhere a client can reach — here it
+# lives in DynamoDB with a 60-second TTL and is deleted on use.
+webauthn-rs = { version = "0.5.5", features = ["danger-allow-state-serialisation"] }
+
+# webauthn-rs-core depends on openssl-sys and offers no pure-Rust alternative,
+# so this binary cannot link without an OpenSSL for the target. On this
+# workstation that comes from the nix shell; in CI, cargo-lambda cross-compiles
+# to aarch64-unknown-linux-gnu, where no such library exists.
+#
+# This feature makes openssl-sys build OpenSSL from source for the target
+# instead of looking for one. Off by default because a source build adds minutes
+# to every local `cargo check`, and CI is the only place that needs it:
+# `cargo lambda build --release --arm64 --features vendored-openssl`.
+[features]
+vendored-openssl = ["dep:openssl", "openssl/vendored"]
+
+[dependencies.openssl]
+version = "0.10"
+optional = true

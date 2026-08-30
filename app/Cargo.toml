@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = ["core", "api", "generate"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+# The aws-sdk-* crates require 1.94.1. Stated here so a too-old toolchain fails
+# with that sentence rather than with a hundred lines of trait errors.
+rust-version = "1.94.1"
+publish = false
+
+# Release settings exist for cold-start time, not for throughput.
+#
+# Both functions share this account's Lambda concurrency limit of 10, and no
+# reserved concurrency could be set (AWS refuses a reservation that leaves fewer
+# than 10 unreserved). So a cold start is not just this caller's latency — it is
+# an execution slot held longer, competing with the generation the caller is
+# probably waiting on. Binary size is the part of cold start we control: the
+# runtime reads the whole artifact before running any of it.
+#
+# `panic` is deliberately left at `unwind`. `abort` would shave a little more,
+# but it turns a panic into a destroyed execution environment and therefore a
+# guaranteed cold start on the next invocation — trading a rare slow request for
+# a rare failure plus a slow request.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true

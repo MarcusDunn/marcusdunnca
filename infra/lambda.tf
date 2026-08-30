@@ -304,6 +304,10 @@ resource "aws_lambda_function" "api" {
       # appears in the function configuration, in state, or in the console.
       JWT_SIGNING_KEY_PARAMETER = local.jwt_signing_key_parameter
 
+      # The api signs the presigned PUT, so the size bound has to be enforced
+      # here — generate only ever sees a file that already exists.
+      MAX_UPLOAD_BYTES = tostring(var.max_upload_bytes)
+
       WEBAUTHN_CREDENTIALS = var.webauthn_credentials
     }
   }
@@ -382,6 +386,7 @@ resource "aws_lambda_function" "generate" {
 
       MODEL_ID           = var.bedrock_model_id
       MAX_PAGES          = tostring(var.max_pages)
+      MAX_DOCUMENT_BYTES = tostring(var.max_upload_bytes)
       DAILY_DOCUMENT_CAP = tostring(var.daily_document_cap)
     }
   }

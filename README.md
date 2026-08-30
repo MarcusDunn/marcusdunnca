@@ -354,7 +354,7 @@ does not bound either:
 1. **Model scoping.** There is no IAM condition key for token count, so *which
    model* is the only lever IAM offers. `bedrock:InvokeModel` is scoped by
    model-ID pattern (`bedrock_allowed_models`) to Nova Lite and the Claude
-   Sonnet/Haiku families. Opus is `implicitDeny` for both the apply role and any
+   Sonnet/Haiku families — Nova is what the application actually uses. Opus is `implicitDeny` for both the apply role and any
    boundary-capped runtime role.
 
    The app uses `ca.amazon.nova-lite-v1:0` — roughly a twentieth of Sonnet's
