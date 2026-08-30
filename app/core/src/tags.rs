@@ -146,37 +146,29 @@ macro_rules! closed_vocab {
 closed_vocab! {
     /// How a question is presented and graded.
     ///
-    /// Grading dispatches on this, which is the reason it is an enum rather
-    /// than an implicit assumption: `multiple_choice` is graded by comparing
-    /// letters, `numeric` by parsing a typed number and comparing it against a
-    /// tolerance, and the two share no code.
+    /// **This is a label, not a discriminant.** It is not stored on a question:
+    /// `crate::model::QuestionBody` is an enum, and the format is derived from
+    /// which variant a question is. Storing it as well would be a second
+    /// statement of one fact, and two statements of one fact can disagree —
+    /// which is precisely how `"format": "definitional"` once cost a whole
+    /// generation.
     ///
-    /// **Both are still graded in this process, deterministically, with no
-    /// model call.** That is the property to preserve when a third format is
-    /// added. A format whose grading is a model call is a format whose scores
-    /// drift when the model changes, and a score series that silently changes
-    /// scale is worse than no score series.
+    /// Where it *is* stored is on an attempt response, and that is a different
+    /// thing: an attempt records what the question was when it was answered, in
+    /// the same way it copies the skill and the topics rather than joining back
+    /// to a document that may since have been regenerated.
+    ///
+    /// It is also what the browser discriminates on and what `?format=` filters
+    /// by, so it stays a closed vocabulary with a wire form.
+    ///
+    /// **Both formats are graded in this process, deterministically, with no
+    /// model call.** That is the property to preserve when a third is added. A
+    /// format whose grading is a model call is a format whose scores drift when
+    /// the model changes, and a score series that silently changes scale is
+    /// worse than no score series.
     QuestionFormat {
         MultipleChoice => "multiple_choice",
         Numeric        => "numeric",
-    }
-}
-
-/// What a question with no stated format is.
-///
-/// **This is a compatibility rule, not a preference.** Every question written
-/// before `numeric` existed was multiple choice, and the generator was
-/// deliberately not asked for a `format` — handing a model a field with one
-/// legal value is all downside, and Sonnet proved it by returning
-/// `"format": "definitional"` and costing a whole generation.
-///
-/// Now that there are two formats the generator is *still* not asked, because
-/// it is still not a judgement call: the two kinds of question are requested in
-/// two separate arrays, so the handler knows which is which without asking. See
-/// `bedrock::assemble`.
-impl Default for QuestionFormat {
-    fn default() -> Self {
-        Self::MultipleChoice
     }
 }
 
