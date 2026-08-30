@@ -118,9 +118,37 @@ allow this. CloudFront is global, so the region lock gives it no cost
 containment and data-transfer-out is unbounded — the $1 budget and the $1
 anomaly subscription are what bound it now.
 
-There are no secrets in this system, and no reason for any yet: IAM handles all
-AWS-to-AWS auth. If one is ever needed, SSM Parameter Store *Standard* with
-`SecureString` is free; Secrets Manager is $0.40/secret/month.
+### Secrets
+
+SSM Parameter Store, split into two namespaces that differ in who can read them:
+
+| Prefix | Managed by | Readable by |
+| --- | --- | --- |
+| `/marcusdunnca/secret/*` | **nobody — created out of band** | runtime roles only |
+| `/marcusdunnca/config/*` | Terraform | runtime roles, apply, plan |
+
+Secrets are created with `aws ssm put-parameter` and are **never referenced by
+value in Terraform** — only by name, in a Lambda environment variable and an IAM
+policy resource ARN. Neither CI role can read them:
+
+```bash
+aws ssm put-parameter --name /marcusdunnca/secret/jwt-signing-key \
+  --type SecureString --value "$(openssl rand -base64 48)" --overwrite
+```
+
+This is not squeamishness about state. The plan role is reachable from **any
+pull request** on a public repository, and it can read state objects — so any
+secret that reaches state is a secret any stranger's PR can print. Rotation is
+the same command with a fresh value.
+
+`SecureString` with the AWS-managed `aws/ssm` key is free. Secrets Manager is
+$0.40/secret/month, and a customer-managed KMS key is ~$1/month — neither buys
+anything here.
+
+The provider does support write-only arguments (`aws_ssm_parameter.value_wo`,
+verified present in aws 6.62.0) which keep a value out of state. They do not
+help for CI-applied resources, because the applier still needs the value —
+which for `infra/` would mean putting it in a GitHub secret.
 
 ## Branch protection
 
