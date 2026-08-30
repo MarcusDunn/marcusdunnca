@@ -59,6 +59,20 @@ pub fn registration_sk(id: &str) -> String {
 /// Partition holding the daily generation counter.
 pub const QUOTA_PK: &str = "QUOTA";
 
+/// The single row listing every topic ever used.
+///
+/// One row, not one row per topic, because the only question ever asked of it
+/// is "what is the whole set" — that is what gets handed to the model so it can
+/// reuse an existing tag instead of coining a synonym. A `GetItem` answers it;
+/// a row-per-topic layout would need a query and would buy nothing.
+///
+/// Stored as a DynamoDB string set so registration is `ADD`, which is an atomic
+/// union. The read-modify-write alternative loses tags when two documents
+/// finish generating at once, and with ten concurrent executions available that
+/// is not hypothetical.
+pub const TOPICS_PK: &str = "TOPICS";
+pub const TOPICS_SK: &str = "REGISTRY";
+
 /// One row per UTC day.
 pub fn day_sk(date: &str) -> String {
     format!("DAY#{date}")

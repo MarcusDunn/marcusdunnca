@@ -34,9 +34,19 @@ locals {
   # wrote down, which is a miserable thing to debug.
   #
   # Kept in step with bedrock_allowed_models in bootstrap/variables.tf. The
-  # boundary caps these roles at the Nova Lite family regardless, so widening
-  # here alone achieves nothing except misleading the next reader.
-  bedrock_model_patterns = ["amazon.nova-lite-*", "amazon.nova-2-lite-*"]
+  # boundary caps these roles at that list regardless, so widening here alone
+  # achieves nothing except misleading the next reader — and narrowing here is
+  # what actually reduces what the function can invoke.
+  #
+  # Sonnet is the model in use; the Nova entries are kept so that reverting
+  # var.bedrock_model_id to the in-region profile does not also require an IAM
+  # change. Opus is absent from the bootstrap allowlist and so cannot be
+  # reached from here whatever this list says.
+  bedrock_model_patterns = [
+    "anthropic.claude-sonnet-*",
+    "amazon.nova-lite-*",
+    "amazon.nova-2-lite-*",
+  ]
 
   bedrock_model_arns = flatten([
     for pattern in local.bedrock_model_patterns : [
@@ -389,7 +399,9 @@ resource "aws_lambda_function" "generate" {
       TABLE_NAME  = aws_dynamodb_table.app.name
       DOCS_BUCKET = aws_s3_bucket.docs.id
 
-      MODEL_ID           = var.bedrock_model_id
+      MODEL_ID               = var.bedrock_model_id
+      THINKING_BUDGET_TOKENS = tostring(var.bedrock_thinking_budget_tokens)
+
       MAX_PAGES          = tostring(var.max_pages)
       MAX_DOCUMENT_BYTES = tostring(var.max_upload_bytes)
       DAILY_DOCUMENT_CAP = tostring(var.daily_document_cap)

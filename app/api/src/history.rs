@@ -56,11 +56,16 @@ impl HistoryFilter {
                         ))
                     })?)
                 }
+                // No "expected one of" here, unlike `skill` above. The topic
+                // vocabulary is open — the model coins new words as it meets
+                // new subject matter — so there is no list to quote back, and
+                // the only thing that can be wrong is the *shape*. A filter for
+                // a well-formed word nobody has used yet is not an error; it
+                // legitimately matches nothing.
                 "topic" => {
                     f.topic = Some(Topic::parse(v).ok_or_else(|| {
                         Error::Invalid(format!(
-                            "unknown topic {v:?}; expected one of: {}",
-                            Topic::vocabulary()
+                            "{v:?} is not a topic; topics are single lowercase words"
                         ))
                     })?)
                 }
@@ -111,8 +116,8 @@ pub async fn list(state: &AppState, filter: &HistoryFilter) -> Result<HistoryRes
         // A topic filter is a property of the whole attempt — topics are tagged
         // per document — so it excludes the attempt entirely rather than
         // narrowing its questions.
-        if let Some(topic) = filter.topic {
-            if !attempt.topics.contains(&topic) {
+        if let Some(topic) = &filter.topic {
+            if !attempt.topics.contains(topic) {
                 continue;
             }
         }
@@ -186,12 +191,12 @@ mod tests {
                     qid: format!("q{i}"),
                     format: QuestionFormat::MultipleChoice,
                     skill,
-                    topics: vec![Topic::Fiscal],
+                    topics: vec![Topic::parse("fiscal").expect("a valid topic")],
                     answer: Some(Choice::A),
                     correct,
                 })
                 .collect(),
-            topics: vec![Topic::Fiscal],
+            topics: vec![Topic::parse("fiscal").expect("a valid topic")],
             tag_version: TAG_VERSION,
             duration_ms: 0,
             score: 0,

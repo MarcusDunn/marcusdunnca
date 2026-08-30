@@ -20,8 +20,7 @@ import {
   FORMAT_LABELS,
   SKILLS,
   SKILL_LABELS,
-  TOPICS,
-  TOPIC_LABELS,
+  topicLabel,
   type QuestionFormat,
   type Skill,
   type Topic,
@@ -41,9 +40,22 @@ export function HistoryScreen() {
     return <ErrorNotice error={history.error} onRetry={() => void history.refetch()} />;
   }
 
+  // Topics are open, so the axis of the matrix is whatever has actually been
+  // read — there is no fixed list to lay out. Unlike skills, an unused topic is
+  // not a gap worth showing: a column of empty cells for a subject you have
+  // never touched is noise, and with the model coining tags there could be any
+  // number of them.
+  const observedTopics: Topic[] = [
+    ...new Set(
+      history.data.flatMap((attempt) =>
+        attempt.questions.flatMap((question) => question.topics),
+      ),
+    ),
+  ].toSorted();
+
   const observations = selectObservations(history.data, { format, skills, topics });
   const visibleSkills = skills.length > 0 ? skills : SKILLS;
-  const visibleTopics = topics.length > 0 ? topics : TOPICS;
+  const visibleTopics = topics.length > 0 ? topics : observedTopics;
   const breakdown = buildBreakdown(observations, visibleSkills, visibleTopics);
   const rows = attemptRows(observations);
 
@@ -87,8 +99,8 @@ export function HistoryScreen() {
         <CheckboxFilter
           idPrefix="topic"
           legend="Topics"
-          options={TOPICS}
-          labels={TOPIC_LABELS}
+          options={observedTopics}
+          labels={Object.fromEntries(observedTopics.map((t) => [t, topicLabel(t)]))}
           selected={topics}
           onChange={setTopics}
         />
@@ -225,7 +237,7 @@ function BreakdownTable({ breakdown }: { breakdown: Breakdown }) {
           <th scope="col">Skill</th>
           {breakdown.topics.map((topic) => (
             <th key={topic} scope="col">
-              {TOPIC_LABELS[topic]}
+              {topicLabel(topic)}
             </th>
           ))}
           <th scope="col">All topics</th>

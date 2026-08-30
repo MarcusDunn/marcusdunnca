@@ -1414,6 +1414,7 @@ dependencies = [
  "aws-sdk-bedrockruntime",
  "aws-sdk-dynamodb",
  "aws-sdk-s3",
+ "aws-smithy-types",
  "aws_lambda_events",
  "lambda_runtime",
  "lopdf",

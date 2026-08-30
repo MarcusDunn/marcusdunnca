@@ -3,7 +3,7 @@ import { Link } from "@tanstack/react-router";
 import { Busy, BusyMark, ErrorNotice } from "../components/ui";
 import { api } from "../lib/api";
 import { documentsQuery, queryKeys } from "../lib/queries";
-import { isUnsettled, TOPIC_LABELS, type DocumentSummary } from "../lib/schemas";
+import { isUnsettled, topicLabel, type DocumentSummary } from "../lib/schemas";
 
 const STATUS_TEXT: Record<DocumentSummary["status"], string> = {
   pending: "Queued",
@@ -96,7 +96,7 @@ function DocumentRow({
         {new Date(doc.createdAt).toLocaleDateString()} · {doc.attemptCount}{" "}
         attempt{doc.attemptCount === 1 ? "" : "s"}
         {doc.topics.length > 0
-          ? ` · ${doc.topics.map((topic) => TOPIC_LABELS[topic]).join(", ")}`
+          ? ` · ${doc.topics.map(topicLabel).join(", ")}`
           : ""}
       </p>
 

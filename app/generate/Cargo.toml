@@ -13,6 +13,10 @@ aws-config = { version = "1.11.0", features = ["behavior-version-latest"] }
 aws-sdk-bedrockruntime = "1.142.0"
 aws-sdk-dynamodb = "1.123.0"
 aws-sdk-s3 = "1.144.0"
+# `Document`, the untyped JSON the Converse API uses for a tool's input schema
+# and for additionalModelRequestFields. A transitive dependency of the SDK
+# already, named here because bedrock.rs constructs it directly.
+aws-smithy-types = "1.4.0"
 # Only the S3 event shape. The default feature set of aws_lambda_events compiles
 # every AWS event type there is, which is a lot of code for one struct.
 aws_lambda_events = { version = "1.2.0", default-features = false, features = ["s3"] }

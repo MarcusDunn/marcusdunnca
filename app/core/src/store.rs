@@ -146,9 +146,18 @@ impl Store {
     ///
     /// `topics` is deliberately absent: topics are chosen by the reader at
     /// upload time and generation has no business overwriting them.
+    /// Publish a finished generation.
+    ///
+    /// `title` and `topics` are written here rather than at creation because
+    /// the model chooses both, and it cannot do so until it has read the PDF —
+    /// which happens after the row already exists. Until this runs the row
+    /// carries the provisional title `POST /docs` derived from the filename.
+    #[allow(clippy::too_many_arguments)]
     pub async fn set_doc_ready(
         &self,
         doc_id: &str,
+        title: &str,
+        topics: &[Topic],
         questions: &[Question],
         page_count: usize,
         tag_version: u32,
@@ -156,6 +165,8 @@ impl Store {
         let count = questions.len();
         let questions: AttributeValue =
             serde_dynamo::to_attribute_value(questions).map_err(|e| Error::Aws(e.to_string()))?;
+        let topics: AttributeValue =
+            serde_dynamo::to_attribute_value(topics).map_err(|e| Error::Aws(e.to_string()))?;
 
         self.client
             .update_item()
@@ -163,16 +174,100 @@ impl Store {
             .key("pk", AttributeValue::S(keys::doc_pk(doc_id)))
             .key("sk", AttributeValue::S(keys::META_SK.to_string()))
             .update_expression(
-                "SET #status = :ready, questions = :q, question_count = :n, \
-                 page_count = :p, tag_version = :v REMOVE #err",
+                "SET #status = :ready, title = :t, topics = :topics, questions = :q, \
+                 question_count = :n, page_count = :p, tag_version = :v REMOVE #err",
             )
             .expression_attribute_names("#status", "status")
             .expression_attribute_names("#err", "error")
             .expression_attribute_values(":ready", AttributeValue::S("ready".into()))
+            .expression_attribute_values(":t", AttributeValue::S(title.to_string()))
+            .expression_attribute_values(":topics", topics)
             .expression_attribute_values(":q", questions)
             .expression_attribute_values(":n", AttributeValue::N(count.to_string()))
             .expression_attribute_values(":p", AttributeValue::N(page_count.to_string()))
             .expression_attribute_values(":v", AttributeValue::N(tag_version.to_string()))
+            .send()
+            .await
+            .map_err(aws)?;
+
+        Ok(())
+    }
+
+    /// Every topic ever used, for offering back to the model.
+    ///
+    /// Seeded rather than empty on first read: a model given an empty list
+    /// coins a vocabulary from scratch on document one, and the second document
+    /// then coins synonyms for it. Seeding costs nothing and gives the reuse
+    /// instruction something to bite on immediately.
+    ///
+    /// Missing and malformed both degrade to the seed rather than erroring. A
+    /// failure to read the registry must not fail a generation — the tags would
+    /// merely be less consistent, which is not worth spending a Bedrock call to
+    /// avoid.
+    pub async fn known_topics(&self) -> Result<Vec<Topic>> {
+        let out = self
+            .client
+            .get_item()
+            .table_name(&self.table)
+            .key("pk", AttributeValue::S(keys::TOPICS_PK.to_string()))
+            .key("sk", AttributeValue::S(keys::TOPICS_SK.to_string()))
+            .send()
+            .await
+            .map_err(aws)?;
+
+        let stored = out
+            .item
+            .as_ref()
+            .and_then(|item| item.get("topics"))
+            .and_then(|v| v.as_ss().ok())
+            .cloned()
+            .unwrap_or_default();
+
+        let mut topics: Vec<Topic> = crate::tags::SEED_TOPICS
+            .iter()
+            .filter_map(|w| Topic::parse(w))
+            .collect();
+
+        // Stored tags are filtered through `parse` too. The set may contain
+        // values written before the one-word rule, and offering those back to
+        // the model would teach it to reproduce exactly the shape now refused.
+        for word in stored {
+            if let Some(topic) = Topic::parse(&word) {
+                if !topics.contains(&topic) {
+                    topics.push(topic);
+                }
+            }
+        }
+
+        topics.sort();
+        Ok(topics)
+    }
+
+    /// Record topics as used, so later generations can reuse them.
+    ///
+    /// `ADD` on a string set is an atomic union: concurrent generations cannot
+    /// clobber each other's tags, and re-registering an existing tag is a no-op
+    /// rather than a duplicate.
+    ///
+    /// Best-effort by contract — the caller logs and continues on failure. The
+    /// document is already `ready` by this point, and failing it because a
+    /// convenience index did not update would throw away a paid-for generation.
+    pub async fn register_topics(&self, topics: &[Topic]) -> Result<()> {
+        // DynamoDB rejects an empty string set outright, so this is a real
+        // guard rather than an optimisation.
+        if topics.is_empty() {
+            return Ok(());
+        }
+
+        let words: Vec<String> = topics.iter().map(|t| t.as_str().to_string()).collect();
+
+        self.client
+            .update_item()
+            .table_name(&self.table)
+            .key("pk", AttributeValue::S(keys::TOPICS_PK.to_string()))
+            .key("sk", AttributeValue::S(keys::TOPICS_SK.to_string()))
+            .update_expression("ADD topics :t")
+            .expression_attribute_values(":t", AttributeValue::Ss(words))
             .send()
             .await
             .map_err(aws)?;
