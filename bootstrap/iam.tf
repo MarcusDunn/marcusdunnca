@@ -615,6 +615,9 @@ data "aws_iam_policy_document" "plan_permissions" {
       "iam:ListOpenIDConnectProviders",
       "iam:ListAccountAliases",
       "iam:GetAccountPasswordPolicy",
+      # For the health job's root-account assertions (MFA present, no root
+      # access keys, no IAM users). Returns counts only, no credential material.
+      "iam:GetAccountSummary",
       # Per-bucket metadata is granted separately, scoped to the two managed
       # buckets. These two are account-level and have no bucket to scope to.
       "s3:GetAccountPublicAccessBlock",

@@ -196,6 +196,27 @@ jobs:
           fi
           echo "CloudTrail delivering normally."
 
+      # Root bypasses everything this repo builds — the guardrails, the
+      # permissions boundary, Object Lock, even CloudTrail. MFA on root is the
+      # only thing standing between the root credentials and total account
+      # compromise, and nothing else here would notice if it were removed.
+      #
+      # Also asserts no root access keys and no IAM users: both should be zero
+      # forever, and both are exactly the kind of thing created "temporarily"
+      # during an incident and never removed.
+      - name: Root account is hardened
+        run: |
+          summary=$(aws iam get-account-summary --query SummaryMap --output json)
+          mfa=$(echo "$summary" | jq -r '.AccountMFAEnabled')
+          keys=$(echo "$summary" | jq -r '.AccountAccessKeysPresent')
+          users=$(echo "$summary" | jq -r '.Users')
+          echo "root MFA=$mfa  root access keys=$keys  IAM users=$users"
+          fail=0
+          [ "$mfa" = "1" ]   || { echo "::error::Root account has NO MFA. Everything here is IAM-layer; root bypasses all of it."; fail=1; }
+          [ "$keys" = "0" ]  || { echo "::error::Root access keys exist ($keys). Root should never have long-lived keys."; fail=1; }
+          [ "$users" = "0" ] || { echo "::error::IAM users exist ($users). This account uses Identity Center and OIDC only."; fail=1; }
+          exit $fail
+
       # WARNING, not a failure: confirming a subscription needs a human to click
       # a link, so failing here would block all merges on an action no CI run can
       # take. Promote to a hard failure once both are confirmed.

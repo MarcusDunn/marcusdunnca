@@ -195,7 +195,16 @@ comes from the environment reviewer above.
 
 ### Controls that can fail silently
 
-Two have already done so, which is why `tofu-plan.yml` has a `health` job:
+Three assertions run on every PR via the `health` job in `tofu-plan.yml`, all
+hard failures: CloudTrail is actually delivering, the cost-alert topic has at
+least one confirmed subscriber, and the root account is hardened (MFA present,
+no root access keys, no IAM users).
+
+Root is checked because it bypasses everything else here — the guardrails, the
+permissions boundary, Object Lock, CloudTrail. Nothing else in this repo would
+notice if root MFA were removed.
+
+The first two exist because they have already failed silently:
 
 - **CloudTrail delivered nothing for 108 minutes** while reporting
   `IsLogging: true`. A bucket-policy statement copied from the state bucket
