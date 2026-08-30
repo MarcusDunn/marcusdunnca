@@ -125,6 +125,33 @@ variable "bedrock_thinking_budget_tokens" {
   }
 }
 
+variable "generate_retry_attempts" {
+  description = <<-EOT
+    Asynchronous retries Lambda makes for a failed generate invocation. Total
+    attempts is this plus one.
+
+    Two things read it, and they must agree: Lambda's own retry configuration,
+    and the handler's MAX_GENERATION_ATTEMPTS. The handler treats an
+    infrastructure failure as retryable — document back to `pending`, invocation
+    failed, Lambda tries again — which is correct until the attempt that has no
+    successor. On that one it must write `failed` instead, because no further S3
+    event will ever be delivered for an object that already exists and a
+    `pending` document offers the reader no Retry button.
+
+    Both are derived from this variable in lambda.tf so the two cannot drift. If
+    they ever do, documents strand silently.
+
+    Each retry is another Bedrock call, so this is also a cost input.
+  EOT
+  type        = number
+  default     = 1
+
+  validation {
+    condition     = var.generate_retry_attempts >= 0 && var.generate_retry_attempts <= 2
+    error_message = "Lambda accepts 0, 1 or 2 asynchronous retry attempts."
+  }
+}
+
 variable "max_pages" {
   description = <<-EOT
     Pages of a document the generate function will read before giving up.

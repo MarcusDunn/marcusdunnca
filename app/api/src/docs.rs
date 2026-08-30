@@ -171,6 +171,7 @@ async fn create_upload(state: &AppState, req: UploadRequest) -> Result<CreateDoc
         question_count: 0,
         created_at: clock::now_iso8601(),
         processed_at: None,
+        generation_attempts: 0,
     };
 
     // Written before the URL is handed out. If this fails there is no upload
