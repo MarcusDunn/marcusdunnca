@@ -295,3 +295,57 @@ pub fn require_session(state: &AppState, header: Option<&str>) -> Result<Claims>
 
     Ok(data.claims)
 }
+
+#[cfg(test)]
+mod crypto_provider_tests {
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Serialize, Deserialize)]
+    struct TestClaims {
+        sub: String,
+        exp: u64,
+    }
+
+    /// Exercises a real sign-and-verify round trip.
+    ///
+    /// This exists because of a specific failure. jsonwebtoken 11 ships no
+    /// CryptoProvider by default — exactly one of `rust_crypto` or `aws_lc_rs`
+    /// must be enabled — and with neither it compiles, type-checks, and then
+    /// PANICS on the first signature.
+    ///
+    /// `cargo check`, `cargo test`, `cargo clippy` and the deploy smoke test all
+    /// passed while login was completely broken, because nothing in the test
+    /// suite signed a token and the smoke test only reached unauthenticated
+    /// routes. The bug surfaced only after a real passkey assertion succeeded.
+    ///
+    /// A type system cannot catch a missing runtime provider. Executing the
+    /// path is the only thing that can.
+    #[test]
+    fn signing_and_verifying_a_token_does_not_panic() {
+        const SECRET: &[u8] = b"a-test-secret-of-entirely-sufficient-length";
+
+        let claims = TestClaims {
+            sub: "owner".to_string(),
+            exp: 4_102_444_800,
+        };
+
+        let token = jsonwebtoken::encode(
+            &jsonwebtoken::Header::default(),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(SECRET),
+        )
+        .expect("signing must succeed; a panic here means no CryptoProvider is enabled");
+
+        let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
+        validation.validate_exp = false;
+
+        let decoded = jsonwebtoken::decode::<TestClaims>(
+            &token,
+            &jsonwebtoken::DecodingKey::from_secret(SECRET),
+            &validation,
+        )
+        .expect("verification must succeed");
+
+        assert_eq!(decoded.claims.sub, "owner");
+    }
+}
