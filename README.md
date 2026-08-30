@@ -88,7 +88,7 @@ refuses stays refused no matter what is added to an allowlist.
 
 CI **can** create IAM roles, but only ones carrying the permissions boundary.
 That boundary is an allowlist — `lambda`, `s3`, `sqs`, `sns`, `logs`,
-`cloudfront`, plus X-Ray write — so a created role cannot act outside those
+`cloudfront`, `dynamodb`, plus X-Ray write — so a created role cannot act outside those
 services *even if a policy granting `Action: "*"` is attached to it*. Verified:
 under the boundary, `dynamodb:PutItem`, `ses:SendEmail` and `kms:Decrypt` are
 denied while `lambda:InvokeFunction` and `sqs:SendMessage` are allowed.
@@ -103,7 +103,15 @@ Two conditioned denies make this safe:
   is an escalation primitive; constrained it is ordinary wiring.
 
 Widening `app_service_actions` widens every application role at once, so it
-deserves the same scrutiny as widening the apply role itself.
+deserves the same scrutiny as widening the apply role itself. Its read-only
+counterpart `app_service_read_actions` is granted to the plan role so `tofu
+plan` can refresh application resources — keep the two in step, or the first PR
+touching a new service fails its plan.
+
+The read list deliberately excludes anything returning *contents*: no
+`s3:GetObject` outside the state bucket, no `dynamodb:GetItem`/`Scan`, no
+`sqs:ReceiveMessage`. The plan role is reachable from any pull request, so it
+must be able to see configuration without seeing data.
 
 Note CloudFront create/update was removed from the expensive-service denies to
 allow this. CloudFront is global, so the region lock gives it no cost

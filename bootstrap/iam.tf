@@ -271,8 +271,37 @@ locals {
     "sns:*",
     "logs:*",
     "cloudfront:*",
+    "dynamodb:*",
     "xray:PutTraceSegments",
     "xray:PutTelemetryRecords",
+  ]
+
+  # Read-only counterpart, for the plan role: `tofu plan` must refresh every
+  # application resource, and an enumerated allowlist means each new service
+  # otherwise fails the plan until its reads are added. Adding these up front
+  # avoids that round trip.
+  #
+  # Deliberately NOT `s3:Get*` — that includes GetObject, and confining the plan
+  # role's object reads to the state bucket is what stops a compromised plan job
+  # (reachable from any PR) exfiltrating application data. Bucket *metadata* is
+  # granted separately below.
+  #
+  # Likewise no dynamodb:GetItem/Scan or sqs:ReceiveMessage: Describe/List
+  # return table and queue configuration, never their contents.
+  app_service_read_actions = [
+    "lambda:Get*",
+    "lambda:List*",
+    "sqs:Get*",
+    "sqs:List*",
+    "sns:Get*",
+    "sns:List*",
+    "logs:Describe*",
+    "logs:List*",
+    "logs:GetLogDelivery",
+    "cloudfront:Get*",
+    "cloudfront:List*",
+    "dynamodb:Describe*",
+    "dynamodb:List*",
   ]
 
   # iam:PassRole is how a role gets handed to a service. Unconstrained it is a
@@ -604,6 +633,22 @@ data "aws_iam_policy_document" "plan_permissions" {
       "${local.iam_root}:role/*",
       "${local.iam_root}:policy/*",
     ]
+  }
+
+  statement {
+    sid       = "ReadApplicationResources"
+    effect    = "Allow"
+    actions   = local.app_service_read_actions
+    resources = ["*"]
+  }
+
+  # Bucket-level metadata for application buckets. Object CONTENT is not
+  # included — s3:GetObject stays confined to the state bucket above.
+  statement {
+    sid       = "ReadApplicationBucketMetadata"
+    effect    = "Allow"
+    actions   = local.s3_bucket_read_actions
+    resources = ["*"]
   }
 
   statement {
