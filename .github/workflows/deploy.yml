@@ -1,0 +1,144 @@
+name: deploy
+
+# Application code, deployed separately from infrastructure.
+#
+# Terraform owns each Lambda's existence and configuration but never its code —
+# the functions carry `ignore_changes` on filename/source_code_hash so the two
+# never fight. That split keeps Rust out of the `tofu plan` path, which matters
+# because a plan runs on every pull request and a Rust build does not belong
+# there.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "app/**"
+      - "web/**"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ca-central-1
+
+jobs:
+  deploy:
+    # Same gate as tofu apply: declaring the environment is what puts
+    # `environment:production` in the OIDC subject, which is the only subject the
+    # apply role trusts. The environment is branch-scoped to main, so a
+    # workflow_dispatch from another branch is refused at the environment rather
+    # than quietly deploying from it.
+    environment: production
+
+    # arm64 runner, matching the Lambda architecture. This is a native build
+    # rather than a cross-compile, which avoids the whole zig/cross toolchain
+    # question. Free for public repositories.
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: ${{ vars.AWS_APPLY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-deploy-${{ github.run_id }}
+
+      # No actions/setup-node or setup-rust here: github_owned_allowed is false
+      # and the actions allowlist is four named repositories, so third-party
+      # setup actions are not available. The runners ship Node and rustup
+      # already, which is enough.
+      - name: Enable pnpm
+        run: corepack enable && corepack prepare pnpm@latest --activate
+
+      # musl, statically linked, rather than the native gnu target. The runner
+      # has glibc 2.39 and provided.al2023 has 2.34 — a dynamically linked
+      # binary built here would fail at runtime on a version mismatch that does
+      # not show up until the first invocation.
+      - name: Add musl target
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
+          rustup target add aarch64-unknown-linux-musl
+
+      - name: Build handlers
+        working-directory: app
+        env:
+          CC_aarch64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        run: cargo build --release --target aarch64-unknown-linux-musl
+
+      # provided.al2023 executes a file named exactly `bootstrap` at the archive
+      # root; the crate name is irrelevant to the runtime.
+      - name: Package handlers
+        working-directory: app
+        run: |
+          for fn in api generate; do
+            cp "target/aarch64-unknown-linux-musl/release/$fn" bootstrap
+            zip -j "$fn.zip" bootstrap
+            rm bootstrap
+          done
+          ls -la ./*.zip
+
+      - name: Deploy handlers
+        working-directory: app
+        run: |
+          for fn in api generate; do
+            aws lambda update-function-code \
+              --function-name "marcusdunnca-$fn" \
+              --zip-file "fileb://$fn.zip" \
+              --query 'LastUpdateStatus' --output text
+            aws lambda wait function-updated --function-name "marcusdunnca-$fn"
+            echo "deployed marcusdunnca-$fn"
+          done
+
+      - name: Build SPA
+        working-directory: web
+        env:
+          # The api is reached cross-origin at its Function URL; there is no
+          # CloudFront behaviour fronting it.
+          VITE_API_BASE_URL: ${{ vars.API_BASE_URL }}
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      # Hashed assets are immutable and cached hard; index.html must not be, or
+      # a deploy leaves browsers pinned to an old bundle referencing assets that
+      # no longer exist. Uploaded in that order so index.html never points at
+      # assets that have not landed yet.
+      - name: Deploy SPA
+        working-directory: web
+        run: |
+          aws s3 sync dist/ "s3://${{ vars.SITE_BUCKET }}/" \
+            --delete --exclude index.html \
+            --cache-control 'public,max-age=31536000,immutable'
+          aws s3 cp dist/index.html "s3://${{ vars.SITE_BUCKET }}/index.html" \
+            --cache-control 'no-cache,must-revalidate'
+
+      - name: Invalidate CloudFront
+        run: |
+          id=$(aws cloudfront create-invalidation \
+            --distribution-id "${{ vars.CLOUDFRONT_DISTRIBUTION_ID }}" \
+            --paths '/index.html' '/' \
+            --query 'Invalidation.Id' --output text)
+          echo "invalidation $id"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### deploy"
+            echo
+            echo "- handlers: \`marcusdunnca-api\`, \`marcusdunnca-generate\` (arm64, musl)"
+            echo "- site: \`${{ vars.SITE_BUCKET }}\`"
+            echo "- https://study.aws.marcusdunn.ca"
+          } >> "$GITHUB_STEP_SUMMARY"

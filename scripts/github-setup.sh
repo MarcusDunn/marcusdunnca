@@ -323,3 +323,24 @@ cat <<EOF
     Required checks only appear in the ruleset UI after they have reported once,
     so the very first PR is what makes them real.
 EOF
+
+# ---------------------------------------------------------------------------
+# Application deploy targets.
+#
+# Read from infra outputs rather than hardcoded, so a rebuilt distribution or a
+# renamed bucket does not leave the deploy workflow pushing at a resource that
+# no longer exists. Skipped silently if infra has never been applied.
+# ---------------------------------------------------------------------------
+if [ -f "${REPO_ROOT}/infra/backend.hcl" ]; then
+  pushd "${REPO_ROOT}/infra" >/dev/null
+  if tofu output -raw cloudfront_distribution_id >/dev/null 2>&1; then
+    echo "==> Publishing application deploy targets"
+    gh variable set SITE_BUCKET               --repo "$SLUG" --body "$(tofu output -raw site_bucket)"
+    gh variable set CLOUDFRONT_DISTRIBUTION_ID --repo "$SLUG" --body "$(tofu output -raw cloudfront_distribution_id)"
+    gh variable set API_BASE_URL              --repo "$SLUG" --body "$(tofu output -raw api_function_url)"
+    echo "    SITE_BUCKET, CLOUDFRONT_DISTRIBUTION_ID, API_BASE_URL"
+  else
+    echo "==> Skipping deploy targets (infra outputs not present yet)"
+  fi
+  popd >/dev/null
+fi
