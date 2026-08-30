@@ -67,7 +67,10 @@ jobs:
       # not show up until the first invocation.
       - name: Add musl target
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
+          # perl and make are for OpenSSL: webauthn-rs-core depends on
+          # openssl-sys and offers no pure-Rust backend, so a statically linked
+          # musl build has to compile OpenSSL from source.
+          sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools perl make
           rustup target add aarch64-unknown-linux-musl
 
       - name: Build handlers
@@ -75,7 +78,12 @@ jobs:
         env:
           CC_aarch64_unknown_linux_musl: musl-gcc
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
-        run: cargo build --release --target aarch64-unknown-linux-musl
+        run: |
+          # Only api needs vendored OpenSSL; generate has no such dependency and
+          # building it with the feature would add minutes for nothing.
+          cargo build --release --target aarch64-unknown-linux-musl \
+            -p api --features api/vendored-openssl
+          cargo build --release --target aarch64-unknown-linux-musl -p generate
 
       # provided.al2023 executes a file named exactly `bootstrap` at the archive
       # root; the crate name is irrelevant to the runtime.

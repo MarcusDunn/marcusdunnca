@@ -103,3 +103,17 @@ variable "daily_document_cap" {
   type        = number
   default     = 20
 }
+
+variable "max_upload_bytes" {
+  description = <<-EOT
+    Largest PDF the presigned PUT will accept.
+
+    Bound by Bedrock, not by S3. The Converse document block caps around 4.5 MB,
+    so a larger file uploads perfectly and then fails generation — the worst
+    shape of failure, because the cost is paid and the feedback arrives a minute
+    later on a different screen. Rejecting at the create call fails it in the
+    place the user is looking.
+  EOT
+  type        = number
+  default     = 4500000
+}

@@ -23,6 +23,7 @@ async function performUpload(
   pageCount: number,
   title: string,
   topics: readonly Topic[],
+  sizeBytes: number,
   onPhase: (phase: Phase) => void,
 ): Promise<UploadOutcome> {
   try {
@@ -32,6 +33,7 @@ async function performUpload(
       topics: [...topics],
       pageCount,
       contentType: "application/pdf",
+      sizeBytes,
     });
 
     // uploadUrl is null only on a retry, which this screen never issues. The
@@ -85,6 +87,7 @@ export function UploadScreen() {
         inspection.pageCount,
         value.title.trim(),
         value.topics,
+        file.size,
         setPhase,
       );
 

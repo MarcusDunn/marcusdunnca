@@ -254,18 +254,32 @@ export const CreateDocumentRequest = z.union([
     topics: z.array(Topic).min(1),
     pageCount: z.number().int().positive(),
     contentType: z.literal("application/pdf"),
+    // Required, not optional. The presigned PUT signs content-length, which
+    // fixes the object size at exactly this value — a pinned-key presigned URL
+    // with no size bound otherwise accepts a multi-gigabyte object. Sending it
+    // costs the client nothing (File.size is already to hand) and the server
+    // has no other way to obtain it before the upload happens.
+    sizeBytes: z.number().int().positive(),
   }),
   z.object({ retryOf: z.string().min(1) }),
 ]);
 export type CreateDocumentRequest = z.infer<typeof CreateDocumentRequest>;
 
 export const SubmitQuizRequest = z.object({
+  // Client-generated and stable across retries of the same submission. A
+  // double-tap on a flaky phone connection otherwise writes two attempts and
+  // skews every rate in the history view. The server stores an idempotency
+  // marker alongside the attempt in one transaction and replays the original
+  // response rather than regrading.
+  attemptId: z.uuid(),
   answers: z.array(
     z.object({
       questionId: z.string().min(1),
       optionId: z.string().min(1),
     }),
   ),
+  // Wall-clock time on the quiz. Stored as 0 when absent.
+  durationMs: z.number().int().nonnegative().optional(),
 });
 export type SubmitQuizRequest = z.infer<typeof SubmitQuizRequest>;
 

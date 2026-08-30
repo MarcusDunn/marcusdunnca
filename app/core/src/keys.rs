@@ -1,0 +1,104 @@
+//! Key construction for the single table.
+//!
+//! Centralised because key strings are the one thing in this system that cannot
+//! be refactored after the fact — a typo'd prefix does not fail, it writes a
+//! row nobody will ever read again. Every `format!("DOC#...")` in a handler is
+//! a chance to write `DOC:` instead.
+
+/// Partition key for a document and everything hanging off it.
+pub fn doc_pk(doc_id: &str) -> String {
+    format!("DOC#{doc_id}")
+}
+
+/// Sort key of the document's metadata row.
+pub const META_SK: &str = "META";
+
+/// Sort key of one attempt. RFC 3339 in UTC, so lexicographic order is
+/// chronological order and a `begins_with`/range query over attempts works
+/// without a secondary index.
+pub fn attempt_sk(submitted_at: &str) -> String {
+    format!("{ATTEMPT_PREFIX}{submitted_at}")
+}
+
+pub const ATTEMPT_PREFIX: &str = "ATTEMPT#";
+
+/// Sort key of the idempotency marker for one submission.
+///
+/// Shares the document's partition so it can be written in the same
+/// transaction as the attempt — DynamoDB transactions are cross-partition
+/// capable, but keeping them together also means a document's rows can be
+/// deleted as one range.
+pub fn idempotency_sk(attempt_id: &str) -> String {
+    format!("IDEMPOTENCY#{attempt_id}")
+}
+
+/// All auth challenges share one partition. That is fine — they live 60
+/// seconds and there is one user, so this is not a hot partition, and putting
+/// them together means TTL sweeps touch one place.
+pub const AUTH_PK: &str = "AUTH";
+
+/// The challenge itself is the sort key. Making the challenge the key is what
+/// makes single-use enforcement a `DeleteItem` rather than a read-modify-write.
+pub fn challenge_sk(challenge_b64: &str) -> String {
+    format!("CHALLENGE#{challenge_b64}")
+}
+
+/// Partition holding the daily generation counter.
+pub const QUOTA_PK: &str = "QUOTA";
+
+/// One row per UTC day.
+pub fn day_sk(date: &str) -> String {
+    format!("DAY#{date}")
+}
+
+/// Recover the document id from an S3 object key.
+///
+/// Accepts exactly `docs/<id>.pdf` and nothing else. Anything laxer — a
+/// `strip_prefix` plus `strip_suffix` with no check on what is between them —
+/// would happily derive an id containing `/`, which produces a partition key
+/// that no `POST /docs` could ever have created and a row that is invisible to
+/// the rest of the app.
+pub fn doc_id_from_s3_key(key: &str) -> Option<&str> {
+    let id = key.strip_prefix("docs/")?.strip_suffix(".pdf")?;
+
+    let ok = !id.is_empty()
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+
+    ok.then_some(id)
+}
+
+/// The only key a document is ever stored at.
+pub fn s3_key(doc_id: &str) -> String {
+    format!("docs/{doc_id}.pdf")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn s3_key_and_doc_id_round_trip() {
+        let id = "0191f0c8-2a1e-7c3b-9d44-6f2b1c4a5e77";
+        assert_eq!(doc_id_from_s3_key(&s3_key(id)), Some(id));
+    }
+
+    #[test]
+    fn traversal_and_nesting_are_refused() {
+        // A presigned PUT pins the key, but the S3 trigger fires for every
+        // object in the bucket including any written by a future feature or by
+        // hand. Deriving a partition key from an attacker-influenced string is
+        // the thing to be careful about here.
+        assert_eq!(doc_id_from_s3_key("docs/a/b.pdf"), None);
+        assert_eq!(doc_id_from_s3_key("docs/../secret.pdf"), None);
+        assert_eq!(doc_id_from_s3_key("docs/.pdf"), None);
+        assert_eq!(doc_id_from_s3_key("other/x.pdf"), None);
+        assert_eq!(doc_id_from_s3_key("docs/x.txt"), None);
+        assert_eq!(
+            doc_id_from_s3_key(&format!("docs/{}.pdf", "a".repeat(65))),
+            None
+        );
+    }
+}
