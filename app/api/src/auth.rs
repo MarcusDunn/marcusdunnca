@@ -281,7 +281,24 @@ fn issue_token(state: &AppState) -> Result<SessionResponse> {
     })
 }
 
-/// Verify the `Authorization: Bearer` header.
+/// Name of the header carrying the session token.
+///
+/// NOT `Authorization`, and that is not a style choice.
+///
+/// The api is reached through CloudFront, which signs every origin request to
+/// the Lambda Function URL with SigV4 via an Origin Access Control. SigV4 puts
+/// its signature in `Authorization`, and with signing behaviour "always"
+/// CloudFront OVERWRITES whatever the viewer sent there. A bearer token in that
+/// header is silently discarded before the handler ever sees it — login
+/// succeeds, then the first authenticated request arrives with no token and is
+/// refused.
+///
+/// "no-override" signing is not the escape: the request would then reach Lambda
+/// unsigned, and AWS_IAM auth refuses it outright. The token has to live
+/// somewhere else.
+pub const SESSION_HEADER: &str = "x-session-token";
+
+/// Verify the session token header.
 ///
 /// The algorithm is pinned to HS256 by `Validation::new`. That is the whole
 /// point of constructing a `Validation` rather than accepting the default
@@ -294,7 +311,7 @@ fn issue_token(state: &AppState) -> Result<SessionResponse> {
 /// line is a thirty-day credential in a log line.
 pub fn require_session(state: &AppState, header: Option<&str>) -> Result<Claims> {
     let raw = header
-        .and_then(|h| h.strip_prefix("Bearer "))
+        .map(str::trim)
         .map(str::trim)
         .filter(|t| !t.is_empty())
         .ok_or(Error::Unauthorized)?;

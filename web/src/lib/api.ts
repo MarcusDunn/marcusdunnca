@@ -112,7 +112,12 @@ async function request<T>(
   if (!anonymous) {
     const token = getToken();
     if (!token) throw new ApiError("Not signed in", 401, url);
-    headers.set("authorization", `Bearer ${token}`);
+    // NOT `Authorization`. CloudFront signs every origin request to the Lambda
+    // Function URL with SigV4, which puts its signature in that header and
+    // overwrites whatever the viewer sent. A bearer token there is discarded
+    // before the handler sees it: login succeeds, then the first authenticated
+    // request arrives with no token and is refused.
+    headers.set("x-session-token", token);
   }
 
   let response: Response;
