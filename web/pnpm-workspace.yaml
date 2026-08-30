@@ -1,0 +1,5 @@
+# pnpm 11 gates freshly published packages behind a minimum release age. zod 4.5.4
+# is newer than that window, so it needs an explicit exclusion for a clean
+# `pnpm install` from the committed lockfile.
+minimumReleaseAgeExclude:
+  - zod@4.5.4

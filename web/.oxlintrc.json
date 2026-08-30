@@ -1,0 +1,36 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  // `react-perf` is deliberately absent. It flags every inline arrow and object
+  // literal passed as a prop — which is precisely the work React Compiler now
+  // does automatically. Leaving it on would mean hand-memoizing against a
+  // compiler that already did it.
+  "plugins": ["react", "typescript", "unicorn", "oxc", "import"],
+  "categories": {
+    "correctness": "error",
+    "suspicious": "error",
+    "perf": "warn"
+  },
+  "env": {
+    "browser": true,
+    "es2024": true
+  },
+  "rules": {
+    "eqeqeq": ["error", "always", { "null": "ignore" }],
+    "no-console": ["warn", { "allow": ["warn", "error"] }],
+    "typescript/no-explicit-any": "error",
+    "typescript/consistent-type-imports": "error",
+
+    // Correctness rules for hooks stay on; they still hold under the compiler.
+    "react/exhaustive-deps": "error",
+    "react/rules-of-hooks": "error",
+
+    // The automatic JSX runtime is on (jsx: "react-jsx"), so React is never
+    // referenced by name.
+    "react/react-in-jsx-scope": "off",
+
+    // `import "./styles.css"` is the intended way to pull the stylesheet into
+    // the graph.
+    "import/no-unassigned-import": "off"
+  },
+  "ignorePatterns": ["dist", "node_modules"]
+}
