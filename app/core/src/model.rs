@@ -35,6 +35,14 @@ pub struct QuestionOption {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Question {
     pub id: String,
+    /// Defaulted, because the model is not asked for it — there is exactly one
+    /// legal value, so the field can only ever be filled in wrongly. See
+    /// [`QuestionFormat`]'s `Default` impl for the generation that was thrown
+    /// away proving that.
+    ///
+    /// The field itself stays: grading branches on it, and a second format will
+    /// not be graded by equality.
+    #[serde(default)]
     pub format: QuestionFormat,
     /// Singular. One question tests one skill: the history view builds a
     /// skill × topic matrix, and a question belonging to three skills would
@@ -162,13 +170,18 @@ pub struct DocMeta {
     /// so that a future change to the key layout does not orphan old rows.
     pub s3_key: String,
 
-    /// Supplied by the reader at upload time, not inferred by the model.
+    /// Chosen by the model from the document, not supplied by the reader.
     ///
-    /// The frontend requires topics before the document exists — they are shown
-    /// in the list while status is still `pending` — so they cannot come from a
-    /// generation step that has not run. Asking the person who chose the
-    /// document also removes a whole class of model error: there is no such
-    /// thing as a hallucinated topic if the model is never asked for one.
+    /// **Empty until `status == Ready`.** The row exists from the moment the
+    /// upload URL is handed out, which is before anything has read the PDF, so
+    /// a `pending` document genuinely has no topics and the list view renders
+    /// it without them.
+    ///
+    /// This used to be the reader's job, on the reasoning that a model cannot
+    /// hallucinate a topic it is never asked for. True, and beside the point:
+    /// the closed vocabulary it had to choose from contained no tag for a
+    /// housing report, so the reader picked a wrong one instead. The vocabulary
+    /// is now open — see `tags::Topic`.
     #[serde(default)]
     pub topics: Vec<Topic>,
     pub tag_version: u32,
@@ -332,4 +345,52 @@ pub struct ChallengeItem {
     /// 48 hours, so a 60-second expiry that is only enforced by TTL is a
     /// 48-hour expiry.
     pub expires_at: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The model is no longer asked for `format`, so every generated question
+    /// arrives without one. If this default ever stops applying, ten good
+    /// questions get discarded at deserialization — which is exactly what
+    /// happened when the model *was* asked, and answered `"definitional"`.
+    #[test]
+    fn a_question_without_a_format_defaults_to_multiple_choice() {
+        let q: Question = serde_json::from_str(
+            r#"{"id":"q1","skill":"causal","prompt":"why?",
+                "options":["a","b","c","d"],"answer":"a","explanation":"page 1"}"#,
+        )
+        .expect("format is optional");
+
+        assert_eq!(q.format, QuestionFormat::MultipleChoice);
+    }
+
+    /// Stored rows written before the field was defaulted still carry it, and
+    /// must keep round-tripping.
+    #[test]
+    fn an_explicit_format_still_deserializes() {
+        let q: Question = serde_json::from_str(
+            r#"{"id":"q1","format":"multiple_choice","skill":"causal","prompt":"why?",
+                "options":["a","b","c","d"],"answer":"a","explanation":"page 1"}"#,
+        )
+        .expect("explicit format still accepted");
+
+        assert_eq!(q.format, QuestionFormat::MultipleChoice);
+    }
+
+    /// A wrong value must still be refused rather than silently defaulted. The
+    /// defaulting is for an *absent* field only — if serde ever started
+    /// swallowing bad values, the closed vocabulary would be decorative.
+    #[test]
+    fn a_bogus_format_is_still_rejected() {
+        let bogus: Result<Question, _> = serde_json::from_str(
+            r#"{"id":"q1","format":"definitional","skill":"causal","prompt":"why?",
+                "options":["a","b","c","d"],"answer":"a","explanation":"page 1"}"#,
+        );
+        assert!(
+            bogus.is_err(),
+            "an unknown format must not default silently"
+        );
+    }
 }

@@ -142,6 +142,21 @@ closed_vocab! {
     }
 }
 
+/// The only format that exists today.
+///
+/// A `Default` impl on a one-variant enum looks redundant and is not: it is
+/// what lets [`crate::model::Question`] accept a question with no `format` at
+/// all, which is how the model is now asked for them. Handing a model a field
+/// with exactly one legal value is all downside — it cannot add information,
+/// and it can be filled in wrongly. It was: Sonnet returned
+/// `"format": "definitional"`, putting a *skill* in the format field, and the
+/// whole generation was discarded over a value that was never in question.
+impl Default for QuestionFormat {
+    fn default() -> Self {
+        Self::MultipleChoice
+    }
+}
+
 closed_vocab! {
     /// What the question is testing. Attached per question, not per document —
     /// a single document produces questions across several skills, and the
