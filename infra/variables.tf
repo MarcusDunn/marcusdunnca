@@ -69,7 +69,7 @@ variable "bedrock_model_id" {
   description = <<-EOT
     Model the generate function invokes.
 
-    **This is a `global.` inference profile, so document text leaves Canada.**
+    **This is a `us.` inference profile, so document text leaves Canada.**
     That was a deliberate trade, not an oversight. Nova Lite carried a genuine
     in-region (`ca.`) profile and was chosen for it, but measured on a real
     document it produced questions answerable without reading the document,
@@ -80,11 +80,25 @@ variable "bedrock_model_id" {
     "ca.amazon.nova-lite-v1:0" and accepting those question-quality losses;
     nothing else in the stack depends on the choice.
 
+    **Do not change this to a `global.` profile without reading the region-lock
+    note in bootstrap/iam.tf.** It was briefly set to
+    "global.anthropic.claude-sonnet-4-6" and every generation failed with an
+    AccessDenied naming an explicit deny in the permissions boundary. A global
+    profile routes to a *region-less* model ARN —
+    `arn:aws:bedrock:::foundation-model/...` — and AWS authorizes that one with
+    no `aws:RequestedRegion` in context. `StringNotEquals` against a missing key
+    is true, so the region lock fires and denies it. Working as designed, and
+    invisible until a document fails.
+
+    A `us.` profile has no such target: every model it routes to carries a real
+    region, the call is still made to the ca-central-1 endpoint, and the lock is
+    satisfied.
+
     Cost is roughly 7c per document against Nova's 0.1c — bounded by
     daily_document_cap and by the budget's spend brake, both unchanged.
   EOT
   type        = string
-  default     = "global.anthropic.claude-sonnet-4-6"
+  default     = "us.anthropic.claude-sonnet-4-6"
 }
 
 variable "bedrock_thinking_budget_tokens" {

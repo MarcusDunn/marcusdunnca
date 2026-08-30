@@ -60,6 +60,31 @@ locals {
 
   # Services whose API calls are not region-scoped, and so must be exempt from
   # the region lock or they would break entirely.
+  #
+  # Bedrock is deliberately NOT in this list, and the omission has a consequence
+  # worth stating because it is not discoverable from the policy:
+  #
+  #   A *global* inference profile (`global.anthropic.claude-sonnet-4-6`) routes
+  #   to a region-less model ARN, `arn:aws:bedrock:::foundation-model/...`, and
+  #   AWS authorizes that one with no `aws:RequestedRegion` in the request
+  #   context. `StringNotEquals` against a missing key is true, so
+  #   DenyAllOutsideAllowedRegions fires and every Converse call is refused —
+  #   correctly, and invisibly until a document fails.
+  #
+  # The app therefore uses a `us.` profile, whose routing targets all carry real
+  # regions while the call itself is still made to the ca-central-1 endpoint.
+  # Nothing needs to change here to support that.
+  #
+  # If a global profile is ever genuinely required, the fix is to add the four
+  # bedrock invoke actions to this list — model invocation via a global profile
+  # *is* a global-service call, in the same sense as cloudfront and route53
+  # below. That is a real widening: it would permit invoking the approved models
+  # from any region. The model allowlist in `bedrock_allowed_model_arns`, the
+  # daily cap and the spend brake would be the only remaining cost controls.
+  #
+  # Note that `iam:simulate-principal-policy` does NOT reproduce this: with no
+  # context supplied it reports the region-less ARN as allowed. CloudTrail's
+  # errorMessage was the only reliable witness.
   global_service_actions = [
     "iam:*",
     "sts:*",
