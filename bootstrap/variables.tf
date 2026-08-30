@@ -121,13 +121,13 @@ variable "monthly_budget_usd" {
     Monthly cost budget in USD. Alerts fire at 80% actual, 100% actual, and on a
     forecast breach of 100%.
 
-    $1 is chosen to sit just above the real floor. This account costs a few cents
-    a month at rest (S3 storage and CloudTrail data events), so a genuinely
-    zero-spend threshold produces a false alarm every month and trains you to
-    ignore it. A dollar of unexplained spend here is still a real signal.
+    $10 covers the Reading Trainer workload: Bedrock at roughly 15c/document
+    plus a few cents of S3 and CloudTrail data events. Raised from $1 when
+    Bedrock was allowlisted — at 15c/doc the old threshold would have fired
+    after about seven documents, which is normal use, not an anomaly.
   EOT
   type        = string
-  default     = "1"
+  default     = "10"
 }
 
 variable "cost_alert_emails" {

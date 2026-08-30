@@ -92,7 +92,6 @@ locals {
     "ec2:AllocateHosts",
     "savingsplans:*",
     "sagemaker:*",
-    "bedrock:*",
     "emr:*",
     "elasticmapreduce:*",
     "redshift:*",
@@ -272,6 +271,15 @@ locals {
     "logs:*",
     "cloudfront:*",
     "dynamodb:*",
+    # Moved out of expensive_service_actions deliberately. Bedrock is metered
+    # per token and, like CloudFront, is not meaningfully bounded by the region
+    # lock — the $10 budget and the $1 anomaly subscription are what bound it.
+    "bedrock:InvokeModel",
+    "bedrock:InvokeModelWithResponseStream",
+    "bedrock:Converse",
+    "bedrock:ConverseStream",
+    "bedrock:ListFoundationModels",
+    "bedrock:GetFoundationModel",
     "xray:PutTraceSegments",
     "xray:PutTelemetryRecords",
   ]
@@ -300,6 +308,9 @@ locals {
     "logs:GetLogDelivery",
     "cloudfront:Get*",
     "cloudfront:List*",
+    "acm:Describe*",
+    "acm:List*",
+    "acm:GetCertificate",
     "dynamodb:Describe*",
     "dynamodb:List*",
   ]
@@ -635,6 +646,21 @@ data "aws_iam_policy_document" "plan_permissions" {
     ]
   }
 
+  # Config parameters only. Granting /secret/* here would hand the JWT signing
+  # key to anyone who can open a pull request.
+  statement {
+    sid    = "ReadApplicationConfigParameters"
+    effect = "Allow"
+    actions = [
+      "ssm:GetParameter",
+      "ssm:GetParameters",
+      "ssm:GetParametersByPath",
+      "ssm:DescribeParameters",
+      "ssm:ListTagsForResource",
+    ]
+    resources = ["arn:${local.partition}:ssm:*:${local.account_id}:parameter/${var.project}/config/*"]
+  }
+
   statement {
     sid       = "ReadApplicationResources"
     effect    = "Allow"
@@ -807,6 +833,44 @@ data "aws_iam_policy_document" "apply_permissions" {
     resources = ["*"]
   }
 
+  # Certificates for the CloudFront distribution. Must be issued in us-east-1 —
+  # CloudFront accepts certificates from nowhere else — which the region lock
+  # already permits.
+  statement {
+    sid    = "ManageCertificates"
+    effect = "Allow"
+    actions = [
+      "acm:RequestCertificate",
+      "acm:DeleteCertificate",
+      "acm:DescribeCertificate",
+      "acm:ListCertificates",
+      "acm:ListTagsForCertificate",
+      "acm:AddTagsToCertificate",
+      "acm:RemoveTagsFromCertificate",
+      "acm:GetCertificate",
+    ]
+    resources = ["*"]
+  }
+
+  # Non-secret application configuration only. SECRETS ARE NOT MANAGED HERE —
+  # see the namespace split documented in the boundary below.
+  statement {
+    sid    = "ManageApplicationConfigParameters"
+    effect = "Allow"
+    actions = [
+      "ssm:PutParameter",
+      "ssm:GetParameter",
+      "ssm:GetParameters",
+      "ssm:GetParametersByPath",
+      "ssm:DeleteParameter",
+      "ssm:DescribeParameters",
+      "ssm:AddTagsToResource",
+      "ssm:RemoveTagsFromResource",
+      "ssm:ListTagsForResource",
+    ]
+    resources = ["arn:${local.partition}:ssm:*:${local.account_id}:parameter/${var.project}/config/*"]
+  }
+
   # Application infrastructure. Same list the boundary caps created roles at, so
   # CI cannot build something it could not also grant a role access to.
   statement {
@@ -909,6 +973,28 @@ data "aws_iam_policy_document" "ci_permissions_boundary" {
     effect    = "Allow"
     actions   = local.app_service_actions
     resources = ["*"]
+  }
+
+  # Parameter namespace split — the reason secrets stay out of CI's reach:
+  #
+  #   /marcusdunnca/secret/*  created OUT OF BAND with `aws ssm put-parameter`.
+  #                           Never in Terraform, never in state, never readable
+  #                           by the plan role (which any pull request can
+  #                           reach). Runtime roles read it; nothing else can.
+  #   /marcusdunnca/config/*  ordinary non-secret configuration. Terraform may
+  #                           manage these, and the plan role may read them so
+  #                           `tofu plan` can refresh.
+  #
+  # Runtime roles get both, because the application actually needs its secret.
+  statement {
+    sid    = "ReadApplicationParameters"
+    effect = "Allow"
+    actions = [
+      "ssm:GetParameter",
+      "ssm:GetParameters",
+      "ssm:GetParametersByPath",
+    ]
+    resources = ["arn:${local.partition}:ssm:*:${local.account_id}:parameter/${var.project}/*"]
   }
 
   statement {
