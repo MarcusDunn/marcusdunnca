@@ -172,15 +172,31 @@ pub async fn verify_assertion(
     // the browser hands us. Reading it from there rather than from a sibling
     // field in the request body means there is only one copy and no way for the
     // two to disagree.
-    let challenge_b64 = extract_challenge(credential).ok_or(Error::Unauthorized)?;
+    let Some(challenge_b64) = extract_challenge(credential) else {
+        // Previously an unlogged `ok_or`. A failed login then produced a bare
+        // "unauthorized" with nothing to distinguish "clientDataJSON did not
+        // parse" from "challenge not found" from "signature invalid" — three
+        // very different bugs.
+        tracing::warn!("assertion rejected: clientDataJSON missing or unparseable");
+        return Err(Error::Unauthorized);
+    };
 
     let Some(stored) = state.store.take_challenge(&challenge_b64).await? else {
         // Either never issued, already used, or reaped. All three are the same
-        // answer to the caller.
+        // answer to the CALLER — but not to whoever is debugging, so the reason
+        // is logged even though the response does not distinguish them.
+        //
+        // DeleteItem succeeds whether or not the item existed, so nothing in
+        // the SDK logs reveals this; only this line does.
+        tracing::warn!(
+            challenge = %challenge_b64,
+            "assertion rejected: challenge not found (never issued, already used, or expired)"
+        );
         return Err(Error::Unauthorized);
     };
 
     if stored.expires_at < clock::unix_now() {
+        tracing::warn!("assertion rejected: challenge expired");
         return Err(Error::Unauthorized);
     }
 
@@ -193,7 +209,7 @@ pub async fn verify_assertion(
             // Logged at debug with the library's own error, which contains no
             // key material — only which check failed. Useful when a new phone
             // stops working; not useful to anyone who cannot read the logs.
-            tracing::debug!(error = ?e, "assertion rejected");
+            tracing::warn!(error = ?e, "assertion rejected by webauthn-rs");
             Error::Unauthorized
         })?;
 
@@ -201,7 +217,7 @@ pub async fn verify_assertion(
         // Belt and braces over the library's policy. Without UV a passkey is a
         // single factor — possession of an unlocked phone — and this token is
         // valid for thirty days.
-        tracing::debug!("assertion rejected: user verification flag not set");
+        tracing::warn!("assertion rejected: user verification flag not set");
         return Err(Error::Unauthorized);
     }
 
