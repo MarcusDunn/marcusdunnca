@@ -329,6 +329,10 @@ locals {
     "logs:GetLogDelivery",
     "cloudfront:Get*",
     "cloudfront:List*",
+    # CloudFront Functions use DescribeFunction, which matches neither the Get*
+    # nor the List* prefix — a reminder that verb-prefix wildcards are a
+    # heuristic, not a guarantee of coverage.
+    "cloudfront:DescribeFunction",
     "acm:Describe*",
     "acm:List*",
     "acm:GetCertificate",
