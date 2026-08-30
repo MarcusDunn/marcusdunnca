@@ -295,10 +295,13 @@ locals {
 
   # Both the raw foundation-model ARN and the inference-profile form, because
   # newer models are addressed through profiles rather than directly.
+  # Both forms are required: invoking through an inference profile needs
+  # permission on the profile ARN AND on the underlying foundation-model ARN in
+  # every region the profile may route to, hence the wildcard region.
   bedrock_allowed_model_arns = flatten([
-    for family in var.bedrock_allowed_model_families : [
-      "arn:${local.partition}:bedrock:*::foundation-model/anthropic.claude-${family}-*",
-      "arn:${local.partition}:bedrock:*:${local.account_id}:inference-profile/*anthropic.claude-${family}-*",
+    for pattern in var.bedrock_allowed_models : [
+      "arn:${local.partition}:bedrock:*::foundation-model/${pattern}",
+      "arn:${local.partition}:bedrock:*:${local.account_id}:inference-profile/*${pattern}",
     ]
   ])
 
@@ -1037,9 +1040,20 @@ resource "aws_iam_role_policy_attachment" "apply_guardrails" {
 # ---------------------------------------------------------------------------
 
 data "aws_iam_policy_document" "ci_permissions_boundary" {
-  # The ceiling. A role wearing this boundary can never act outside these
-  # services, regardless of what policy CI attaches to it. This replaced a
-  # blanket Allow "*" — which made the boundary a formality rather than a limit.
+  # IAM caps a managed policy at 6144 bytes and this hit it. What follows is
+  # deliberately trimmed, on a specific argument:
+  #
+  # The Allow below is a narrow app-service allowlist, so a deny for anything
+  # OUTSIDE that list is unreachable and pure weight — ec2, rds, sagemaker, all
+  # of iam:*, cloudtrail, and kms beyond SSM-decrypt are already denied by
+  # simply not being allowed. Only denies that constrain actions INSIDE the
+  # allowed services do real work, and those are kept.
+  #
+  # THE COUPLING THIS CREATES: if app_service_actions is ever widened, the
+  # dropped denies stop being unreachable. Widening that list means revisiting
+  # this policy in the same change. The guardrail attached to the CI roles keeps
+  # the full set — it is the one that has to hold against a broad allow.
+
   statement {
     sid       = "AllowOnlyApplicationServices"
     effect    = "Allow"
@@ -1047,8 +1061,6 @@ data "aws_iam_policy_document" "ci_permissions_boundary" {
     resources = ["*"]
   }
 
-  # Runtime inference, same model restriction as the apply role. A created role
-  # cannot invoke Opus even if a policy granting bedrock:* is attached to it.
   statement {
     sid       = "InvokeApprovedBedrockModels"
     effect    = "Allow"
@@ -1056,9 +1068,17 @@ data "aws_iam_policy_document" "ci_permissions_boundary" {
     resources = local.bedrock_allowed_model_arns
   }
 
-  # Reading a SecureString requires kms:Decrypt on the key behind it. Scoped by
-  # kms:ViaService so the grant only works through SSM — a runtime role cannot
-  # use it to decrypt anything else.
+  # /secret/* included: the application genuinely needs its signing key. Scoped
+  # to this project's prefix, so no other parameter is reachable.
+  statement {
+    sid       = "ReadApplicationParameters"
+    effect    = "Allow"
+    actions   = ["ssm:GetParameter", "ssm:GetParameters", "ssm:GetParametersByPath"]
+    resources = ["arn:${local.partition}:ssm:*:${local.account_id}:parameter/${var.project}/*"]
+  }
+
+  # SecureString reads need Decrypt on the key behind the parameter. ViaService
+  # confines it to SSM, so it cannot decrypt anything else.
   statement {
     sid       = "DecryptParametersViaSSM"
     effect    = "Allow"
@@ -1072,80 +1092,6 @@ data "aws_iam_policy_document" "ci_permissions_boundary" {
     }
   }
 
-  # Parameter namespace split — the reason secrets stay out of CI's reach:
-  #
-  #   /marcusdunnca/secret/*  created OUT OF BAND with `aws ssm put-parameter`.
-  #                           Never in Terraform, never in state, never readable
-  #                           by the plan role (which any pull request can
-  #                           reach). Runtime roles read it; nothing else can.
-  #   /marcusdunnca/config/*  ordinary non-secret configuration. Terraform may
-  #                           manage these, and the plan role may read them so
-  #                           `tofu plan` can refresh.
-  #
-  # Runtime roles get both, because the application actually needs its secret.
-  statement {
-    sid    = "ReadApplicationParameters"
-    effect = "Allow"
-    actions = [
-      "ssm:GetParameter",
-      "ssm:GetParameters",
-      "ssm:GetParametersByPath",
-    ]
-    resources = ["arn:${local.partition}:ssm:*:${local.account_id}:parameter/${var.project}/*"]
-  }
-
-  statement {
-    sid       = "DenyLongLivedCredentials"
-    effect    = "Deny"
-    actions   = local.long_lived_credential_actions
-    resources = ["*"]
-  }
-
-  statement {
-    sid       = "DenyExpensiveServices"
-    effect    = "Deny"
-    actions   = local.expensive_service_actions
-    resources = ["*"]
-  }
-
-  statement {
-    sid    = "DenyBoundaryEscape"
-    effect = "Deny"
-    actions = [
-      "iam:DeleteRolePermissionsBoundary",
-      "iam:DeleteUserPermissionsBoundary",
-      "iam:PutRolePermissionsBoundary",
-      "iam:PutUserPermissionsBoundary",
-    ]
-    resources = ["*"]
-  }
-
-  # Without this the boundary was an escape hatch, not a ceiling: a principal
-  # holding it could iam:CreateRole a NEW, unbounded role and attach
-  # AdministratorAccess to it. DenyBoundaryEscape above only stops removing a
-  # boundary from an existing principal — it never required a new one to carry
-  # the boundary in the first place. A missing iam:PermissionsBoundary key makes
-  # StringNotEquals true, so no-boundary fails closed.
-  statement {
-    sid    = "DenyRoleCreationWithoutThisBoundary"
-    effect = "Deny"
-    actions = [
-      "iam:CreateRole",
-      "iam:PutRolePermissionsBoundary",
-    ]
-    resources = ["*"]
-
-    condition {
-      test     = "StringNotEquals"
-      variable = "iam:PermissionsBoundary"
-      values   = [local.boundary_arn]
-    }
-  }
-
-  # The boundary previously omitted the region lock and the destruction denies
-  # entirely, so a boundary-constrained role was free in every region and could
-  # delete state versions and silence the trail. Reuse the same statements the
-  # guardrail applies to the CI roles themselves.
   statement {
     sid         = "DenyAllOutsideAllowedRegions"
     effect      = "Deny"
@@ -1159,95 +1105,33 @@ data "aws_iam_policy_document" "ci_permissions_boundary" {
     }
   }
 
-  # Rendered from the same lists as the guardrail. "*" rather than the bucket
-  # ARNs: a role wearing this boundary has no legitimate reason to destroy
-  # state, logs, or keys anywhere in the account.
-  # The control that makes iam:CreateRole safe to grant.
-  #
-  # PassRole unconstrained is an escalation primitive: hand a powerful role to a
-  # service you control and inherit it. Constrained to the app services, it is
-  # ordinary wiring. A missing iam:PassedToService key fails closed here too.
-  statement {
-    sid       = "DenyPassRoleExceptToAppServices"
-    effect    = "Deny"
-    actions   = ["iam:PassRole"]
-    resources = ["*"]
-
-    condition {
-      test     = "StringNotEquals"
-      variable = "iam:PassedToService"
-      values   = local.app_pass_role_services
-    }
-  }
-
+  # s3:* is allowed, so these are reachable and matter: state and the audit log
+  # must not be destroyable by an application role.
   statement {
     sid       = "DenyStateAndAuditDestruction"
     effect    = "Deny"
     actions   = local.state_audit_destruction_actions
-    resources = ["*"]
+    resources = [local.state_bucket_arn, "${local.state_bucket_arn}/*", local.trail_bucket_arn, "${local.trail_bucket_arn}/*"]
   }
 
+  # Reachable tampering within the allowed services: silencing the cost alerts
+  # (sns is allowed), reopening public access (s3 is allowed), and destroying
+  # the application table or its backups (dynamodb is allowed).
   statement {
-    sid       = "DenySilencingTheAuditTrail"
-    effect    = "Deny"
-    actions   = local.audit_silencing_actions
+    sid    = "DenyProtectedResourceDestruction"
+    effect = "Deny"
+    actions = [
+      "sns:DeleteTopic",
+      "sns:SetTopicAttributes",
+      "sns:SetSubscriptionAttributes",
+      "sns:Unsubscribe",
+      "sns:RemovePermission",
+      "s3:PutAccountPublicAccessBlock",
+      "dynamodb:DeleteTable",
+      "dynamodb:DeleteBackup",
+      "dynamodb:UpdateContinuousBackups",
+    ]
     resources = ["*"]
-  }
-
-  statement {
-    sid       = "DenyKeyDestruction"
-    effect    = "Deny"
-    actions   = local.key_destruction_actions
-    resources = ["*"]
-  }
-
-  # This whole group was absent. Most starkly, iam:DeleteAccountAlias was
-  # permitted — the boundary allowed the exact permanent console-URL hijack the
-  # guardrail spends a paragraph explaining.
-  # Grants are how a principal hands key use to something else, so an
-  # unconstrained CreateGrant is a way to widen access to a key. But AWS
-  # services create grants on AWS-managed keys as normal operation — ACM does it
-  # to store a certificate's private key.
-  #
-  # kms:GrantIsForAWSResource is set only when a service makes the call.
-  # BoolIfExists is load-bearing: on a direct user call the key is ABSENT, and
-  # IfExists makes the condition true, so the deny fires. A plain Bool would
-  # evaluate false on the absent key and let exactly the case we care about
-  # through.
-  statement {
-    sid       = "DenyUserInitiatedKeyGrants"
-    effect    = "Deny"
-    actions   = ["kms:CreateGrant"]
-    resources = ["*"]
-
-    condition {
-      test     = "BoolIfExists"
-      variable = "kms:GrantIsForAWSResource"
-      values   = ["false"]
-    }
-  }
-
-  statement {
-    sid       = "DenyAccountAndIdentityCenterControl"
-    effect    = "Deny"
-    actions   = local.account_control_actions
-    resources = ["*"]
-  }
-
-  # Closes the escape where a boundary-wearing role rewrites a pre-existing
-  # unbounded role's trust policy to trust itself, assumes it, and steps out.
-  statement {
-    sid       = "DenyRoleTakeover"
-    effect    = "Deny"
-    actions   = local.role_takeover_actions
-    resources = ["*"]
-  }
-
-  statement {
-    sid       = "DenyTamperingWithCIControlPlane"
-    effect    = "Deny"
-    actions   = local.iam_mutating_actions
-    resources = local.ci_control_plane_arns
   }
 }
 

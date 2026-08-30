@@ -144,14 +144,24 @@ variable "cost_alert_emails" {
   default     = ["aws-root@marcusdunn.ca", "marcus.s.dunn@gmail.com"]
 }
 
-variable "bedrock_allowed_model_families" {
+variable "bedrock_allowed_models" {
   description = <<-EOT
-    Claude model families the application may invoke, as ARN fragments.
+    Model ID patterns the application may invoke.
 
     There is no IAM condition key for token count, so model choice is the only
-    cost lever IAM offers. Opus costs several times Sonnet per token; omitting
-    it caps the per-document worst case. Add a family here deliberately.
+    cost lever IAM offers, and this list is where it is pulled. Generalised from
+    an Anthropic-only shape when Nova was chosen — Nova Lite is roughly a
+    twentieth of Sonnet's token price and, uniquely, has a genuine in-region
+    (ca.) inference profile rather than routing globally.
+
+    Opus is deliberately absent: several times Sonnet's price per token, and
+    nothing here needs it.
   EOT
   type        = list(string)
-  default     = ["sonnet", "haiku"]
+  default = [
+    "amazon.nova-lite-*",
+    "amazon.nova-2-lite-*",
+    "anthropic.claude-sonnet-*",
+    "anthropic.claude-haiku-*",
+  ]
 }
