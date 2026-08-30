@@ -47,7 +47,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
 use trainer_core::error::{aws, Error, Result};
-use trainer_core::model::Question;
+use trainer_core::model::{Question, QuestionBody};
 use trainer_core::numeric::NumericAnswer;
 use trainer_core::tags::{
     self, Choice, QuestionFormat, Skill, Topic, MAX_TOPICS_PER_DOC, TOPIC_MAX_LEN, TOPIC_MIN_LEN,
@@ -560,8 +560,10 @@ pub async fn generate(client: &Client, req: Request<'_>) -> Result<Generated> {
 /// regeneration reproduces the same quiz and a bug in any of them is
 /// reproducible:
 ///
-/// 1. Each question gets its `format` and, for numeric ones, its skill. Neither
-///    was asked of the model — see the note on `NUMERIC_SKILL`.
+/// 1. Each question becomes the [`QuestionBody`] variant its array implies, and
+///    numeric ones get their skill. Neither the variant nor the skill was asked
+///    of the model — see the note on `NUMERIC_SKILL`. The variant *is* the
+///    format; there is no separate field to fill in.
 /// 2. Multiple-choice options are shuffled. See [`shuffle_options`].
 /// 3. The ten are shuffled together. Without this the three numeric questions
 ///    are always the last three, and a reader learns "the typing starts at
@@ -573,27 +575,26 @@ fn assemble(quiz: GeneratedQuiz, seed: &str) -> Vec<Question> {
         .into_iter()
         .map(|q| Question {
             id: q.id,
-            format: QuestionFormat::MultipleChoice,
             skill: q.skill,
             prompt: q.prompt,
-            options: q.options,
-            answer: Some(q.answer),
-            numeric: None,
             explanation: q.explanation,
+            body: QuestionBody::MultipleChoice {
+                options: q.options,
+                answer: q.answer,
+            },
         })
         .chain(quiz.numeric_questions.into_iter().map(|q| Question {
             id: q.id,
-            format: QuestionFormat::Numeric,
             skill: NUMERIC_SKILL,
             prompt: q.prompt,
-            options: Vec::new(),
-            answer: None,
-            numeric: Some(NumericAnswer {
-                value: q.value,
-                tolerance: q.tolerance,
-                unit: q.unit,
-            }),
             explanation: q.explanation,
+            body: QuestionBody::Numeric {
+                numeric: NumericAnswer {
+                    value: q.value,
+                    tolerance: q.tolerance,
+                    unit: q.unit,
+                },
+            },
         }))
         .collect();
 
@@ -832,11 +833,13 @@ fn shuffle_options(questions: &mut [Question], seed: &str) {
     let mut state = fnv1a(seed);
 
     for q in questions.iter_mut() {
-        let Some(answer) = q.answer else {
+        // The numeric variant is skipped structurally rather than by a check on
+        // a nullable field — there is no letter here to move.
+        let QuestionBody::MultipleChoice { options, answer } = &mut q.body else {
             continue;
         };
 
-        let mut order: Vec<usize> = (0..q.options.len()).collect();
+        let mut order: Vec<usize> = (0..options.len()).collect();
 
         // Fisher-Yates, which is uniform. Repeatedly swapping random pairs is
         // the version that looks equivalent and is not.
@@ -846,7 +849,7 @@ fn shuffle_options(questions: &mut [Question], seed: &str) {
         }
 
         let was_correct = answer.index();
-        q.options = order.iter().map(|&i| q.options[i].clone()).collect();
+        *options = order.iter().map(|&i| options[i].clone()).collect();
 
         // `order` is a permutation of every index, so the old correct index is
         // in it exactly once. Handled rather than unwrapped because a panic
@@ -858,7 +861,7 @@ fn shuffle_options(questions: &mut [Question], seed: &str) {
             .and_then(|pos| Choice::ALL.get(pos).copied());
 
         if let Some(choice) = now_correct {
-            q.answer = Some(choice);
+            *answer = choice;
         }
     }
 }
@@ -1011,13 +1014,21 @@ mod tests {
         assert_eq!(
             questions
                 .iter()
-                .filter(|q| q.format == QuestionFormat::Numeric)
+                .filter(|q| q.format() == QuestionFormat::Numeric)
                 .count(),
             NUMERIC_QUESTIONS_PER_DOC
         );
-        // Every assembled question must be gradeable. `body()` returning `None`
-        // is the one failure the API cannot recover from at submit time.
-        assert!(questions.iter().all(|q| q.body().is_some()));
+        // Every multiple-choice question keeps a letter and every numeric one
+        // keeps a figure. Guaranteed by the enum rather than checked, so this
+        // asserts the assembly put things in the right variant at all.
+        assert_eq!(
+            questions.iter().filter(|q| q.answer().is_some()).count(),
+            CHOICE_QUESTIONS_PER_DOC
+        );
+        assert_eq!(
+            questions.iter().filter(|q| q.numeric().is_some()).count(),
+            NUMERIC_QUESTIONS_PER_DOC
+        );
     }
 
     #[test]
@@ -1157,13 +1168,15 @@ mod tests {
 
         for (id, expected) in before {
             let q = questions.iter().find(|q| q.id == id).expect("survives");
-            let answer = q.answer.expect("multiple choice keeps its letter");
+            let QuestionBody::MultipleChoice { options, answer } = &q.body else {
+                panic!("a choice question came back as something else");
+            };
             assert_eq!(
-                q.options[answer.index()],
+                options[answer.index()],
                 expected,
                 "the answer key must still point at the same text"
             );
-            assert_eq!(q.options.len(), OPTIONS_PER_QUESTION, "nothing lost");
+            assert_eq!(options.len(), OPTIONS_PER_QUESTION, "nothing lost");
         }
     }
 
@@ -1176,7 +1189,7 @@ mod tests {
         assert!(
             questions
                 .iter()
-                .any(|q| q.answer.is_some_and(|a| a != Choice::A)),
+                .any(|q| q.answer().is_some_and(|a| a != Choice::A)),
             "shuffle left every answer at 'a'"
         );
     }
@@ -1188,7 +1201,7 @@ mod tests {
         let questions = check(good()).expect("validates");
         let tail = &questions[QUESTIONS_PER_DOC - NUMERIC_QUESTIONS_PER_DOC..];
         assert!(
-            !tail.iter().all(|q| q.format == QuestionFormat::Numeric),
+            !tail.iter().all(|q| q.format() == QuestionFormat::Numeric),
             "the numeric questions are still bunched at the end"
         );
     }
@@ -1200,7 +1213,7 @@ mod tests {
 
         let fingerprint = |qs: &[Question]| {
             qs.iter()
-                .map(|q| (q.id.clone(), q.answer, q.format))
+                .map(|q| (q.id.clone(), q.answer(), q.format()))
                 .collect::<Vec<_>>()
         };
         assert_eq!(fingerprint(&first), fingerprint(&second));

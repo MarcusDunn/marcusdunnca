@@ -33,79 +33,98 @@ pub struct QuestionOption {
 ///
 /// This type must never be serialized onto a response body. See
 /// [`PublicQuestion`].
-///
-/// # Why this is one flat struct rather than an enum
-///
-/// There are two kinds of question and they share no answer key, which is
-/// exactly the shape a Rust enum is for. It is stored flat anyway, with the
-/// key fields optional, for one reason: these rows go through `serde_dynamo`,
-/// and every enum representation that would express the invariant properly —
-/// `#[serde(tag)]`, `#[serde(untagged)]`, `#[serde(flatten)]` — either breaks
-/// rows written before the second format existed (those carry no `format` at
-/// all, so there is no tag to dispatch on) or leans on serde's content
-/// buffering, which is where `serde_dynamo`'s sharp edges live.
-///
-/// The invariant is not abandoned, it is moved: [`Question::body`] is the only
-/// way anything reads an answer key, and it returns `None` for a row whose
-/// `format` and payload disagree. Grading calls it and refuses to score a
-/// document it cannot grade, rather than marking the question wrong — a
-/// question nobody can answer scoring zero is a confidently false statement
-/// about the reader.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Question {
     pub id: String,
-    /// Defaulted, because the model is still not asked for it.
-    ///
-    /// It has two legal values now, but choosing between them was never a
-    /// judgement call: the generator requests multiple-choice and numeric
-    /// questions in two separate arrays, so the handler already knows which is
-    /// which and fills this in. Asking would only reintroduce the failure that
-    /// removed the field in the first place — Sonnet answering
-    /// `"format": "definitional"`, putting a skill in the format slot, and
-    /// costing ten good questions.
-    ///
-    /// The default is `multiple_choice` because every row written before
-    /// `numeric` existed was one. See [`QuestionFormat`]'s `Default` impl.
-    #[serde(default)]
-    pub format: QuestionFormat,
     /// Singular. One question tests one skill: the history view builds a
     /// skill × topic matrix, and a question belonging to three skills would
     /// either be counted three times or need a weighting rule nobody has
     /// specified.
     pub skill: Skill,
     pub prompt: String,
-    /// Exactly four on a multiple-choice question, validated at generation time
-    /// so [`Choice::index`] is total. Empty on a numeric one.
-    #[serde(default)]
-    pub options: Vec<String>,
-    /// The keyed letter. `None` on a numeric question, which has no letters.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub answer: Option<Choice>,
-    /// The keyed figure and the precision it demands. `None` on a
-    /// multiple-choice question.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub numeric: Option<NumericAnswer>,
     pub explanation: String,
+    /// The parts that differ by format, including the key.
+    ///
+    /// Flattened, so the stored item is `{id, skill, prompt, explanation,
+    /// options, answer}` or `{…, numeric}` — one level, exactly as before this
+    /// was an enum. That is what lets rows written under the old shape keep
+    /// reading without a migration.
+    #[serde(flatten)]
+    pub body: QuestionBody,
 }
 
 /// The answer key, in the shape its format actually has.
 ///
-/// Borrowed rather than owned because it is produced per submission, per
-/// question, and copying four option strings to compare one letter is work for
-/// nothing.
-#[derive(Debug)]
-pub enum QuestionBody<'a> {
+/// # Why this is an enum, and why it is untagged
+///
+/// The two kinds of question share no answer key, so every alternative shape —
+/// a flat struct with optional fields, a `format` field plus a payload — makes
+/// "numeric question, no figure" and "multiple choice, no letter" representable
+/// states that something has to check for. This makes them unrepresentable
+/// instead, which is the difference between a rule and a habit.
+///
+/// **There is deliberately no `format` field.** A stored discriminant is a
+/// second statement of something the payload already says, and two statements
+/// of one fact can disagree. [`QuestionBody::format`] derives it. This also
+/// closes, permanently, the failure that removed `format` from the generator's
+/// schema in the first place: Sonnet answering `"format": "definitional"` and
+/// costing ten good questions. There is no longer a field to put a skill in.
+///
+/// `untagged` rather than `tag = "format"` for one reason, and it is about the
+/// rows already in the table: questions written before the numeric format
+/// existed carry no `format` key at all, so there is no tag to dispatch on and
+/// an internally-tagged enum would fail on every one of them. Untagged
+/// dispatches on the shape, which those rows have. A stray `format` key left
+/// over from an even older row is ignored rather than believed — which is the
+/// right way round.
+///
+/// Variant order matters and is not arbitrary: `MultipleChoice` requires both
+/// `options` and `answer`, so a numeric row cannot satisfy it, and a
+/// multiple-choice row cannot satisfy `Numeric` because it has no `numeric`
+/// key. Neither is a prefix of the other, so the ordering is a tie-break that
+/// never fires — stated here because untagged enums are exactly where that
+/// stops being true when someone adds a third variant.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum QuestionBody {
     MultipleChoice {
-        options: &'a [String],
+        /// Exactly four, validated at generation time so [`Choice::index`]
+        /// indexes something.
+        options: Vec<String>,
         answer: Choice,
     },
-    Numeric(&'a NumericAnswer),
+    Numeric {
+        numeric: NumericAnswer,
+    },
+}
+
+impl QuestionBody {
+    /// The format, derived rather than stored.
+    ///
+    /// Still a [`QuestionFormat`] because the *wire* and the *attempt record*
+    /// both need one: the browser discriminates on it, and an attempt stores
+    /// what the question was at the time it was answered. What has gone away is
+    /// a copy of it on the question itself.
+    pub const fn format(&self) -> QuestionFormat {
+        match self {
+            QuestionBody::MultipleChoice { .. } => QuestionFormat::MultipleChoice,
+            QuestionBody::Numeric { .. } => QuestionFormat::Numeric,
+        }
+    }
 }
 
 impl Question {
+    pub const fn format(&self) -> QuestionFormat {
+        self.body.format()
+    }
+
     /// Pair each option with its letter. Empty for a numeric question.
     pub fn options(&self) -> Vec<QuestionOption> {
-        self.options
+        let QuestionBody::MultipleChoice { options, .. } = &self.body else {
+            return Vec::new();
+        };
+
+        options
             .iter()
             .enumerate()
             .filter_map(|(i, text)| {
@@ -122,29 +141,24 @@ impl Question {
             .collect()
     }
 
-    /// The answer key, or `None` if this row's `format` and payload disagree.
+    /// The keyed figure, if this is a numeric question.
     ///
-    /// **This is the single place the flat storage shape is turned back into
-    /// the sum type it really is**, and the single place a malformed row is
-    /// detectable. Generation validates that it never writes one; this exists
-    /// because "generation validates it" is a statement about code that can
-    /// change, and the cost of being wrong is a silently unscoreable quiz.
-    pub fn body(&self) -> Option<QuestionBody<'_>> {
-        match self.format {
-            QuestionFormat::MultipleChoice => {
-                let answer = self.answer?;
-                // A keyed letter that indexes past the options is the same
-                // corruption as a missing one, and `Choice::index` is only
-                // total because this is checked.
-                if answer.index() >= self.options.len() {
-                    return None;
-                }
-                Some(QuestionBody::MultipleChoice {
-                    options: &self.options,
-                    answer,
-                })
-            }
-            QuestionFormat::Numeric => self.numeric.as_ref().map(QuestionBody::Numeric),
+    /// A named accessor rather than a `match` at each call site, because there
+    /// are three of them and two are on paths where reaching for the field
+    /// directly is how `value` would one day end up on the wire. See
+    /// [`PublicQuestion::new`].
+    pub const fn numeric(&self) -> Option<&NumericAnswer> {
+        match &self.body {
+            QuestionBody::Numeric { numeric } => Some(numeric),
+            QuestionBody::MultipleChoice { .. } => None,
+        }
+    }
+
+    /// The keyed letter, if this is a multiple-choice question.
+    pub const fn answer(&self) -> Option<Choice> {
+        match &self.body {
+            QuestionBody::MultipleChoice { answer, .. } => Some(*answer),
+            QuestionBody::Numeric { .. } => None,
         }
     }
 }
@@ -206,18 +220,15 @@ pub struct PublicQuestion {
 
 impl PublicQuestion {
     pub fn new(q: &Question, topics: &[Topic]) -> Self {
-        // Read through `body()` rather than off the struct, so a numeric
-        // question can only ever contribute the two fields that are safe to
-        // send. Reaching for `q.numeric` directly here is how `value` would
-        // one day arrive on the wire.
-        let numeric = match q.body() {
-            Some(QuestionBody::Numeric(answer)) => Some(answer),
-            _ => None,
-        };
+        // Named fields off the key, one at a time. Never `..numeric` or a
+        // struct update from `NumericAnswer` — the field this must not copy
+        // sits right next to the two it must, and a spread would take all
+        // three.
+        let numeric = q.numeric();
 
         Self {
             id: q.id.clone(),
-            format: q.format,
+            format: q.format(),
             skill: q.skill,
             topics: topics.to_vec(),
             prompt: q.prompt.clone(),
@@ -493,62 +504,139 @@ pub struct ChallengeItem {
 mod tests {
     use super::*;
 
-    /// The model is no longer asked for `format`, so every generated question
-    /// arrives without one. If this default ever stops applying, ten good
-    /// questions get discarded at deserialization — which is exactly what
-    /// happened when the model *was* asked, and answered `"definitional"`.
+    /// Rows written when `format` was a stored field — some carrying it, some
+    /// not, depending on which side of PR #39 they were generated on.
+    ///
+    /// **This is the whole compatibility claim of the untagged enum**, and it is
+    /// the reason the enum is untagged rather than tagged on `format`: a tagged
+    /// enum would fail outright on the first of these, which is the shape every
+    /// question in the table currently has.
     #[test]
-    fn a_question_without_a_format_defaults_to_multiple_choice() {
-        let q: Question = serde_json::from_str(
+    fn rows_written_before_the_body_was_an_enum_still_read() {
+        let without: Question = serde_json::from_str(
             r#"{"id":"q1","skill":"causal","prompt":"why?",
                 "options":["a","b","c","d"],"answer":"a","explanation":"page 1"}"#,
         )
-        .expect("format is optional");
+        .expect("a row with no format key");
+        assert_eq!(without.format(), QuestionFormat::MultipleChoice);
+        assert_eq!(without.answer(), Some(Choice::A));
 
-        assert_eq!(q.format, QuestionFormat::MultipleChoice);
-    }
-
-    /// Stored rows written before the field was defaulted still carry it, and
-    /// must keep round-tripping.
-    #[test]
-    fn an_explicit_format_still_deserializes() {
-        let q: Question = serde_json::from_str(
+        let with: Question = serde_json::from_str(
             r#"{"id":"q1","format":"multiple_choice","skill":"causal","prompt":"why?",
                 "options":["a","b","c","d"],"answer":"a","explanation":"page 1"}"#,
         )
-        .expect("explicit format still accepted");
+        .expect("a row that still carries the old discriminant");
+        assert_eq!(with.format(), QuestionFormat::MultipleChoice);
 
-        assert_eq!(q.format, QuestionFormat::MultipleChoice);
+        // A leftover discriminant is *ignored*, not believed. It is no longer
+        // stored, so the payload is the only statement of what this is — which
+        // is the point of removing the field. A row that says `numeric` while
+        // carrying four options is still four options.
+        let lying: Question = serde_json::from_str(
+            r#"{"id":"q1","format":"numeric","skill":"causal","prompt":"why?",
+                "options":["a","b","c","d"],"answer":"a","explanation":"page 1"}"#,
+        )
+        .expect("the stray key does not fail the row");
+        assert_eq!(lying.format(), QuestionFormat::MultipleChoice);
     }
 
-    /// A wrong value must still be refused rather than silently defaulted. The
-    /// defaulting is for an *absent* field only — if serde ever started
-    /// swallowing bad values, the closed vocabulary would be decorative.
+    /// The state the enum exists to make unrepresentable.
+    ///
+    /// A numeric question with no figure, or a multiple-choice one with no
+    /// letter, used to be a row that deserialized perfectly and could not be
+    /// graded. Now it does not deserialize at all — there is no variant it fits.
     #[test]
-    fn a_bogus_format_is_still_rejected() {
-        let bogus: Result<Question, _> = serde_json::from_str(
-            r#"{"id":"q1","format":"definitional","skill":"causal","prompt":"why?",
-                "options":["a","b","c","d"],"answer":"a","explanation":"page 1"}"#,
-        );
+    fn a_question_with_no_usable_key_does_not_deserialize() {
+        for orphan in [
+            // Says nothing about how it is answered.
+            r#"{"id":"q1","skill":"causal","prompt":"why?","explanation":"page 1"}"#,
+            // Options with no key.
+            r#"{"id":"q1","skill":"causal","prompt":"why?",
+                "options":["a","b","c","d"],"explanation":"page 1"}"#,
+            // A key with no options.
+            r#"{"id":"q1","skill":"causal","prompt":"why?",
+                "answer":"a","explanation":"page 1"}"#,
+            // A figure that is not a figure.
+            r#"{"id":"q1","skill":"figure_recall","prompt":"how much?",
+                "numeric":{"tolerance":1.0},"explanation":"table 1"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<Question>(orphan).is_err(),
+                "an ungradeable question deserialized: {orphan}"
+            );
+        }
+    }
+
+    /// The stored shape must stay one level deep, or every existing row is
+    /// orphaned and the compatibility tests above are checking a shape nothing
+    /// writes. This is what `#[serde(flatten)]` is buying.
+    #[test]
+    fn the_body_is_flattened_into_the_row_rather_than_nested() {
+        let json = serde_json::to_string(&numeric_question()).expect("serializes");
+        assert!(json.contains(r#""numeric":{"#), "{json}");
+        assert!(!json.contains(r#""body":"#), "{json}");
         assert!(
-            bogus.is_err(),
-            "an unknown format must not default silently"
+            !json.contains(r#""format":"#),
+            "the discriminant is derived, not stored: {json}"
         );
+    }
+
+    /// **Questions are stored in DynamoDB, not in JSON, and the two are not the
+    /// same test.**
+    ///
+    /// `#[serde(flatten)]` and `#[serde(untagged)]` both work by buffering the
+    /// input through serde's intermediate `Content` representation rather than
+    /// reading it field by field. That is exactly the path where `serde_dynamo`
+    /// has historically been awkward, because a DynamoDB number arrives as `N`
+    /// with a string payload and has to survive the round trip as an `f64`. The
+    /// combination is used here for the tolerance and the figure, so it is
+    /// checked here rather than assumed.
+    ///
+    /// If this fails, every question in the table becomes unreadable and the
+    /// symptom is `GET /docs/:id/quiz` returning a 500 with a serde message.
+    #[test]
+    fn questions_round_trip_through_dynamodb_attribute_values() {
+        use aws_sdk_dynamodb::types::AttributeValue;
+
+        let mc: Question = serde_json::from_str(
+            r#"{"id":"c1","skill":"causal","prompt":"why?",
+                "options":["w","x","y","z"],"answer":"c","explanation":"page 1"}"#,
+        )
+        .expect("parses");
+
+        for original in [mc, numeric_question()] {
+            let stored: AttributeValue =
+                serde_dynamo::to_attribute_value(&original).expect("serializes to DynamoDB");
+            let back: Question =
+                serde_dynamo::from_attribute_value(stored).expect("reads back from DynamoDB");
+
+            assert_eq!(back.id, original.id);
+            assert_eq!(back.format(), original.format());
+            assert_eq!(back.answer(), original.answer());
+            assert_eq!(
+                back.numeric()
+                    .map(|n| (n.value, n.tolerance, n.unit.clone())),
+                original
+                    .numeric()
+                    .map(|n| (n.value, n.tolerance, n.unit.clone())),
+                "the figure and its tolerance survived the number encoding"
+            );
+            assert_eq!(back.options().len(), original.options().len());
+        }
     }
 
     fn numeric_question() -> Question {
         Question {
             id: "n1".into(),
-            format: QuestionFormat::Numeric,
             skill: Skill::FigureRecall,
             prompt: "What was the 2026 forecast change in Ontario home prices?".into(),
-            options: Vec::new(),
-            answer: None,
-            numeric: Some(NumericAnswer {
-                value: -4.0,
-                tolerance: 1.0,
-                unit: "%".into(),
-            }),
+            body: QuestionBody::Numeric {
+                numeric: NumericAnswer {
+                    value: -4.0,
+                    tolerance: 1.0,
+                    unit: "%".into(),
+                },
+            },
             explanation: "Table 1, Ontario row.".into(),
         }
     }
@@ -589,52 +677,24 @@ mod tests {
         assert!(!json.contains("unit"));
     }
 
+    /// The format is derived from the payload and cannot disagree with it.
     #[test]
-    fn body_returns_the_key_in_the_shape_the_format_promises() {
+    fn the_format_follows_the_shape_of_the_key() {
         let mc: Question = serde_json::from_str(
             r#"{"id":"q1","skill":"causal","prompt":"why?",
                 "options":["w","x","y","z"],"answer":"b","explanation":"page 1"}"#,
         )
         .expect("parses");
 
-        assert!(matches!(
-            mc.body(),
-            Some(QuestionBody::MultipleChoice {
-                answer: Choice::B,
-                ..
-            })
-        ));
-        assert!(matches!(
-            numeric_question().body(),
-            Some(QuestionBody::Numeric(_))
-        ));
-    }
+        assert_eq!(mc.format(), QuestionFormat::MultipleChoice);
+        assert_eq!(mc.answer(), Some(Choice::B));
+        assert_eq!(mc.numeric(), None);
 
-    /// The reason `body` returns an `Option` at all. Each of these is a row
-    /// that deserializes perfectly and cannot be graded, and each must be
-    /// detectable in one place rather than producing a question that scores
-    /// zero however it is answered.
-    #[test]
-    fn a_row_whose_format_and_payload_disagree_has_no_body() {
-        let mut orphan = numeric_question();
-        orphan.numeric = None;
-        assert!(orphan.body().is_none(), "numeric with no figure");
-
-        let mut mislabelled = numeric_question();
-        mislabelled.format = QuestionFormat::MultipleChoice;
-        assert!(mislabelled.body().is_none(), "no options and no letter");
-
-        let mut short: Question = serde_json::from_str(
-            r#"{"id":"q1","skill":"causal","prompt":"why?",
-                "options":["w","x"],"answer":"d","explanation":"page 1"}"#,
-        )
-        .expect("parses");
-        assert!(
-            short.body().is_none(),
-            "the letter indexes past the options"
-        );
-        short.answer = None;
-        assert!(short.body().is_none(), "multiple choice with no letter");
+        let numeric = numeric_question();
+        assert_eq!(numeric.format(), QuestionFormat::Numeric);
+        assert_eq!(numeric.answer(), None);
+        assert_eq!(numeric.numeric().map(|n| n.value), Some(-4.0));
+        assert!(numeric.options().is_empty());
     }
 
     /// Legacy rows predate both new fields and must keep reading.

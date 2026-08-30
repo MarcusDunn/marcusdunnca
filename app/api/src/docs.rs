@@ -560,21 +560,15 @@ fn grade_one(
     topics: &[Topic],
     submitted: Option<&SubmittedAnswer>,
 ) -> Result<AttemptResponse> {
-    // A row whose format and payload disagree cannot be graded, and marking it
-    // wrong would be a confidently false statement about the reader. Failing
-    // the submission points at the Retry button, which regenerates.
-    let body = question.body().ok_or_else(|| {
-        tracing::error!(qid = %question.id, "stored question has no usable answer key");
-        Error::Invalid(format!(
-            "question {} was stored without a usable answer; regenerate this document",
-            question.id
-        ))
-    })?;
-
     let confidence = submitted.and_then(|s| s.confidence);
 
-    let (answered, correct, answer, answer_text) = match body {
+    // No fallible unwrapping before the match, and none needed: `QuestionBody`
+    // is an enum, so "a question with no usable answer key" is not a state a
+    // stored row can be in. It used to be, and this function had to detect it
+    // and fail the whole submission.
+    let (answered, correct, answer, answer_text) = match &question.body {
         QuestionBody::MultipleChoice { answer: key, .. } => {
+            let key = *key;
             if let Some(text) = submitted.and_then(|s| s.value.as_ref()) {
                 return Err(Error::Invalid(format!(
                     "question {} is multiple choice; {text:?} is not an option letter",
@@ -584,7 +578,7 @@ fn grade_one(
             let chosen = submitted.and_then(|s| s.option_id);
             (chosen.is_some(), chosen == Some(key), chosen, None)
         }
-        QuestionBody::Numeric(spec) => {
+        QuestionBody::Numeric { numeric: spec } => {
             if submitted.and_then(|s| s.option_id).is_some() {
                 return Err(Error::Invalid(format!(
                     "question {} is answered by typing a figure, not by choosing a letter",
@@ -621,7 +615,7 @@ fn grade_one(
 
     Ok(AttemptResponse {
         qid: question.id.clone(),
-        format: question.format,
+        format: question.format(),
         skill: question.skill,
         // Snapshots, all of them. Re-tagging a document later must not rewrite
         // what past attempts mean.
@@ -785,27 +779,21 @@ fn grade_all(
         .iter()
         .map(|q| {
             let response = recorded.get(q.id.as_str());
-            // The key is revealed here and only here, so it is read through
-            // `body()` — the same accessor the quiz payload uses to decide what
-            // it may *not* say. One source of truth for what a question's key
-            // is, whichever direction it is travelling.
-            let numeric: Option<&NumericAnswer> = match q.body() {
-                Some(QuestionBody::Numeric(answer)) => Some(answer),
-                _ => None,
-            };
+            // This is the one response type that may carry the key, so it reads
+            // it through the same accessors the quiz payload uses to decide
+            // what it may *not* say. One source of truth for what a question's
+            // key is, whichever direction it is travelling.
+            let numeric: Option<&NumericAnswer> = q.numeric();
 
             GradedQuestionDto {
                 question_id: q.id.clone(),
-                format: q.format,
+                format: q.format(),
                 skill: q.skill,
                 topics: topics.to_vec(),
                 prompt: q.prompt.clone(),
                 options: q.options(),
                 selected_option_id: response.and_then(|r| r.answer),
-                correct_option_id: match q.body() {
-                    Some(QuestionBody::MultipleChoice { answer, .. }) => Some(answer),
-                    _ => None,
-                },
+                correct_option_id: q.answer(),
                 selected_value: response.and_then(|r| r.answer_text.clone()),
                 correct_value: numeric.map(|n| n.value),
                 tolerance: numeric.map(|n| n.tolerance),
@@ -828,30 +816,29 @@ mod tests {
     fn sample_question() -> Question {
         Question {
             id: "q3".into(),
-            format: QuestionFormat::MultipleChoice,
             skill: Skill::Causal,
             prompt: "What was the deficit?".into(),
-            options: vec!["one".into(), "two".into(), "three".into(), "four".into()],
-            answer: Some(Choice::B),
-            numeric: None,
             explanation: "Table 2, line 4.".into(),
+            body: QuestionBody::MultipleChoice {
+                options: vec!["one".into(), "two".into(), "three".into(), "four".into()],
+                answer: Choice::B,
+            },
         }
     }
 
     fn sample_numeric() -> Question {
         Question {
             id: "n1".into(),
-            format: QuestionFormat::Numeric,
             skill: Skill::FigureRecall,
             prompt: "What was the forecast change in Ontario home prices?".into(),
-            options: Vec::new(),
-            answer: None,
-            numeric: Some(NumericAnswer {
-                value: -4.0,
-                tolerance: 1.0,
-                unit: "%".into(),
-            }),
             explanation: "Table 1, Ontario row.".into(),
+            body: QuestionBody::Numeric {
+                numeric: NumericAnswer {
+                    value: -4.0,
+                    tolerance: 1.0,
+                    unit: "%".into(),
+                },
+            },
         }
     }
 
@@ -1075,16 +1062,30 @@ mod tests {
         ));
     }
 
-    /// A stored row that cannot be graded fails the submission instead of
-    /// scoring zero. Zero would be a confidently false statement about the
-    /// reader; the error points at Retry, which regenerates the document.
+    /// Grading a numeric question does not consult the letter path and vice
+    /// versa, which is now guaranteed by the enum rather than by a check.
+    ///
+    /// There used to be a test here for a stored question with no usable answer
+    /// key — `grade_one` detected it and failed the whole submission. That state
+    /// is no longer constructible: `QuestionBody` has no variant for it, and a
+    /// row that would produce one does not deserialize. See
+    /// `a_question_with_no_usable_key_does_not_deserialize` in `trainer_core`.
     #[test]
-    fn an_ungradeable_question_fails_the_submission() {
-        let mut broken = sample_numeric();
-        broken.numeric = None;
-        assert!(matches!(
-            grade_one(&broken, &[], None),
-            Err(Error::Invalid(_))
-        ));
+    fn each_format_is_graded_only_by_its_own_key() {
+        let numeric = grade(
+            &sample_numeric(),
+            Some(&answered("n1", None, Some("-4"), None)),
+        );
+        assert!(numeric.correct);
+        assert_eq!(numeric.answer, None, "a typed figure records no letter");
+        assert_eq!(numeric.format, QuestionFormat::Numeric);
+
+        let choice = grade(
+            &sample_question(),
+            Some(&answered("q3", Some(Choice::B), None, None)),
+        );
+        assert!(choice.correct);
+        assert_eq!(choice.answer_text, None, "a letter records no typed text");
+        assert_eq!(choice.format, QuestionFormat::MultipleChoice);
     }
 }
