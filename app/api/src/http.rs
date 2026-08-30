@@ -140,7 +140,7 @@ pub fn preflight(origin: &str) -> Response<Body> {
         // get as far as the code above.
         .header(
             "access-control-allow-headers",
-            "authorization, content-type, x-registration-token",
+            "authorization, content-type, x-registration-token, x-session-token",
         )
         .header("access-control-max-age", "600")
         .body(Body::Empty)

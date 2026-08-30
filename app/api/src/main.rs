@@ -166,7 +166,7 @@ async fn dispatch(
 
     let header = req
         .headers()
-        .get(lambda_http::http::header::AUTHORIZATION)
+        .get(auth::SESSION_HEADER)
         .and_then(|v| v.to_str().ok());
     auth::require_session(state, header)?;
 
