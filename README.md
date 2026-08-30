@@ -352,10 +352,18 @@ Three layers, because Bedrock and CloudFront are metered and the region lock
 does not bound either:
 
 1. **Model scoping.** There is no IAM condition key for token count, so *which
-   model* is the only lever IAM offers. `bedrock:InvokeModel` is scoped to the
-   Sonnet and Haiku families; Opus is `implicitDeny`, for both the apply role
-   and any boundary-capped runtime role. Widen `bedrock_allowed_model_families`
-   deliberately, knowing the price difference.
+   model* is the only lever IAM offers. `bedrock:InvokeModel` is scoped by
+   model-ID pattern (`bedrock_allowed_models`) to Nova Lite and the Claude
+   Sonnet/Haiku families. Opus is `implicitDeny` for both the apply role and any
+   boundary-capped runtime role.
+
+   The app uses `ca.amazon.nova-lite-v1:0` — roughly a twentieth of Sonnet's
+   token price and, uniquely among available models, a genuine **in-region**
+   inference profile. Every Claude profile in `ca-central-1` is `us.`- or
+   `global.`-prefixed and routes outside Canada. Verified that Nova Lite reads
+   PDFs via Converse document blocks; `inputModalities` does not list
+   `DOCUMENT` for *any* of these models, because that field describes
+   InvokeModel rather than Converse.
 2. **Alerting.** $10 budget at 80/100% actual and 100% forecast, plus a Cost
    Anomaly subscription at $1 that publishes immediately via SNS.
 3. **An automated circuit breaker.** At 90% of budget, AWS Budgets itself
