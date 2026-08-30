@@ -27,6 +27,7 @@ use std::collections::HashMap;
 use crate::error::{aws, Error, Result};
 use crate::keys;
 use crate::model::{Attempt, ChallengeItem, DocMeta, DocStatus, DocSummary, Question};
+use crate::review::ReviewItem;
 use crate::tags::Topic;
 
 type Item = HashMap<String, AttributeValue>;
@@ -656,6 +657,128 @@ impl Store {
     }
 
     // ---- auth challenges --------------------------------------------------
+
+    /// Every question's schedule, whether due or not.
+    ///
+    /// A `Query` on one partition rather than a `Scan`, which is the difference
+    /// between reading the review schedule and reading the whole table — and
+    /// the reason all the schedules share a partition key. Due-ness is decided
+    /// in the handler: it is a string comparison against now, and pushing it
+    /// into a `KeyConditionExpression` would need the due date in the sort key,
+    /// which would make every review a delete plus a put instead of an update.
+    ///
+    /// See `keys::REVIEW_PK` for the trigger that would change that trade.
+    pub async fn list_reviews(&self) -> Result<Vec<ReviewItem>> {
+        self.query_reviews(None).await
+    }
+
+    /// The schedules belonging to one document.
+    ///
+    /// Used by the submit path, which advances every question in an attempt at
+    /// once and must not read the whole schedule to do it.
+    pub async fn list_reviews_for_doc(&self, doc_id: &str) -> Result<Vec<ReviewItem>> {
+        self.query_reviews(Some(keys::review_sk_prefix(doc_id)))
+            .await
+    }
+
+    async fn query_reviews(&self, sk_prefix: Option<String>) -> Result<Vec<ReviewItem>> {
+        let mut reviews = Vec::new();
+        let mut start_key: Option<Item> = None;
+
+        loop {
+            let mut request = self
+                .client
+                .query()
+                .table_name(&self.table)
+                .expression_attribute_values(":pk", AttributeValue::S(keys::REVIEW_PK.to_string()))
+                .set_exclusive_start_key(start_key.clone());
+
+            request = match &sk_prefix {
+                Some(prefix) => request
+                    .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
+                    .expression_attribute_values(":prefix", AttributeValue::S(prefix.clone())),
+                None => request.key_condition_expression("pk = :pk"),
+            };
+
+            let out = request.send().await.map_err(aws)?;
+
+            for item in out.items() {
+                match serde_dynamo::from_item::<_, ReviewItem>(item.clone()) {
+                    Ok(r) => reviews.push(r),
+                    // Skipped rather than fatal, matching `list_attempts`. One
+                    // unreadable schedule row must not take down the queue —
+                    // the worst case is a question that stops coming back, and
+                    // the log says which.
+                    Err(e) => tracing::warn!(error = %e, "skipping unreadable review row"),
+                }
+            }
+
+            start_key = out.last_evaluated_key().cloned();
+            if start_key.is_none() {
+                break;
+            }
+        }
+
+        Ok(reviews)
+    }
+
+    /// Write a batch of schedules, creating or replacing.
+    ///
+    /// `BatchWriteItem` rather than a put per row: a ten-question attempt would
+    /// otherwise be ten round trips against a table provisioned at 5 WCU, on the
+    /// request the reader is waiting on to see their score.
+    ///
+    /// **Not transactional, and does not need to be.** A partial write leaves
+    /// some questions scheduled and some not; the un-scheduled ones are picked
+    /// up by the next attempt, and none of it can corrupt an attempt record,
+    /// which is written separately and first. `TransactWriteItems` would cost
+    /// double the capacity to protect against a failure whose consequence is
+    /// "that question comes back later than it should have".
+    pub async fn put_reviews(&self, reviews: &[ReviewItem]) -> Result<()> {
+        // DynamoDB's own limit. Ten questions a document means this is one
+        // chunk today; the chunking exists so that stops being load-bearing.
+        const MAX_BATCH: usize = 25;
+
+        for chunk in reviews.chunks(MAX_BATCH) {
+            let mut requests = Vec::with_capacity(chunk.len());
+            for review in chunk {
+                let item: Item =
+                    serde_dynamo::to_item(review).map_err(|e| Error::Aws(e.to_string()))?;
+                requests.push(
+                    aws_sdk_dynamodb::types::WriteRequest::builder()
+                        .put_request(
+                            aws_sdk_dynamodb::types::PutRequest::builder()
+                                .set_item(Some(item))
+                                .build()
+                                .map_err(|e| Error::Aws(e.to_string()))?,
+                        )
+                        .build(),
+                );
+            }
+
+            let out = self
+                .client
+                .batch_write_item()
+                .request_items(self.table.clone(), requests)
+                .send()
+                .await
+                .map_err(aws)?;
+
+            // Throttling returns the rejected writes rather than an error. Not
+            // retried here: the caller is a request the reader is waiting on,
+            // and a schedule that missed an update is corrected by the next
+            // review of that question. Logged because a persistent one means
+            // the table is under-provisioned, which nothing else would show.
+            let unprocessed = out
+                .unprocessed_items()
+                .map_or(0, |m| m.values().map(Vec::len).sum::<usize>());
+            if unprocessed > 0 {
+                tracing::warn!(unprocessed, "review schedule writes were throttled");
+            }
+        }
+
+        Ok(())
+    }
 
     pub async fn put_challenge(&self, challenge: &ChallengeItem) -> Result<()> {
         let item: Item = serde_dynamo::to_item(challenge).map_err(|e| Error::Aws(e.to_string()))?;

@@ -32,6 +32,36 @@ pub fn idempotency_sk(attempt_id: &str) -> String {
     format!("IDEMPOTENCY#{attempt_id}")
 }
 
+/// Partition holding the spaced-review schedule, one row per question.
+///
+/// **One partition for every document's questions, deliberately.** The review
+/// queue's only question is "what is due now", which spans documents — putting
+/// each document's schedule in its own partition would turn that into a scan.
+/// One `Query` here returns the whole schedule and the handler picks the due
+/// ones, which is the same trade the document list already makes and for the
+/// same reason: one reader, a few hundred rows, 5 RCU.
+///
+/// The trigger for changing it: if this grows past a few thousand rows the
+/// Query starts paginating for no benefit, and the fix is to move the due date
+/// into the sort key so the range itself selects. That is a migration, not a
+/// rewrite, and it is not worth doing early — a due date in the sort key means
+/// every review is a delete plus a put rather than an update.
+pub const REVIEW_PK: &str = "REVIEW";
+
+/// Sort key of one question's schedule.
+///
+/// Document first so `begins_with(doc_pk_fragment)` selects a single document's
+/// questions — which is what the submit path needs when it advances every
+/// question in an attempt at once.
+pub fn review_sk(doc_id: &str, qid: &str) -> String {
+    format!("{doc_id}#{qid}")
+}
+
+/// The `begins_with` prefix matching every review row for one document.
+pub fn review_sk_prefix(doc_id: &str) -> String {
+    format!("{doc_id}#")
+}
+
 /// All auth challenges share one partition. That is fine — they live 60
 /// seconds and there is one user, so this is not a hot partition, and putting
 /// them together means TTL sweeps touch one place.

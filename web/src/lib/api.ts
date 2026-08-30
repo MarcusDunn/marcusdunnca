@@ -10,8 +10,11 @@ import {
   DocumentUrl,
   History,
   Quiz,
+  ReviewQueue,
+  ReviewSubmitResult,
   type CreateDocumentRequest,
   type DocumentSummary,
+  type ReviewSubmitRequest,
   type SubmitQuizRequest,
 } from "./schemas";
 
@@ -178,6 +181,12 @@ export const api = {
     }),
 
   history: () => request("/history", History).then((r) => r.attempts),
+
+  reviewQueue: (signal?: AbortSignal) =>
+    request("/review", ReviewQueue, signal ? { signal } : {}),
+
+  submitReview: (body: ReviewSubmitRequest) =>
+    request("/review/submit", ReviewSubmitResult, { method: "POST", body }),
 };
 
 /**

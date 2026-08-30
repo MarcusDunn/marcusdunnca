@@ -11,13 +11,14 @@ import { DocumentsScreen } from "./routes/documents";
 import { HistoryScreen } from "./routes/history";
 import { LoginScreen } from "./routes/login";
 import { ReadScreen } from "./routes/read";
+import { ReviewScreen } from "./routes/review";
 import { NotFound, RootLayout } from "./routes/root";
 import { UploadScreen } from "./routes/upload";
 
 /*
  * Code-based routing, not file-based.
  *
- * Five routes and one guard fit in this file, which makes the auth boundary and
+ * A handful of routes and one guard fit in this file, which makes the auth boundary and
  * the redirect rules readable in one screen. File-based routing would buy
  * generated types we already get here, at the cost of a routeTree.gen.ts that has
  * to be regenerated, gitignored-or-committed, and kept in step with the build —
@@ -94,6 +95,12 @@ const uploadRoute = createRoute({
   component: UploadScreen,
 });
 
+const reviewRoute = createRoute({
+  getParentRoute: () => authRoute,
+  path: "/review",
+  component: ReviewScreen,
+});
+
 const historyRoute = createRoute({
   getParentRoute: () => authRoute,
   path: "/history",
@@ -102,7 +109,14 @@ const historyRoute = createRoute({
 
 const routeTree = rootRoute.addChildren([
   loginRoute,
-  authRoute.addChildren([indexRoute, documentsRoute, readRoute, uploadRoute, historyRoute]),
+  authRoute.addChildren([
+    indexRoute,
+    documentsRoute,
+    readRoute,
+    uploadRoute,
+    reviewRoute,
+    historyRoute,
+  ]),
 ]);
 
 export function createAppRouter(queryClient: QueryClient) {

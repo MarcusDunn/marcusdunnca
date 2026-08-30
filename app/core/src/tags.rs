@@ -96,7 +96,9 @@ pub const TOPIC_MAX_LEN: usize = 20;
 macro_rules! closed_vocab {
     (
         $(#[$meta:meta])*
-        $name:ident { $($variant:ident => $wire:literal),+ $(,)? }
+        $name:ident {
+            $( $(#[$variant_meta:meta])* $variant:ident => $wire:literal ),+ $(,)?
+        }
     ) => {
         $(#[$meta])*
         #[derive(
@@ -104,7 +106,7 @@ macro_rules! closed_vocab {
             serde::Serialize, serde::Deserialize,
         )]
         pub enum $name {
-            $( #[serde(rename = $wire)] $variant, )+
+            $( $(#[$variant_meta])* #[serde(rename = $wire)] $variant, )+
         }
 
         impl $name {
@@ -260,6 +262,78 @@ impl Confidence {
             Confidence::FairlySure => (50, 80),
             Confidence::Certain => (80, 100),
         }
+    }
+}
+
+closed_vocab! {
+    /// How long a question stays worth being asked again.
+    ///
+    /// # The problem this exists for
+    ///
+    /// A quarterly forecast read today is reviewed in three years. The question
+    /// is still *answerable* — what a report predicted in March 2026 is a fixed
+    /// historical fact — but drilling it has stopped being useful, and the
+    /// review queue fills with dead trivia that crowds out live material.
+    ///
+    /// Worse, and this is the part that matters: a figure rehearsed for years
+    /// without its date attached stops being remembered as "TD's 2026 forecast"
+    /// and starts being remembered as "the number". Spaced repetition is very
+    /// good at making things stick, which makes it very good at making a stale
+    /// figure stick. An app whose purpose is having accurate numbers to hand
+    /// must not be the reason you cite a three-year-old forecast as current.
+    ///
+    /// Two things guard against that and they are different. This one retires
+    /// the question. The other is that every prompt must name its source and
+    /// period — see the generator's schema — so that what is rehearsed is a
+    /// correctly-scoped historical claim rather than a free-floating number.
+    ///
+    /// # Why the model picks it
+    ///
+    /// Shelf life is a property of the claim, and the model has the document in
+    /// front of it. "We forecast 2.1% growth in 2027" and "the equalization
+    /// formula is set out in section 4" come out of the same PDF and age
+    /// completely differently, so it cannot be a property of the document, and
+    /// no rule over titles or dates would separate them.
+    Shelf {
+        /// Structural, definitional, or historical-by-construction. Never
+        /// retires: how a mechanism works does not stop being true.
+        Perennial => "perennial",
+        /// Policy, institutional arrangements, multi-year trends. Ages slowly.
+        Slow      => "slow",
+        /// Forecasts, current conditions, quarterly figures. The thing this
+        /// vocabulary exists for.
+        Dated     => "dated",
+    }
+}
+
+impl Shelf {
+    /// How long after the document was read this question keeps being
+    /// scheduled. `None` means never retire.
+    ///
+    /// These are deliberately generous. Retiring a question is not free — it
+    /// removes something you chose to learn — so the bar is "this is now
+    /// clearly historical", not "this is getting old". A `dated` question
+    /// surviving eighteen months has been through five or six repetitions,
+    /// which is most of the value it was ever going to give.
+    pub const fn horizon_days(&self) -> Option<i64> {
+        match self {
+            Shelf::Perennial => None,
+            Shelf::Slow => Some(5 * 365),
+            Shelf::Dated => Some(548),
+        }
+    }
+}
+
+/// What a question written before shelf life existed is assumed to be.
+///
+/// `Slow`, not `Dated`, and the asymmetry is the point: the two errors do not
+/// cost the same. Guessing `slow` for something genuinely dated costs a handful
+/// of reviews of a stale question. Guessing `dated` for something perennial
+/// silently deletes it from the queue at eighteen months, and nothing would
+/// ever tell you it had gone.
+impl Default for Shelf {
+    fn default() -> Self {
+        Self::Slow
     }
 }
 

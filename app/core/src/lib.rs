@@ -14,9 +14,12 @@
 pub mod clock;
 pub mod config;
 pub mod error;
+pub mod fsrs;
 pub mod keys;
 pub mod model;
 pub mod numeric;
+pub mod review;
+pub mod shuffle;
 pub mod store;
 pub mod tags;
 

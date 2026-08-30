@@ -68,6 +68,23 @@ pub fn unix_now() -> i64 {
     OffsetDateTime::now_utc().unix_timestamp()
 }
 
+/// Read one of these strings back, as Unix seconds.
+///
+/// The inverse of [`iso_at`], and the only way anything in this crate parses a
+/// timestamp. It exists because the review scheduler works in absolute time and
+/// its state is stored as these strings — so a stored `due_at` has to become a
+/// number again, once, in a known place.
+///
+/// `None` rather than a fallback, deliberately, unlike the formatting
+/// direction. A timestamp that will not parse is data this process did not
+/// write, and each caller wants a different answer to that: a review whose due
+/// date is unreadable should surface as due, not silently be treated as now.
+pub fn unix_from_iso8601(s: &str) -> Option<i64> {
+    OffsetDateTime::parse(s, &Rfc3339)
+        .ok()
+        .map(|t| t.unix_timestamp())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
