@@ -146,17 +146,17 @@ macro_rules! closed_vocab {
 closed_vocab! {
     /// How a question is presented and graded.
     ///
-    /// **This is a label, not a discriminant.** It is not stored on a question:
-    /// `crate::model::QuestionBody` is an enum, and the format is derived from
-    /// which variant a question is. Storing it as well would be a second
-    /// statement of one fact, and two statements of one fact can disagree —
-    /// which is precisely how `"format": "definitional"` once cost a whole
-    /// generation.
+    /// **On a question this is the enum tag, not a field anyone sets.**
+    /// `crate::model::QuestionBody` is `#[serde(tag = "format")]`, so the value
+    /// stored on a question is generated from the variant and checked against
+    /// the payload on the way back in. Nothing can write one that disagrees
+    /// with the key beside it — which is precisely how `"format":
+    /// "definitional"` once cost a whole generation.
     ///
-    /// Where it *is* stored is on an attempt response, and that is a different
-    /// thing: an attempt records what the question was when it was answered, in
-    /// the same way it copies the skill and the topics rather than joining back
-    /// to a document that may since have been regenerated.
+    /// On an *attempt response* it is an ordinary stored field, and that is a
+    /// different thing: an attempt records what the question was when it was
+    /// answered, in the same way it copies the skill and the topics rather than
+    /// joining back to a document that may since have been regenerated.
     ///
     /// It is also what the browser discriminates on and what `?format=` filters
     /// by, so it stays a closed vocabulary with a wire form.
