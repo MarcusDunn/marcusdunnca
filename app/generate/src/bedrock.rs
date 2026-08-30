@@ -49,7 +49,7 @@ use std::collections::HashMap;
 use trainer_core::error::{aws, Error, Result};
 use trainer_core::model::Question;
 use trainer_core::tags::{
-    self, Choice, QuestionFormat, Skill, Topic, MAX_TOPICS_PER_DOC, TOPIC_MAX_LEN, TOPIC_MIN_LEN,
+    self, Choice, Skill, Topic, MAX_TOPICS_PER_DOC, TOPIC_MAX_LEN, TOPIC_MIN_LEN,
 };
 
 /// How many questions a quiz has. Not configurable: it is baked into the
@@ -86,9 +86,10 @@ mod limits {
 ///
 /// `questions` deserializes into the *same* [`Question`] type the rest of the
 /// app uses, so there is no separate "model shape" that could drift from the
-/// stored shape. The closed enums do the vocabulary enforcement for `skill`,
-/// `format` and `answer`: a value outside the list is a serde error here,
-/// before any of the checks below run.
+/// stored shape. The closed enums do the vocabulary enforcement for `skill` and
+/// `answer`: a value outside the list is a serde error here, before any of the
+/// checks below run. `format` is not asked for at all and defaults — see
+/// `Question::format`.
 ///
 /// `topics` is the exception, and is `Vec<String>` rather than `Vec<Topic>` on
 /// purpose. The topic vocabulary is open, so there is no enum to reject
@@ -114,7 +115,6 @@ struct GeneratedQuiz {
 /// closed list is what made a housing report get tagged `energy`.
 fn quiz_schema(known: &[Topic]) -> serde_json::Value {
     let skills: Vec<&str> = Skill::ALL.iter().map(|s| s.as_str()).collect();
-    let formats: Vec<&str> = QuestionFormat::ALL.iter().map(|f| f.as_str()).collect();
     let choices: Vec<&str> = Choice::ALL.iter().map(|c| c.as_str()).collect();
     let known: Vec<&str> = known.iter().map(|t| t.as_str()).collect();
 
@@ -158,8 +158,13 @@ fn quiz_schema(known: &[Topic]) -> serde_json::Value {
                 "items": {
                     "type": "object",
                     "additionalProperties": false,
+                    // No `format`. It has exactly one legal value, so asking
+                    // for it cannot add information and can only be got wrong —
+                    // and was: Sonnet returned `"format": "definitional"`,
+                    // putting a skill in the format field, and ten otherwise
+                    // good questions were discarded. The handler fills it in.
                     "required": [
-                        "id", "format", "skill", "prompt", "options", "answer", "explanation"
+                        "id", "skill", "prompt", "options", "answer", "explanation"
                     ],
                     "properties": {
                         "id": {
@@ -167,7 +172,6 @@ fn quiz_schema(known: &[Topic]) -> serde_json::Value {
                             "pattern": "^q([1-9]|10)$",
                             "description": "q1 through q10, each used once."
                         },
-                        "format": { "type": "string", "enum": formats },
                         "skill": {
                             "type": "string",
                             "enum": skills,
@@ -648,7 +652,7 @@ mod tests {
             .map(|j| format!("\"option {i}-{j}\""))
             .collect();
         format!(
-            r#"{{"id":"q{i}","format":"multiple_choice","skill":"causal",
+            r#"{{"id":"q{i}","skill":"causal",
                 "prompt":"why does this document say {i} happened?",
                 "options":[{}],"answer":"a",
                 "explanation":"stated in the section on {i}, second paragraph"}}"#,
