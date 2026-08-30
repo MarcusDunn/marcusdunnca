@@ -35,11 +35,10 @@ use trainer_core::tags::TAG_VERSION;
 /// even under a JSON Schema. Sonnet with a thinking budget produced ten
 /// schema-clean questions anchored to the document's own tables.
 ///
-/// `us.` and not `global.`, which is not a free choice: a global profile routes
-/// to a region-less model ARN that AWS authorizes with no `aws:RequestedRegion`
-/// in context, and the permissions boundary's region lock denies it — every
-/// generation fails with AccessDenied. See the note on `bedrock_model_id` in
-/// infra/variables.tf.
+/// Any cross-region profile — `us.` or `global.` — depends on the Bedrock
+/// exemption in the permissions boundary's region lock, because each routing
+/// target is authorized with `aws:RequestedRegion` set to that target's region
+/// rather than the caller's. See `global_service_actions` in bootstrap/iam.tf.
 ///
 /// Roughly 7c per document against Nova's 0.1c. At a handful of documents a
 /// month that is inside the noise of the budget.

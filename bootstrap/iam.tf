@@ -61,31 +61,46 @@ locals {
   # Services whose API calls are not region-scoped, and so must be exempt from
   # the region lock or they would break entirely.
   #
-  # Bedrock is deliberately NOT in this list, and the omission has a consequence
-  # worth stating because it is not discoverable from the policy:
+  # The Bedrock entries are the non-obvious ones, and they are here because
+  # cross-region inference makes model invocation genuinely multi-region.
   #
-  #   A *global* inference profile (`global.anthropic.claude-sonnet-4-6`) routes
-  #   to a region-less model ARN, `arn:aws:bedrock:::foundation-model/...`, and
-  #   AWS authorizes that one with no `aws:RequestedRegion` in the request
-  #   context. `StringNotEquals` against a missing key is true, so
-  #   DenyAllOutsideAllowedRegions fires and every Converse call is refused —
-  #   correctly, and invisibly until a document fails.
+  # **A cross-region inference profile authorizes each of its routing targets
+  # with `aws:RequestedRegion` set to that target's region, not the caller's.**
+  # `us.anthropic.claude-sonnet-4-6` routes through us-east-1, us-east-2,
+  # ca-central-1 and us-west-2, so a Converse call made to the ca-central-1
+  # endpoint is authorized four times, twice against regions this lock does not
+  # allow. A `global.` profile is worse: it adds a *region-less* target,
+  # `arn:aws:bedrock:::foundation-model/...`, authorized with no
+  # `aws:RequestedRegion` at all — and `StringNotEquals` against a missing key
+  # is true, so the deny fires on that one too.
   #
-  # The app therefore uses a `us.` profile, whose routing targets all carry real
-  # regions while the call itself is still made to the ca-central-1 endpoint.
-  # Nothing needs to change here to support that.
+  # There is no Sonnet profile that stays inside ca-central-1 and us-east-1.
+  # The choice was: exempt these four actions, widen the region list for every
+  # service, or give up Sonnet. This is the narrowest of the three.
   #
-  # If a global profile is ever genuinely required, the fix is to add the four
-  # bedrock invoke actions to this list — model invocation via a global profile
-  # *is* a global-service call, in the same sense as cloudfront and route53
-  # below. That is a real widening: it would permit invoking the approved models
-  # from any region. The model allowlist in `bedrock_allowed_model_arns`, the
-  # daily cap and the spend brake would be the only remaining cost controls.
+  # What still constrains these actions:
+  #   * `bedrock_allowed_model_arns` — sonnet, haiku and nova patterns only.
+  #     Opus is absent and unreachable.
+  #   * Invocation creates no persistent resource, so this cannot be used to
+  #     stand something up in an unwatched region.
+  #   * The trail is multi-region, so calls in us-east-2 and us-west-2 are still
+  #     recorded.
+  #   * DAILY_DOCUMENT_CAP, MAX_PAGES, MAX_DOCUMENT_BYTES and the budget spend
+  #     brake bound the spend.
   #
-  # Note that `iam:simulate-principal-policy` does NOT reproduce this: with no
-  # context supplied it reports the region-less ARN as allowed. CloudTrail's
-  # errorMessage was the only reliable witness.
+  # What it costs: a compromised role may invoke the approved models from any
+  # region rather than two.
+  #
+  # Debugging note, because it cost real time. `iam:simulate-principal-policy`
+  # does NOT reproduce any of this — with no context entries it reports these
+  # ARNs as allowed, because it does not apply the missing-key rule that real
+  # evaluation does. CloudTrail's `errorMessage` names the exact resource and
+  # the exact policy, and was the only reliable witness.
   global_service_actions = [
+    "bedrock:InvokeModel",
+    "bedrock:InvokeModelWithResponseStream",
+    "bedrock:Converse",
+    "bedrock:ConverseStream",
     "iam:*",
     "sts:*",
     "account:*",
