@@ -84,9 +84,35 @@ When the application needs a new service, add the specific actions to
 guardrail policy is pure `Deny` and attached to both roles, so anything it
 refuses stays refused no matter what is added to an allowlist.
 
-If `iam:CreateRole` is ever added, the permissions boundary in `bootstrap/iam.tf`
-must be wired to it at the same time — otherwise that one addition converts the
-apply role into a privilege-escalation path.
+### Application roles
+
+CI **can** create IAM roles, but only ones carrying the permissions boundary.
+That boundary is an allowlist — `lambda`, `s3`, `sqs`, `sns`, `logs`,
+`cloudfront`, plus X-Ray write — so a created role cannot act outside those
+services *even if a policy granting `Action: "*"` is attached to it*. Verified:
+under the boundary, `dynamodb:PutItem`, `ses:SendEmail` and `kms:Decrypt` are
+denied while `lambda:InvokeFunction` and `sqs:SendMessage` are allowed.
+
+Two conditioned denies make this safe:
+
+- `DenyRoleWorkWithoutBoundary` — `iam:CreateRole` without the boundary is
+  refused. A missing `iam:PermissionsBoundary` key makes `StringNotEquals` true,
+  so no-boundary fails closed.
+- `DenyPassRoleExceptToAppServices` — `iam:PassRole` is confined to
+  `lambda.amazonaws.com` and `edgelambda.amazonaws.com`. Unconstrained PassRole
+  is an escalation primitive; constrained it is ordinary wiring.
+
+Widening `app_service_actions` widens every application role at once, so it
+deserves the same scrutiny as widening the apply role itself.
+
+Note CloudFront create/update was removed from the expensive-service denies to
+allow this. CloudFront is global, so the region lock gives it no cost
+containment and data-transfer-out is unbounded — the $1 budget and the $1
+anomaly subscription are what bound it now.
+
+There are no secrets in this system, and no reason for any yet: IAM handles all
+AWS-to-AWS auth. If one is ever needed, SSM Parameter Store *Standard* with
+`SecureString` is free; Secrets Manager is $0.40/secret/month.
 
 ## Branch protection
 
