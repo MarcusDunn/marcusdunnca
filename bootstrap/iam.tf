@@ -271,18 +271,34 @@ locals {
     "logs:*",
     "cloudfront:*",
     "dynamodb:*",
-    # Moved out of expensive_service_actions deliberately. Bedrock is metered
-    # per token and, like CloudFront, is not meaningfully bounded by the region
-    # lock — the $10 budget and the $1 anomaly subscription are what bound it.
-    "bedrock:InvokeModel",
-    "bedrock:InvokeModelWithResponseStream",
-    "bedrock:Converse",
-    "bedrock:ConverseStream",
+    # Only the non-invoking, non-metered Bedrock calls live here. The actual
+    # inference actions are granted separately and scoped to specific model
+    # ARNs — see local.bedrock_invoke_actions.
     "bedrock:ListFoundationModels",
     "bedrock:GetFoundationModel",
     "xray:PutTraceSegments",
     "xray:PutTelemetryRecords",
   ]
+
+  # Inference is metered per token, and there is no IAM condition key for token
+  # count — so the only lever IAM offers is WHICH model. Opus costs several
+  # times Sonnet per token, so restricting the allowed models is a real cost
+  # bound rather than a hope. Add a model here deliberately, knowing the price.
+  bedrock_invoke_actions = [
+    "bedrock:InvokeModel",
+    "bedrock:InvokeModelWithResponseStream",
+    "bedrock:Converse",
+    "bedrock:ConverseStream",
+  ]
+
+  # Both the raw foundation-model ARN and the inference-profile form, because
+  # newer models are addressed through profiles rather than directly.
+  bedrock_allowed_model_arns = flatten([
+    for family in var.bedrock_allowed_model_families : [
+      "arn:${local.partition}:bedrock:*::foundation-model/anthropic.claude-${family}-*",
+      "arn:${local.partition}:bedrock:*:${local.account_id}:inference-profile/*anthropic.claude-${family}-*",
+    ]
+  ])
 
   # Read-only counterpart, for the plan role: `tofu plan` must refresh every
   # application resource, and an enumerated allowlist means each new service
@@ -833,6 +849,14 @@ data "aws_iam_policy_document" "apply_permissions" {
     resources = ["*"]
   }
 
+  # Inference, confined to the approved model families.
+  statement {
+    sid       = "InvokeApprovedBedrockModels"
+    effect    = "Allow"
+    actions   = local.bedrock_invoke_actions
+    resources = local.bedrock_allowed_model_arns
+  }
+
   # Certificates for the CloudFront distribution. Must be issued in us-east-1 —
   # CloudFront accepts certificates from nowhere else — which the region lock
   # already permits.
@@ -973,6 +997,15 @@ data "aws_iam_policy_document" "ci_permissions_boundary" {
     effect    = "Allow"
     actions   = local.app_service_actions
     resources = ["*"]
+  }
+
+  # Runtime inference, same model restriction as the apply role. A created role
+  # cannot invoke Opus even if a policy granting bedrock:* is attached to it.
+  statement {
+    sid       = "InvokeApprovedBedrockModels"
+    effect    = "Allow"
+    actions   = local.bedrock_invoke_actions
+    resources = local.bedrock_allowed_model_arns
   }
 
   # Parameter namespace split — the reason secrets stay out of CI's reach:

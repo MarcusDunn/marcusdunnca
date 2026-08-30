@@ -346,6 +346,28 @@ a forecast breach. That is deliberately just above the real floor: a genuinely
 zero-spend threshold false-alarms every month on a few cents of S3 and data
 events, which trains you to ignore it.
 
+### Spend controls
+
+Three layers, because Bedrock and CloudFront are metered and the region lock
+does not bound either:
+
+1. **Model scoping.** There is no IAM condition key for token count, so *which
+   model* is the only lever IAM offers. `bedrock:InvokeModel` is scoped to the
+   Sonnet and Haiku families; Opus is `implicitDeny`, for both the apply role
+   and any boundary-capped runtime role. Widen `bedrock_allowed_model_families`
+   deliberately, knowing the price difference.
+2. **Alerting.** $10 budget at 80/100% actual and 100% forecast, plus a Cost
+   Anomaly subscription at $1 that publishes immediately via SNS.
+3. **An automated circuit breaker.** At 90% of budget, AWS Budgets itself
+   attaches `marcusdunnca-spend-brake` to both CI roles, denying Bedrock and
+   further resource creation. No human, no Lambda, no dependency on anything in
+   this repo still working. Free — the first two action-enabled budgets cost
+   nothing.
+
+The brake is deliberately one-way: clearing it needs a human with Identity
+Center admin, because CI cannot modify its own role. That is the property you
+want at 3am during a runaway.
+
 Realistically pennies per month while idle. GuardDuty, AWS Config, and Security
 Hub are deliberately **not** enabled. Set `state_bucket_use_cmk = true` in
 `bootstrap/` to encrypt state with a customer-managed KMS key (~$1/month) once

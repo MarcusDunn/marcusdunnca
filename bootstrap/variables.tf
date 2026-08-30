@@ -143,3 +143,15 @@ variable "cost_alert_emails" {
   type        = list(string)
   default     = ["aws-root@marcusdunn.ca", "marcus.s.dunn@gmail.com"]
 }
+
+variable "bedrock_allowed_model_families" {
+  description = <<-EOT
+    Claude model families the application may invoke, as ARN fragments.
+
+    There is no IAM condition key for token count, so model choice is the only
+    cost lever IAM offers. Opus costs several times Sonnet per token; omitting
+    it caps the per-document worst case. Add a family here deliberately.
+  EOT
+  type        = list(string)
+  default     = ["sonnet", "haiku"]
+}
