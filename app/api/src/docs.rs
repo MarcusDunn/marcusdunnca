@@ -18,6 +18,7 @@ use trainer_core::model::{
     QuestionOption,
 };
 use trainer_core::numeric::{self, NumericAnswer};
+use trainer_core::review::ReviewItem;
 use trainer_core::store::AttemptWrite;
 use trainer_core::tags::{Choice, Confidence, Topic, TAG_VERSION};
 
@@ -731,21 +732,28 @@ pub async fn submit(state: &AppState, doc_id: &str, req: SubmitRequest) -> Resul
 
     // Written before the response is built. If the write fails the caller gets
     // an error and can retry, rather than seeing their score and losing it.
-    let stored = match state.store.put_attempt_once(&attempt).await? {
-        AttemptWrite::Created => attempt,
+    let (stored, is_new) = match state.store.put_attempt_once(&attempt).await? {
+        AttemptWrite::Created => (attempt, true),
         // A duplicate submission replays the original, so a lost response
         // followed by a retry shows the same result rather than a second
         // sitting with a later timestamp.
         AttemptWrite::AlreadyRecorded(existing) => match *existing {
             Some(original) => {
                 tracing::info!(doc_id, "duplicate submission; replaying original attempt");
-                original
+                (original, false)
             }
             // Marker without an attempt. Unreachable via the transaction, but
             // if it ever happens, grading what we have beats a 500.
-            None => attempt,
+            None => (attempt, false),
         },
     };
+
+    // Only on a genuinely new attempt. A replayed duplicate must not advance
+    // the schedule a second time — that would be a repetition the reader never
+    // did, and the scheduler would read the doubled interval as knowledge.
+    if is_new {
+        schedule_reviews(state, &doc, &stored).await;
+    }
 
     Ok(SubmitResponse {
         attempt_id: stored.attempt_id.clone(),
@@ -757,6 +765,80 @@ pub async fn submit(state: &AppState, doc_id: &str, req: SubmitRequest) -> Resul
         max_points: stored.max_points,
         questions: grade_all(&doc.questions, &doc.topics, &stored),
     })
+}
+
+/// Create or advance the review schedule for every question in an attempt.
+///
+/// **The first sitting of a document is the first repetition.** There is no
+/// separate "add to the queue" step, because reading the document and answering
+/// its questions *is* what a first repetition is — and a queue you have to
+/// remember to populate is a queue that stays empty.
+///
+/// # Why a failure here is logged and swallowed
+///
+/// The attempt is already written by the time this runs. The reader has taken
+/// their quiz and is waiting for a score; failing the request would lose them
+/// the score they have earned in exchange for a schedule that the *next*
+/// attempt would recreate anyway. So this is best-effort, and the failure mode
+/// is "that document is not in the review queue yet", which is visible and
+/// fixable by taking the quiz again.
+///
+/// That trade is only acceptable because it cannot corrupt anything: schedules
+/// are derived state, and every write here is idempotent for a given attempt.
+async fn schedule_reviews(state: &AppState, doc: &DocMeta, attempt: &Attempt) {
+    let existing = match state.store.list_reviews_for_doc(&doc.doc_id).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(
+                doc_id = %doc.doc_id,
+                error = %trainer_core::error::describe(&e),
+                "could not read the review schedule; questions not scheduled"
+            );
+            return;
+        }
+    };
+
+    let mut updated = Vec::with_capacity(attempt.responses.len());
+
+    for response in &attempt.responses {
+        let Some(question) = doc.questions.iter().find(|q| q.id == response.qid) else {
+            continue;
+        };
+
+        let mut item = existing
+            .iter()
+            .find(|r| r.qid == response.qid)
+            .cloned()
+            .unwrap_or_else(|| {
+                ReviewItem::new(
+                    &doc.doc_id,
+                    &response.qid,
+                    &doc.title,
+                    question.options().len(),
+                    question.shelf,
+                    // The *document's* date, not today's. A question added by a
+                    // second sitting six months on is no fresher than the
+                    // report it came from, and dating it from the sitting would
+                    // let a stale document renew its own shelf life every time
+                    // it was re-read.
+                    &doc.created_at,
+                )
+            });
+
+        // Retaking a document's quiz advances its schedule, which is correct:
+        // it is another spaced retrieval of the same questions, which is what
+        // the schedule is counting.
+        item.record(response.correct, response.confidence, &attempt.submitted_at);
+        updated.push(item);
+    }
+
+    if let Err(e) = state.store.put_reviews(&updated).await {
+        tracing::warn!(
+            doc_id = %doc.doc_id,
+            error = %trainer_core::error::describe(&e),
+            "could not write the review schedule"
+        );
+    }
 }
 
 /// Build the graded view from the *stored* attempt, not from the request.
@@ -817,6 +899,7 @@ mod tests {
         Question {
             id: "q3".into(),
             skill: Skill::Causal,
+            shelf: trainer_core::tags::Shelf::Slow,
             prompt: "What was the deficit?".into(),
             explanation: "Table 2, line 4.".into(),
             body: QuestionBody::MultipleChoice {
@@ -830,6 +913,7 @@ mod tests {
         Question {
             id: "n1".into(),
             skill: Skill::FigureRecall,
+            shelf: trainer_core::tags::Shelf::Dated,
             prompt: "What was the forecast change in Ontario home prices?".into(),
             explanation: "Table 1, Ontario row.".into(),
             body: QuestionBody::Numeric {

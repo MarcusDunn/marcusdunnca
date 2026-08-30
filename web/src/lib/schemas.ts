@@ -329,6 +329,98 @@ export const AttemptResult = z.object({
 export type AttemptResult = z.infer<typeof AttemptResult>;
 
 /* ------------------------------------------------------------------ *
+ * Review
+ *
+ * The spaced queue. Same questions, same grading, no document on screen —
+ * a review with the PDF open is a comprehension test, not a retrieval one.
+ * ------------------------------------------------------------------ */
+
+/**
+ * `GET /review`.
+ *
+ * Options arrive **in this repetition's order**, which is not the stored order:
+ * the option shown third is `c` whatever its position in the document's record.
+ * The server holds the permutation and grades against it, so the client just
+ * renders what it is given and posts back the letter — it must not sort,
+ * re-letter, or otherwise second-guess this array.
+ */
+export const ReviewQuestion = z.object({
+  questionId: z.string().min(1),
+  documentId: z.string().min(1),
+  documentTitle: z.string(),
+  format: QuestionFormat,
+  skill: Skill,
+  topics: z.array(Topic),
+  prompt: z.string().min(1),
+  options: z.array(QuestionOption),
+  tolerance: z.number().nullable().default(null),
+  unit: z.string().nullable().default(null),
+  /** Repetitions already done. Zero means this has never come back before. */
+  reps: z.number().int().nonnegative(),
+  dueAt: z.iso.datetime(),
+  /** When the document was read. Rendered as an age, so a question from a
+   *  two-year-old report is visibly one. */
+  sourceDatedAt: z.string(),
+});
+export type ReviewQuestion = z.infer<typeof ReviewQuestion>;
+
+export const ReviewQueue = z.object({
+  questions: z.array(ReviewQuestion),
+  /** Everything due, including what did not fit in this session. */
+  dueTotal: z.number().int().nonnegative(),
+  /** The whole schedule — the denominator for "how much is being kept alive". */
+  scheduledTotal: z.number().int().nonnegative(),
+  /** Aged out of being worth asking. Reported, not silently subtracted. */
+  retiredTotal: z.number().int().nonnegative().default(0),
+  /** Only when nothing is due: when the next thing comes back. */
+  nextDueAt: z.iso.datetime().nullable().default(null),
+});
+export type ReviewQueue = z.infer<typeof ReviewQueue>;
+
+export const ReviewResult = z.object({
+  questionId: z.string().min(1),
+  documentId: z.string().min(1),
+  prompt: z.string().min(1),
+  correct: z.boolean(),
+  confidence: Confidence.nullable().default(null),
+  points: z.number().int(),
+  options: z.array(QuestionOption),
+  correctOptionId: z.string().nullable().default(null),
+  selectedOptionId: z.string().nullable().default(null),
+  selectedValue: z.string().nullable().default(null),
+  correctValue: z.number().nullable().default(null),
+  unit: z.string().nullable().default(null),
+  explanation: z.string().default(""),
+  /** What the answer just bought: when this comes back, and how far out. */
+  nextDueAt: z.iso.datetime(),
+  intervalDays: z.number().int(),
+});
+export type ReviewResult = z.infer<typeof ReviewResult>;
+
+export const ReviewSubmitResult = z.object({
+  correct: z.number().int().nonnegative(),
+  total: z.number().int().nonnegative(),
+  points: z.number().int(),
+  maxPoints: z.number().int(),
+  results: z.array(ReviewResult),
+});
+export type ReviewSubmitResult = z.infer<typeof ReviewSubmitResult>;
+
+export const ReviewSubmitRequest = z.object({
+  answers: z.array(
+    z.object({
+      documentId: z.string().min(1),
+      questionId: z.string().min(1),
+      /** The letter **as shown**. The server maps it back. */
+      optionId: z.string().min(1).optional(),
+      value: z.string().min(1).optional(),
+      confidence: Confidence,
+    }),
+  ),
+});
+export type ReviewSubmitRequest = z.infer<typeof ReviewSubmitRequest>;
+
+/* ------------------------------------------------------------------ *
  * History
  * ------------------------------------------------------------------ */
 

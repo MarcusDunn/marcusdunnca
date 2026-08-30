@@ -24,6 +24,7 @@ mod docs;
 mod history;
 mod http;
 mod register;
+mod review;
 mod state;
 
 use lambda_http::{service_fn, Body, Request, RequestExt, Response};
@@ -207,6 +208,14 @@ async fn dispatch(
             let filter = history::HistoryFilter::from_query(&pairs)?;
             let entries = history::list(state, &filter).await?;
             Ok(http::json(origin, 200, &entries))
+        }
+        (&Method::GET, ["review"]) => {
+            let queue = review::queue(state).await?;
+            Ok(http::json(origin, 200, &queue))
+        }
+        (&Method::POST, ["review", "submit"]) => {
+            let result = review::submit(state, body_json(&req)?).await?;
+            Ok(http::json(origin, 200, &result))
         }
         (&Method::GET, ["health"]) => Ok(http::no_content(origin)),
         _ => Err(Error::NotFound),

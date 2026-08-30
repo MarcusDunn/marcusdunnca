@@ -50,7 +50,7 @@ use trainer_core::error::{aws, Error, Result};
 use trainer_core::model::{Question, QuestionBody};
 use trainer_core::numeric::NumericAnswer;
 use trainer_core::tags::{
-    self, Choice, QuestionFormat, Skill, Topic, MAX_TOPICS_PER_DOC, TOPIC_MAX_LEN, TOPIC_MIN_LEN,
+    self, Choice, Shelf, Skill, Topic, MAX_TOPICS_PER_DOC, TOPIC_MAX_LEN, TOPIC_MIN_LEN,
 };
 
 /// How many questions a quiz has. Not configurable: it is baked into the
@@ -160,6 +160,7 @@ struct GeneratedQuiz {
 struct ChoiceQuestion {
     id: String,
     skill: Skill,
+    shelf: Shelf,
     prompt: String,
     options: Vec<String>,
     answer: Choice,
@@ -174,6 +175,7 @@ struct ChoiceQuestion {
 #[derive(Debug, Deserialize)]
 struct NumericQuestion {
     id: String,
+    shelf: Shelf,
     prompt: String,
     value: f64,
     tolerance: f64,
@@ -202,6 +204,8 @@ fn quiz_schema(known: &[Topic]) -> serde_json::Value {
         .map(|s| s.as_str())
         .collect();
     let choices: Vec<&str> = Choice::ALL.iter().map(|c| c.as_str()).collect();
+    let shelves: Vec<&str> = Shelf::ALL.iter().map(|s| s.as_str()).collect();
+
     let known: Vec<&str> = known.iter().map(|t| t.as_str()).collect();
 
     json!({
@@ -256,7 +260,7 @@ fn quiz_schema(known: &[Topic]) -> serde_json::Value {
                     // `"format": "definitional"`, putting a skill in the format
                     // field, and ten otherwise good questions were discarded.
                     "required": [
-                        "id", "skill", "prompt", "options", "answer", "explanation"
+                        "id", "skill", "shelf", "prompt", "options", "answer", "explanation"
                     ],
                     "properties": {
                         "id": {
@@ -273,10 +277,32 @@ fn quiz_schema(known: &[Topic]) -> serde_json::Value {
                                 "Spread these across the listed skills. A quiz that leaves a \
                                  skill unused cannot measure it."
                         },
+                        "shelf": {
+                            "type": "string",
+                            "enum": shelves,
+                            "description":
+                                "How long this stays worth re-testing months from now. \
+                                 `dated` for a forecast, a current condition, or a quarterly \
+                                 figure — anything a reader would stop citing once it is \
+                                 superseded. `slow` for policy, institutional arrangements and \
+                                 multi-year trends. `perennial` only for how a mechanism works, \
+                                 or a definition, which does not go out of date. Most questions \
+                                 about a forecast document are `dated`; be honest rather than \
+                                 generous, because a stale question that keeps being asked \
+                                 gets remembered as though it were current."
+                        },
                         "prompt": {
                             "type": "string",
                             "minLength": limits::PROMPT_MIN,
-                            "maxLength": limits::PROMPT_MAX
+                            "maxLength": limits::PROMPT_MAX,
+                            "description":
+                                "Must name the document and the period it describes, not just \
+                                 the fact. \"In this March 2026 outlook, why was the Ontario \
+                                 forecast cut?\" — not \"why was the Ontario forecast cut?\". \
+                                 These questions come back months later, and a claim rehearsed \
+                                 without its date attached stops being remembered as something \
+                                 a document said and starts being remembered as something that \
+                                 is true."
                         },
                         "options": {
                             "type": "array",
@@ -330,7 +356,9 @@ fn quiz_schema(known: &[Topic]) -> serde_json::Value {
                     "additionalProperties": false,
                     // No `skill`: every one of these is figure recall by
                     // construction. No `options`, no `answer` letter.
-                    "required": ["id", "prompt", "value", "tolerance", "unit", "explanation"],
+                    "required": [
+                        "id", "shelf", "prompt", "value", "tolerance", "unit", "explanation"
+                    ],
                     "properties": {
                         "id": {
                             "type": "string",
@@ -339,15 +367,31 @@ fn quiz_schema(known: &[Topic]) -> serde_json::Value {
                                 "n1 through n{NUMERIC_QUESTIONS_PER_DOC}, each used once."
                             )
                         },
+                        "shelf": {
+                            "type": "string",
+                            "enum": shelves,
+                            "description":
+                                "How long this stays worth re-testing months from now. \
+                                 `dated` for a forecast, a current condition, or a quarterly \
+                                 figure — anything a reader would stop citing once it is \
+                                 superseded. `slow` for policy, institutional arrangements and \
+                                 multi-year trends. `perennial` only for how a mechanism works, \
+                                 or a definition, which does not go out of date. Most questions \
+                                 about a forecast document are `dated`; be honest rather than \
+                                 generous, because a stale question that keeps being asked \
+                                 gets remembered as though it were current."
+                        },
                         "prompt": {
                             "type": "string",
                             "minLength": limits::PROMPT_MIN,
                             "maxLength": limits::PROMPT_MAX,
                             "description":
-                                "Must name the unit and the basis unambiguously — which year, \
-                                 which region, percent or percentage points. The reader types a \
-                                 bare number, so anything the prompt leaves open is a question \
-                                 with two right answers."
+                                "Must name the source and period as well as the unit and basis \
+                                 — which document, which year, which region, percent or \
+                                 percentage points. \"In this March 2026 outlook, what was the \
+                                 2026 Ontario home-price forecast, in percent?\" The reader \
+                                 types a bare number months later, so a prompt that leaves the \
+                                 vintage open teaches a stale figure as a current one."
                         },
                         "value": {
                             "type": "number",
@@ -576,6 +620,7 @@ fn assemble(quiz: GeneratedQuiz, seed: &str) -> Vec<Question> {
         .map(|q| Question {
             id: q.id,
             skill: q.skill,
+            shelf: q.shelf,
             prompt: q.prompt,
             explanation: q.explanation,
             body: QuestionBody::MultipleChoice {
@@ -586,6 +631,7 @@ fn assemble(quiz: GeneratedQuiz, seed: &str) -> Vec<Question> {
         .chain(quiz.numeric_questions.into_iter().map(|q| Question {
             id: q.id,
             skill: NUMERIC_SKILL,
+            shelf: q.shelf,
             prompt: q.prompt,
             explanation: q.explanation,
             body: QuestionBody::Numeric {
@@ -952,6 +998,8 @@ fn document_to_json(document: &Document) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+    use trainer_core::tags::QuestionFormat;
+
     use super::*;
 
     /// Cycles the permitted skills so the fixture satisfies the spread rule
@@ -962,7 +1010,7 @@ mod tests {
             .map(|j| format!("\"option {i}-{j}\""))
             .collect();
         format!(
-            r#"{{"id":"c{i}","skill":"{}",
+            r#"{{"id":"c{i}","skill":"{}","shelf":"slow",
                 "prompt":"why does this document say {i} happened?",
                 "options":[{}],"answer":"a",
                 "explanation":"stated in the section on {i}, second paragraph"}}"#,
@@ -973,7 +1021,7 @@ mod tests {
 
     fn numeric_json(i: usize) -> String {
         format!(
-            r#"{{"id":"n{i}","prompt":"what was the {i}th figure, in percent?",
+            r#"{{"id":"n{i}","shelf":"dated","prompt":"what was the {i}th figure, in percent?",
                 "value":-4.0,"tolerance":1.0,"unit":"%",
                 "explanation":"printed in table {i}, the second row"}}"#
         )

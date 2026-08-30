@@ -21,6 +21,9 @@ export function RootLayout() {
               <Link to="/upload">Upload</Link>
             </li>
             <li>
+              <Link to="/review">Review</Link>
+            </li>
+            <li>
               <Link to="/history">History</Link>
             </li>
             <li>

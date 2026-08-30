@@ -14,7 +14,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::numeric::NumericAnswer;
-use crate::tags::{Choice, Confidence, QuestionFormat, Skill, Topic};
+use crate::tags::{Choice, Confidence, QuestionFormat, Shelf, Skill, Topic};
 
 /// One selectable answer.
 ///
@@ -41,6 +41,11 @@ pub struct Question {
     /// either be counted three times or need a weighting rule nobody has
     /// specified.
     pub skill: Skill,
+    /// How long this stays worth reviewing. Defaulted, because questions
+    /// written before shelf life existed carry none — see [`Shelf`]'s `Default`
+    /// for why the default is the forgiving one.
+    #[serde(default)]
+    pub shelf: Shelf,
     pub prompt: String,
     pub explanation: String,
     /// The parts that differ by format, including the key.
@@ -593,19 +598,35 @@ mod tests {
             "the tag is written, from the variant: {json}"
         );
 
-        // And the multiple-choice shape is exactly what the table holds today,
-        // so a round trip through this type is a no-op on an existing row.
+        // And rewriting a row that is already in the table changes nothing
+        // except by *adding* fields that have since been introduced. Nothing
+        // may be renamed, moved, or dropped — that is what would orphan it.
         let stored = r#"{"id":"q1","format":"multiple_choice","skill":"causal","prompt":"why?",
                 "options":["a","b","c","d"],"answer":"a","explanation":"page 1"}"#;
         let parsed: Question = serde_json::from_str(stored).expect("parses");
         let rewritten: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&parsed).expect("serializes"))
                 .expect("valid json");
-        assert_eq!(
-            rewritten,
-            serde_json::from_str::<serde_json::Value>(stored).expect("valid json"),
-            "rewriting a stored row must not change it"
-        );
+        let original: serde_json::Value = serde_json::from_str(stored).expect("valid json");
+
+        for (key, value) in original.as_object().expect("an object") {
+            assert_eq!(
+                rewritten.get(key),
+                Some(value),
+                "rewriting a stored row changed {key}"
+            );
+        }
+
+        // Every key the rewrite adds must be one that defaults, or reading an
+        // existing row would have failed before it got here. Listed explicitly
+        // so that adding a field is a deliberate edit to this test.
+        let added: Vec<&String> = rewritten
+            .as_object()
+            .expect("an object")
+            .keys()
+            .filter(|k| original.get(*k).is_none())
+            .collect();
+        assert_eq!(added, vec!["shelf"], "unexpected new stored fields");
     }
 
     /// **Questions are stored in DynamoDB, not in JSON, and the two are not the
@@ -656,6 +677,7 @@ mod tests {
         Question {
             id: "n1".into(),
             skill: Skill::FigureRecall,
+            shelf: Shelf::Dated,
             prompt: "What was the 2026 forecast change in Ontario home prices?".into(),
             body: QuestionBody::Numeric {
                 numeric: NumericAnswer {

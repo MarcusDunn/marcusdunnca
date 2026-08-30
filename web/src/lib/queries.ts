@@ -7,6 +7,7 @@ export const queryKeys = {
   documentUrl: (id: string) => ["documents", id, "url"] as const,
   quiz: (id: string) => ["documents", id, "quiz"] as const,
   history: ["history"] as const,
+  reviewQueue: ["review"] as const,
 };
 
 /**
@@ -78,4 +79,23 @@ export const historyQuery = () =>
     // volume, and it keeps the `n` counts stable while filters change instead of
     // flickering through loading states on every checkbox.
     staleTime: 30_000,
+  });
+
+/**
+ * The spaced queue.
+ *
+ * `staleTime: 0` and a refetch on focus, unlike every other query here. The
+ * queue is a function of the clock — things become due while the tab sits open —
+ * and a stale one shows "nothing to review" to someone who has three items
+ * waiting. It is one call and it only fires when the screen is looked at.
+ *
+ * Not polled on an interval, though: items come due on day-scale intervals, so
+ * a timer would spend requests to discover something that changes once a day.
+ */
+export const reviewQueueQuery = () =>
+  queryOptions({
+    queryKey: queryKeys.reviewQueue,
+    queryFn: ({ signal }) => api.reviewQueue(signal),
+    staleTime: 0,
+    refetchOnWindowFocus: true,
   });
