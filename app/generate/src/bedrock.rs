@@ -48,8 +48,9 @@ use serde_json::json;
 use std::collections::HashMap;
 use trainer_core::error::{aws, Error, Result};
 use trainer_core::model::Question;
+use trainer_core::numeric::NumericAnswer;
 use trainer_core::tags::{
-    self, Choice, Skill, Topic, MAX_TOPICS_PER_DOC, TOPIC_MAX_LEN, TOPIC_MIN_LEN,
+    self, Choice, QuestionFormat, Skill, Topic, MAX_TOPICS_PER_DOC, TOPIC_MAX_LEN, TOPIC_MIN_LEN,
 };
 
 /// How many questions a quiz has. Not configurable: it is baked into the
@@ -57,9 +58,55 @@ use trainer_core::tags::{
 /// length varies run to run makes scores incomparable across documents.
 pub const QUESTIONS_PER_DOC: usize = 10;
 
+/// How many of those are typed figures rather than four options.
+///
+/// # Why the mix is fixed rather than left to the model
+///
+/// Because it is the mix, not the wording, that decides what the quiz trains.
+/// Asked to write ten questions about a document full of tables, a model writes
+/// mostly figure-recall questions — and a figure-recall question in
+/// multiple-choice form needs three wrong figures, which the model invents.
+/// Reading three invented statistics and deliberating over them is how they get
+/// remembered; the intrusions persist, and by reconstruction rather than
+/// familiarity, so knowing one of them was wrong does not undo it. For an app
+/// whose whole purpose is having accurate numbers to hand, that is the worst
+/// available failure.
+///
+/// Splitting the request into two arrays fixes it structurally. Figures are
+/// asked for as figures, with a tolerance, and there are no wrong ones to read.
+/// The other seven are about causes, relationships and scope, where the wrong
+/// options are claims from the document rather than fabricated quantities.
+///
+/// Three is a floor on numeric practice and a ceiling on trivia: enough that
+/// every document leaves a few recallable anchors, few enough that the quiz is
+/// mostly about what the document *argues*.
+pub const NUMERIC_QUESTIONS_PER_DOC: usize = 3;
+
+/// The remainder, asked as multiple choice.
+pub const CHOICE_QUESTIONS_PER_DOC: usize = QUESTIONS_PER_DOC - NUMERIC_QUESTIONS_PER_DOC;
+
 /// Exactly four options, because [`Choice`] has exactly four variants. These
 /// two numbers are not independent — see `Choice::index`.
 pub const OPTIONS_PER_QUESTION: usize = 4;
+
+/// The fewest distinct skills the seven multiple-choice questions must cover.
+///
+/// A quiz where all seven are `definitional` measures one thing and reports it
+/// as a document score, and the skill × topic matrix — the entire reason
+/// questions are tagged — collapses to a single row. Three of the four is loose
+/// enough that a document genuinely light on causal claims still generates, and
+/// tight enough to catch a model that has settled into one groove.
+const MIN_DISTINCT_CHOICE_SKILLS: usize = 3;
+
+/// The skill every numeric question has.
+///
+/// Not asked for. A typed figure *is* figure recall, so offering the model a
+/// choice would only let it be wrong — the same reasoning that removed
+/// `format` from the schema. The consequence worth stating: from now on
+/// `figure_recall` and `numeric` are the same segment of the history matrix,
+/// and a `figure_recall` rate from before this change is a rate on a different
+/// task, where guessing paid 25%.
+const NUMERIC_SKILL: Skill = Skill::FigureRecall;
 
 /// The name the model must call. Referenced from the instruction text too, so
 /// they cannot drift.
@@ -84,23 +131,55 @@ mod limits {
 
 /// What the model is asked to return.
 ///
-/// `questions` deserializes into the *same* [`Question`] type the rest of the
-/// app uses, so there is no separate "model shape" that could drift from the
-/// stored shape. The closed enums do the vocabulary enforcement for `skill` and
-/// `answer`: a value outside the list is a serde error here, before any of the
-/// checks below run. `format` is not asked for at all and defaults — see
-/// `Question::format`.
+/// **Two arrays, not one array with a discriminator.** A single array of
+/// polymorphic questions would need `oneOf` in the schema, which models honour
+/// unevenly, and a runtime check that each item's shape matches its declared
+/// kind. Two arrays make the same constraint structural: the count of each is a
+/// `minItems`/`maxItems` pair, the shapes cannot be confused because they are
+/// different schemas, and the handler knows which format it is holding without
+/// asking. It is also why `format` is still not a field the model fills in.
 ///
-/// `topics` is the exception, and is `Vec<String>` rather than `Vec<Topic>` on
-/// purpose. The topic vocabulary is open, so there is no enum to reject
-/// against; what there is instead is `tags::normalise`, which splits phrases
-/// into words and drops what it cannot use. Deserializing straight into
-/// `Vec<Topic>` would fail the whole document over a hyphen.
+/// `topics` is `Vec<String>` rather than `Vec<Topic>` on purpose. The topic
+/// vocabulary is open, so there is no enum to reject against; what there is
+/// instead is `tags::normalise`, which splits phrases into words and drops what
+/// it cannot use. Deserializing straight into `Vec<Topic>` would fail the whole
+/// document over a hyphen.
 #[derive(Debug, Deserialize)]
 struct GeneratedQuiz {
     title: String,
     topics: Vec<String>,
-    questions: Vec<Question>,
+    choice_questions: Vec<ChoiceQuestion>,
+    numeric_questions: Vec<NumericQuestion>,
+}
+
+/// A multiple-choice question as the model returns it.
+///
+/// The closed enums do the vocabulary enforcement: a `skill` or `answer`
+/// outside the list is a serde error here, before any of the checks below run.
+#[derive(Debug, Deserialize)]
+struct ChoiceQuestion {
+    id: String,
+    skill: Skill,
+    prompt: String,
+    options: Vec<String>,
+    answer: Choice,
+    explanation: String,
+}
+
+/// A typed-figure question as the model returns it.
+///
+/// No `skill` field — every one of these is [`NUMERIC_SKILL`]. No `options`,
+/// no `answer` letter. The flat `value`/`tolerance`/`unit` triple is assembled
+/// into a `NumericAnswer` and validated by it.
+#[derive(Debug, Deserialize)]
+struct NumericQuestion {
+    id: String,
+    prompt: String,
+    value: f64,
+    tolerance: f64,
+    #[serde(default)]
+    unit: String,
+    explanation: String,
 }
 
 /// The JSON Schema handed to the model as a tool.
@@ -114,14 +193,21 @@ struct GeneratedQuiz {
 /// than as an `enum`, because an `enum` would close the vocabulary again and a
 /// closed list is what made a housing report get tagged `energy`.
 fn quiz_schema(known: &[Topic]) -> serde_json::Value {
-    let skills: Vec<&str> = Skill::ALL.iter().map(|s| s.as_str()).collect();
+    // Figure recall is deliberately absent from the multiple-choice list. It is
+    // what the numeric array is for, and offering it here is what produces a
+    // question with three invented statistics in it.
+    let choice_skills: Vec<&str> = Skill::ALL
+        .iter()
+        .filter(|s| **s != NUMERIC_SKILL)
+        .map(|s| s.as_str())
+        .collect();
     let choices: Vec<&str> = Choice::ALL.iter().map(|c| c.as_str()).collect();
     let known: Vec<&str> = known.iter().map(|t| t.as_str()).collect();
 
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["title", "topics", "questions"],
+        "required": ["title", "topics", "choice_questions", "numeric_questions"],
         "properties": {
             "title": {
                 "type": "string",
@@ -151,33 +237,41 @@ fn quiz_schema(known: &[Topic]) -> serde_json::Value {
                     known.join(", ")
                 )
             },
-            "questions": {
+            "choice_questions": {
                 "type": "array",
-                "minItems": QUESTIONS_PER_DOC,
-                "maxItems": QUESTIONS_PER_DOC,
+                "minItems": CHOICE_QUESTIONS_PER_DOC,
+                "maxItems": CHOICE_QUESTIONS_PER_DOC,
+                "description": format!(
+                    "{CHOICE_QUESTIONS_PER_DOC} questions about what the document argues — its \
+                     causes, comparisons, definitions and limits. NOT about what its figures \
+                     are: those go in numeric_questions, and asking one here would need three \
+                     invented statistics as wrong options."
+                ),
                 "items": {
                     "type": "object",
                     "additionalProperties": false,
-                    // No `format`. It has exactly one legal value, so asking
-                    // for it cannot add information and can only be got wrong —
-                    // and was: Sonnet returned `"format": "definitional"`,
-                    // putting a skill in the format field, and ten otherwise
-                    // good questions were discarded. The handler fills it in.
+                    // No `format`. The array a question arrives in determines
+                    // it, so asking cannot add information and can only be got
+                    // wrong — and was: Sonnet returned
+                    // `"format": "definitional"`, putting a skill in the format
+                    // field, and ten otherwise good questions were discarded.
                     "required": [
                         "id", "skill", "prompt", "options", "answer", "explanation"
                     ],
                     "properties": {
                         "id": {
                             "type": "string",
-                            "pattern": "^q([1-9]|10)$",
-                            "description": "q1 through q10, each used once."
+                            "pattern": "^c[1-9][0-9]?$",
+                            "description": format!(
+                                "c1 through c{CHOICE_QUESTIONS_PER_DOC}, each used once."
+                            )
                         },
                         "skill": {
                             "type": "string",
-                            "enum": skills,
+                            "enum": choice_skills,
                             "description":
-                                "Spread the ten questions across all five skills. A quiz that \
-                                 leaves a skill unused cannot measure it."
+                                "Spread these across the listed skills. A quiz that leaves a \
+                                 skill unused cannot measure it."
                         },
                         "prompt": {
                             "type": "string",
@@ -195,9 +289,13 @@ fn quiz_schema(known: &[Topic]) -> serde_json::Value {
                                 "maxLength": limits::OPTION_MAX
                             },
                             "description":
-                                "Four options. The three wrong ones must be plausible and drawn \
-                                 from the document — not obviously absurd, and not different in \
-                                 length or specificity from the correct one."
+                                "Four options. The three wrong ones must be claims made \
+                                 somewhere in the document, or plain misreadings of it — never \
+                                 an invented statistic. A wrong option that states a number the \
+                                 document does not contain teaches that number; the reader will \
+                                 remember having considered it. If an option must carry a \
+                                 figure, use one the document prints elsewhere, attached to the \
+                                 wrong year or the wrong region."
                         },
                         "answer": {
                             "type": "string",
@@ -212,6 +310,77 @@ fn quiz_schema(known: &[Topic]) -> serde_json::Value {
                             "maxLength": limits::EXPLANATION_MAX,
                             "description":
                                 "Where in the document the answer comes from — name the table, \
+                                 chart or section."
+                        }
+                    }
+                }
+            },
+            "numeric_questions": {
+                "type": "array",
+                "minItems": NUMERIC_QUESTIONS_PER_DOC,
+                "maxItems": NUMERIC_QUESTIONS_PER_DOC,
+                "description": format!(
+                    "{NUMERIC_QUESTIONS_PER_DOC} figures from the document, answered by typing \
+                     a number. Pick the figures worth carrying out of the document — the ones \
+                     someone would cite in an argument — not the ones that happen to be easy \
+                     to look up."
+                ),
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    // No `skill`: every one of these is figure recall by
+                    // construction. No `options`, no `answer` letter.
+                    "required": ["id", "prompt", "value", "tolerance", "unit", "explanation"],
+                    "properties": {
+                        "id": {
+                            "type": "string",
+                            "pattern": "^n[1-9][0-9]?$",
+                            "description": format!(
+                                "n1 through n{NUMERIC_QUESTIONS_PER_DOC}, each used once."
+                            )
+                        },
+                        "prompt": {
+                            "type": "string",
+                            "minLength": limits::PROMPT_MIN,
+                            "maxLength": limits::PROMPT_MAX,
+                            "description":
+                                "Must name the unit and the basis unambiguously — which year, \
+                                 which region, percent or percentage points. The reader types a \
+                                 bare number, so anything the prompt leaves open is a question \
+                                 with two right answers."
+                        },
+                        "value": {
+                            "type": "number",
+                            "description":
+                                "The figure exactly as the document prints it, in the unit \
+                                 named below. Negative for a decline."
+                        },
+                        "tolerance": {
+                            "type": "number",
+                            "exclusiveMinimum": 0,
+                            "description": format!(
+                                "How far off an answer may be and still count, in the same \
+                                 unit. Between {}% and {}% of the figure's magnitude. Set it \
+                                 where a reader who has genuinely absorbed the document lands: \
+                                 the point is to know the figure well enough to use it, not to \
+                                 reproduce its last decimal.",
+                                trainer_core::numeric::MIN_TOLERANCE_FRACTION * 100.0,
+                                trainer_core::numeric::MAX_TOLERANCE_FRACTION * 100.0
+                            )
+                        },
+                        "unit": {
+                            "type": "string",
+                            "maxLength": trainer_core::numeric::UNIT_MAX_LEN,
+                            "description":
+                                "Short label shown beside the input: \"%\", \"pp\", \"$B\", \
+                                 \"bps\". Empty string for a bare count."
+                        },
+                        "explanation": {
+                            "type": "string",
+                            "minLength": limits::EXPLANATION_MIN,
+                            "maxLength": limits::EXPLANATION_MAX,
+                            "description":
+                                "Where in the document the figure comes from — name the table, \
                                  chart or section."
                         }
                     }
@@ -236,9 +405,22 @@ fn system_prompt() -> String {
          formed. Prefer questions that turn on this document's own figures, its specific \
          comparisons, and the claims it actually makes.\n\
          \n\
-         Wrong options must be drawn from the document too. An option that is obviously \
-         absurd, or noticeably longer and more qualified than the others, gives the answer \
-         away without any reading at all."
+         The reader is training to argue from these documents in a fast-moving, \
+         data-driven setting. What they need out of one is its direction, its causes, and \
+         a handful of figures they can carry accurately. They do not need its decimals.\n\
+         \n\
+         Two rules follow from that, and they are the ones worth getting right:\n\
+         \n\
+         1. Questions about a FIGURE go in `numeric_questions`, never in \
+         `choice_questions`. A multiple-choice question about a statistic needs three \
+         wrong statistics, and inventing them teaches them — the reader remembers having \
+         weighed the number, not that they rejected it. Set each tolerance where someone \
+         who genuinely absorbed the document would land.\n\
+         \n\
+         2. Wrong options in `choice_questions` must be claims the document actually \
+         makes, or plain misreadings of it. An option that is obviously absurd, or \
+         noticeably longer and more qualified than the others, gives the answer away \
+         without any reading at all."
     )
 }
 
@@ -289,8 +471,9 @@ pub async fn generate(client: &Client, req: Request<'_>) -> Result<Generated> {
         .role(ConversationRole::User)
         .content(ContentBlock::Document(document))
         .content(ContentBlock::Text(format!(
-            "Read this document and call `{TOOL_NAME}` with its title, its topics, and ten \
-             questions."
+            "Read this document and call `{TOOL_NAME}` with its title, its topics, \
+             {CHOICE_QUESTIONS_PER_DOC} multiple-choice questions about what it argues, and \
+             {NUMERIC_QUESTIONS_PER_DOC} numeric questions about figures worth carrying out of it."
         )))
         .build()
         .map_err(|e| Error::Aws(format!("building message: {e}")))?;
@@ -299,8 +482,8 @@ pub async fn generate(client: &Client, req: Request<'_>) -> Result<Generated> {
         ToolSpecification::builder()
             .name(TOOL_NAME)
             .description(
-                "Emit the title, topics and ten questions for the document. This is the only \
-                 way to return a result.",
+                "Emit the title, topics and questions for the document. This is the only way \
+                 to return a result.",
             )
             .input_schema(ToolInputSchema::Json(json_to_document(&quiz_schema(
                 req.known_topics,
@@ -356,16 +539,75 @@ pub async fn generate(client: &Client, req: Request<'_>) -> Result<Generated> {
 
     let title = quiz.title.trim().to_string();
     let topics = tags::normalise(&quiz.topics);
-    let mut questions = quiz.questions;
 
-    validate(&title, &topics, &questions)?;
-    shuffle_options(&mut questions, req.seed);
+    // Validated before assembly, because the checks are stated per array — a
+    // count, a skill vocabulary, a tolerance band — and every one of them is
+    // easier to phrase, and to report, against the shape the model returned.
+    validate(&title, &topics, &quiz)?;
+
+    let questions = assemble(quiz, req.seed);
 
     Ok(Generated {
         title,
         topics,
         questions,
     })
+}
+
+/// Turn the two validated arrays into the ten stored questions.
+///
+/// Three things happen here, all of them seeded from the document id so a
+/// regeneration reproduces the same quiz and a bug in any of them is
+/// reproducible:
+///
+/// 1. Each question gets its `format` and, for numeric ones, its skill. Neither
+///    was asked of the model — see the note on `NUMERIC_SKILL`.
+/// 2. Multiple-choice options are shuffled. See [`shuffle_options`].
+/// 3. The ten are shuffled together. Without this the three numeric questions
+///    are always the last three, and a reader learns "the typing starts at
+///    eight" instead of reading the prompt — the same positional tell the
+///    option shuffle exists to remove, one level up.
+fn assemble(quiz: GeneratedQuiz, seed: &str) -> Vec<Question> {
+    let mut questions: Vec<Question> = quiz
+        .choice_questions
+        .into_iter()
+        .map(|q| Question {
+            id: q.id,
+            format: QuestionFormat::MultipleChoice,
+            skill: q.skill,
+            prompt: q.prompt,
+            options: q.options,
+            answer: Some(q.answer),
+            numeric: None,
+            explanation: q.explanation,
+        })
+        .chain(quiz.numeric_questions.into_iter().map(|q| Question {
+            id: q.id,
+            format: QuestionFormat::Numeric,
+            skill: NUMERIC_SKILL,
+            prompt: q.prompt,
+            options: Vec::new(),
+            answer: None,
+            numeric: Some(NumericAnswer {
+                value: q.value,
+                tolerance: q.tolerance,
+                unit: q.unit,
+            }),
+            explanation: q.explanation,
+        }))
+        .collect();
+
+    shuffle_options(&mut questions, seed);
+
+    // A separate stream from the option shuffle's, so that changing one does
+    // not silently reshuffle the other and make an old bug irreproducible.
+    let mut state = fnv1a(&format!("order:{seed}"));
+    for i in (1..questions.len()).rev() {
+        let j = (next_u64(&mut state) % (i as u64 + 1)) as usize;
+        questions.swap(i, j);
+    }
+
+    questions
 }
 
 /// Pull the tool call's arguments out of the response.
@@ -427,7 +669,7 @@ fn parse(input: serde_json::Value) -> Result<GeneratedQuiz> {
 /// The vocabulary, the answer letter and the format are guaranteed by
 /// deserialization instead, and there is deliberately no code here re-checking
 /// them: a second copy of a rule is a second place for it to be wrong.
-fn validate(title: &str, topics: &[Topic], questions: &[Question]) -> Result<()> {
+fn validate(title: &str, topics: &[Topic], quiz: &GeneratedQuiz) -> Result<()> {
     let title_len = title.chars().count();
     if !(limits::TITLE_MIN..=limits::TITLE_MAX).contains(&title_len) {
         return Err(Error::Invalid(format!(
@@ -445,30 +687,51 @@ fn validate(title: &str, topics: &[Topic], questions: &[Question]) -> Result<()>
         ));
     }
 
-    if questions.len() != QUESTIONS_PER_DOC {
+    if quiz.choice_questions.len() != CHOICE_QUESTIONS_PER_DOC {
         return Err(Error::Invalid(format!(
-            "the model returned {} questions, expected {QUESTIONS_PER_DOC}",
-            questions.len()
+            "the model returned {} multiple-choice questions, expected {CHOICE_QUESTIONS_PER_DOC}",
+            quiz.choice_questions.len()
+        )));
+    }
+    if quiz.numeric_questions.len() != NUMERIC_QUESTIONS_PER_DOC {
+        return Err(Error::Invalid(format!(
+            "the model returned {} numeric questions, expected {NUMERIC_QUESTIONS_PER_DOC}",
+            quiz.numeric_questions.len()
         )));
     }
 
+    // Shared across both arrays. The two are assembled into one list, so an id
+    // reused between them is the same collision as one reused within either:
+    // the browser keys its list by id, and a submitted answer would be
+    // ambiguous at grading time.
     let mut seen_ids = std::collections::HashSet::new();
-
-    for (i, q) in questions.iter().enumerate() {
-        let n = i + 1;
-
-        // Duplicate ids would silently collapse when the browser keys its list
-        // by id, and would make a submitted answer ambiguous at grading time.
-        if !seen_ids.insert(q.id.as_str()) {
+    let mut claim = |id: &str| -> Result<()> {
+        if !seen_ids.insert(id.to_string()) {
             return Err(Error::Invalid(format!(
-                "the model returned two questions with id {:?}",
-                q.id
+                "the model returned two questions with id {id:?}"
+            )));
+        }
+        Ok(())
+    };
+
+    for (i, q) in quiz.choice_questions.iter().enumerate() {
+        let n = format!("multiple-choice question {}", i + 1);
+        claim(&q.id)?;
+        check_prompt(&n, &q.prompt)?;
+        check_explanation(&n, &q.explanation)?;
+
+        // Belt and braces against the schema's `enum` being ignored. This is
+        // the rule that keeps invented statistics out of the option lists, so
+        // it is not left to the schema alone.
+        if q.skill == NUMERIC_SKILL {
+            return Err(Error::Invalid(format!(
+                "{n} is tagged {NUMERIC_SKILL}, which belongs in the numeric questions"
             )));
         }
 
         if q.options.len() != OPTIONS_PER_QUESTION {
             return Err(Error::Invalid(format!(
-                "question {n} has {} options, expected {OPTIONS_PER_QUESTION}",
+                "{n} has {} options, expected {OPTIONS_PER_QUESTION}",
                 q.options.len()
             )));
         }
@@ -478,30 +741,14 @@ fn validate(title: &str, topics: &[Topic], questions: &[Question]) -> Result<()>
         // shuffle below safe.
         if q.answer.index() >= q.options.len() {
             return Err(Error::Invalid(format!(
-                "question {n} answers with an option it does not have"
-            )));
-        }
-
-        let prompt_len = q.prompt.trim().chars().count();
-        if !(limits::PROMPT_MIN..=limits::PROMPT_MAX).contains(&prompt_len) {
-            return Err(Error::Invalid(format!(
-                "question {n} has a {prompt_len}-character prompt"
-            )));
-        }
-
-        let explanation_len = q.explanation.trim().chars().count();
-        if !(limits::EXPLANATION_MIN..=limits::EXPLANATION_MAX).contains(&explanation_len) {
-            return Err(Error::Invalid(format!(
-                "question {n} has a {explanation_len}-character explanation"
+                "{n} answers with an option it does not have"
             )));
         }
 
         for option in &q.options {
             let len = option.trim().chars().count();
             if !(limits::OPTION_MIN..=limits::OPTION_MAX).contains(&len) {
-                return Err(Error::Invalid(format!(
-                    "question {n} has a {len}-character option"
-                )));
+                return Err(Error::Invalid(format!("{n} has a {len}-character option")));
             }
         }
 
@@ -509,10 +756,58 @@ fn validate(title: &str, topics: &[Topic], questions: &[Question]) -> Result<()>
         // choices where one is keyed correct and the other is not.
         let unique: std::collections::HashSet<&str> = q.options.iter().map(|o| o.trim()).collect();
         if unique.len() != q.options.len() {
-            return Err(Error::Invalid(format!("question {n} repeats an option")));
+            return Err(Error::Invalid(format!("{n} repeats an option")));
         }
     }
 
+    let distinct_skills: std::collections::HashSet<Skill> =
+        quiz.choice_questions.iter().map(|q| q.skill).collect();
+    if distinct_skills.len() < MIN_DISTINCT_CHOICE_SKILLS {
+        return Err(Error::Invalid(format!(
+            "the model used only {} of the available skills; a quiz that measures one thing \
+             cannot be segmented",
+            distinct_skills.len()
+        )));
+    }
+
+    for (i, q) in quiz.numeric_questions.iter().enumerate() {
+        let n = format!("numeric question {}", i + 1);
+        claim(&q.id)?;
+        check_prompt(&n, &q.prompt)?;
+        check_explanation(&n, &q.explanation)?;
+
+        // The tolerance rules live on `NumericAnswer` rather than here, because
+        // grading depends on them too and a second copy is a second place for
+        // them to be wrong.
+        NumericAnswer {
+            value: q.value,
+            tolerance: q.tolerance,
+            unit: q.unit.clone(),
+        }
+        .validate()
+        .map_err(|why| Error::Invalid(format!("{n}: {why}")))?;
+    }
+
+    Ok(())
+}
+
+fn check_prompt(which: &str, prompt: &str) -> Result<()> {
+    let len = prompt.trim().chars().count();
+    if !(limits::PROMPT_MIN..=limits::PROMPT_MAX).contains(&len) {
+        return Err(Error::Invalid(format!(
+            "{which} has a {len}-character prompt"
+        )));
+    }
+    Ok(())
+}
+
+fn check_explanation(which: &str, explanation: &str) -> Result<()> {
+    let len = explanation.trim().chars().count();
+    if !(limits::EXPLANATION_MIN..=limits::EXPLANATION_MAX).contains(&len) {
+        return Err(Error::Invalid(format!(
+            "{which} has a {len}-character explanation"
+        )));
+    }
     Ok(())
 }
 
@@ -528,10 +823,19 @@ fn validate(title: &str, topics: &[Topic], questions: &[Question]) -> Result<()>
 ///
 /// Seeded from the document id rather than the clock, so regenerating a
 /// document produces the same arrangement and a bug here is reproducible.
+///
+/// Numeric questions pass through untouched: they have no options and no
+/// letter, so there is no position to give anything away. That is one of the
+/// quieter benefits of the format — the bias this function exists to correct
+/// cannot arise there at all.
 fn shuffle_options(questions: &mut [Question], seed: &str) {
     let mut state = fnv1a(seed);
 
     for q in questions.iter_mut() {
+        let Some(answer) = q.answer else {
+            continue;
+        };
+
         let mut order: Vec<usize> = (0..q.options.len()).collect();
 
         // Fisher-Yates, which is uniform. Repeatedly swapping random pairs is
@@ -541,7 +845,7 @@ fn shuffle_options(questions: &mut [Question], seed: &str) {
             order.swap(i, j);
         }
 
-        let was_correct = q.answer.index();
+        let was_correct = answer.index();
         q.options = order.iter().map(|&i| q.options[i].clone()).collect();
 
         // `order` is a permutation of every index, so the old correct index is
@@ -554,7 +858,7 @@ fn shuffle_options(questions: &mut [Question], seed: &str) {
             .and_then(|pos| Choice::ALL.get(pos).copied());
 
         if let Some(choice) = now_correct {
-            q.answer = choice;
+            q.answer = Some(choice);
         }
     }
 }
@@ -647,54 +951,103 @@ fn document_to_json(document: &Document) -> serde_json::Value {
 mod tests {
     use super::*;
 
-    fn question_json(i: usize, options: usize) -> String {
+    /// Cycles the permitted skills so the fixture satisfies the spread rule
+    /// without every test having to think about it.
+    fn choice_json(i: usize, options: usize) -> String {
+        const SPREAD: [&str; 4] = ["causal", "relational", "definitional", "scope"];
         let opts: Vec<String> = (0..options)
             .map(|j| format!("\"option {i}-{j}\""))
             .collect();
         format!(
-            r#"{{"id":"q{i}","skill":"causal",
+            r#"{{"id":"c{i}","skill":"{}",
                 "prompt":"why does this document say {i} happened?",
                 "options":[{}],"answer":"a",
                 "explanation":"stated in the section on {i}, second paragraph"}}"#,
+            SPREAD[(i - 1) % SPREAD.len()],
             opts.join(",")
         )
     }
 
-    fn quiz_json(questions: usize, options: usize) -> serde_json::Value {
-        let qs: Vec<String> = (1..=questions).map(|i| question_json(i, options)).collect();
+    fn numeric_json(i: usize) -> String {
+        format!(
+            r#"{{"id":"n{i}","prompt":"what was the {i}th figure, in percent?",
+                "value":-4.0,"tolerance":1.0,"unit":"%",
+                "explanation":"printed in table {i}, the second row"}}"#
+        )
+    }
+
+    fn quiz_json(choice: usize, options: usize, numeric: usize) -> serde_json::Value {
+        let cs: Vec<String> = (1..=choice).map(|i| choice_json(i, options)).collect();
+        let ns: Vec<String> = (1..=numeric).map(numeric_json).collect();
         serde_json::from_str(&format!(
-            r#"{{"title":"A Reference Document","topics":["fiscal"],"questions":[{}]}}"#,
-            qs.join(",")
+            r#"{{"title":"A Reference Document","topics":["fiscal"],
+                "choice_questions":[{}],"numeric_questions":[{}]}}"#,
+            cs.join(","),
+            ns.join(",")
         ))
         .expect("test fixture is valid json")
     }
 
-    fn parsed(questions: usize, options: usize) -> (String, Vec<Topic>, Vec<Question>) {
-        let quiz = parse(quiz_json(questions, options)).expect("parses");
+    /// The shape every test starts from: a quiz that passes.
+    fn good() -> serde_json::Value {
+        quiz_json(
+            CHOICE_QUESTIONS_PER_DOC,
+            OPTIONS_PER_QUESTION,
+            NUMERIC_QUESTIONS_PER_DOC,
+        )
+    }
+
+    fn check(value: serde_json::Value) -> Result<Vec<Question>> {
+        let quiz = parse(value)?;
         let topics = tags::normalise(&quiz.topics);
-        (quiz.title, topics, quiz.questions)
+        validate(&quiz.title, &topics, &quiz)?;
+        Ok(assemble(quiz, "doc-under-test"))
     }
 
     #[test]
     fn a_well_formed_quiz_is_accepted() {
-        let (title, topics, questions) = parsed(10, 4);
-        validate(&title, &topics, &questions).expect("validates");
+        let questions = check(good()).expect("validates");
+        assert_eq!(questions.len(), QUESTIONS_PER_DOC);
+        assert_eq!(
+            questions
+                .iter()
+                .filter(|q| q.format == QuestionFormat::Numeric)
+                .count(),
+            NUMERIC_QUESTIONS_PER_DOC
+        );
+        // Every assembled question must be gradeable. `body()` returning `None`
+        // is the one failure the API cannot recover from at submit time.
+        assert!(questions.iter().all(|q| q.body().is_some()));
     }
 
     #[test]
-    fn wrong_question_count_is_rejected() {
-        let (title, topics, questions) = parsed(9, 4);
-        assert!(matches!(
-            validate(&title, &topics, &questions),
-            Err(Error::Invalid(_))
-        ));
+    fn wrong_question_counts_are_rejected() {
+        for (choice, numeric) in [
+            (CHOICE_QUESTIONS_PER_DOC - 1, NUMERIC_QUESTIONS_PER_DOC),
+            (CHOICE_QUESTIONS_PER_DOC, NUMERIC_QUESTIONS_PER_DOC - 1),
+            (CHOICE_QUESTIONS_PER_DOC, NUMERIC_QUESTIONS_PER_DOC + 1),
+            // Ten questions, all multiple choice — the shape this change
+            // exists to make impossible.
+            (QUESTIONS_PER_DOC, 0),
+        ] {
+            assert!(
+                matches!(
+                    check(quiz_json(choice, OPTIONS_PER_QUESTION, numeric)),
+                    Err(Error::Invalid(_))
+                ),
+                "{choice} choice + {numeric} numeric was accepted"
+            );
+        }
     }
 
     #[test]
     fn wrong_option_count_is_rejected() {
-        let (title, topics, questions) = parsed(10, 3);
         assert!(matches!(
-            validate(&title, &topics, &questions),
+            check(quiz_json(
+                CHOICE_QUESTIONS_PER_DOC,
+                3,
+                NUMERIC_QUESTIONS_PER_DOC
+            )),
             Err(Error::Invalid(_))
         ));
     }
@@ -704,70 +1057,109 @@ mod tests {
     /// `limits::PROMPT_MAX`; this test fails if one is ever hardcoded.
     #[test]
     fn an_over_long_prompt_is_rejected() {
-        let (title, topics, mut questions) = parsed(10, 4);
-        questions[3].prompt = "x".repeat(limits::PROMPT_MAX + 1);
-        assert!(matches!(
-            validate(&title, &topics, &questions),
-            Err(Error::Invalid(_))
-        ));
+        let mut quiz = good();
+        quiz["choice_questions"][3]["prompt"] = json!("x".repeat(limits::PROMPT_MAX + 1));
+        assert!(matches!(check(quiz), Err(Error::Invalid(_))));
+
+        let mut quiz = good();
+        quiz["numeric_questions"][1]["prompt"] = json!("x".repeat(limits::PROMPT_MAX + 1));
+        assert!(matches!(check(quiz), Err(Error::Invalid(_))));
     }
 
     #[test]
     fn a_document_with_no_usable_topics_is_rejected() {
         // Every tag a compound or a connective, so `normalise` yields nothing.
-        let (title, _, questions) = parsed(10, 4);
-        let topics = tags::normalise(["and", "of"]);
-        assert!(topics.is_empty(), "fixture assumption");
-        assert!(matches!(
-            validate(&title, &topics, &questions),
-            Err(Error::Invalid(_))
-        ));
+        let mut quiz = good();
+        quiz["topics"] = json!(["and", "of"]);
+        assert!(matches!(check(quiz), Err(Error::Invalid(_))));
     }
 
     /// The vocabulary check, which lives in the deserializer rather than in
     /// `validate`. This is the case the closed enums exist for.
     #[test]
     fn an_invented_skill_is_rejected_at_parse_time() {
-        let mut quiz = quiz_json(10, 4);
-        quiz["questions"][0]["skill"] = json!("macroeconomic");
+        let mut quiz = good();
+        quiz["choice_questions"][0]["skill"] = json!("macroeconomic");
         assert!(matches!(parse(quiz), Err(Error::Invalid(_))));
+    }
+
+    /// **The rule that keeps invented statistics out of the option lists.**
+    /// The schema states it as an `enum`, but Bedrock does not enforce a tool
+    /// schema, so a model that ignores it must still be caught.
+    #[test]
+    fn a_figure_recall_question_may_not_be_multiple_choice() {
+        let mut quiz = good();
+        quiz["choice_questions"][0]["skill"] = json!(NUMERIC_SKILL.as_str());
+        assert!(matches!(check(quiz), Err(Error::Invalid(_))));
+    }
+
+    #[test]
+    fn a_quiz_that_measures_one_thing_is_rejected() {
+        let mut quiz = good();
+        for i in 0..CHOICE_QUESTIONS_PER_DOC {
+            quiz["choice_questions"][i]["skill"] = json!("definitional");
+        }
+        assert!(matches!(check(quiz), Err(Error::Invalid(_))));
     }
 
     #[test]
     fn an_answer_outside_a_to_d_is_rejected_at_parse_time() {
-        let mut quiz = quiz_json(10, 4);
-        quiz["questions"][0]["answer"] = json!("e");
+        let mut quiz = good();
+        quiz["choice_questions"][0]["answer"] = json!("e");
         assert!(matches!(parse(quiz), Err(Error::Invalid(_))));
     }
 
     #[test]
     fn duplicate_options_are_rejected() {
-        let mut quiz = quiz_json(10, 4);
-        quiz["questions"][0]["options"][1] = quiz["questions"][0]["options"][0].clone();
-        let quiz = parse(quiz).expect("parses");
-        let topics = tags::normalise(&quiz.topics);
-        assert!(matches!(
-            validate(&quiz.title, &topics, &quiz.questions),
-            Err(Error::Invalid(_))
-        ));
+        let mut quiz = good();
+        quiz["choice_questions"][0]["options"][1] =
+            quiz["choice_questions"][0]["options"][0].clone();
+        assert!(matches!(check(quiz), Err(Error::Invalid(_))));
+    }
+
+    /// An id reused *between* the two arrays is the same collision as one
+    /// reused within either, because they are assembled into one list.
+    #[test]
+    fn an_id_reused_across_the_two_arrays_is_rejected() {
+        let mut quiz = good();
+        quiz["numeric_questions"][0]["id"] = quiz["choice_questions"][0]["id"].clone();
+        assert!(matches!(check(quiz), Err(Error::Invalid(_))));
+    }
+
+    /// The tolerance rules are enforced by `NumericAnswer::validate`, which
+    /// grading also depends on. This checks they are actually reached from
+    /// here — a numeric question that skipped them would be stored with a
+    /// tolerance that makes it unanswerable or free.
+    #[test]
+    fn a_useless_tolerance_is_rejected() {
+        for tolerance in [json!(0), json!(-1), json!(0.0001), json!(1000)] {
+            let mut quiz = good();
+            quiz["numeric_questions"][0]["tolerance"] = tolerance.clone();
+            assert!(
+                matches!(check(quiz), Err(Error::Invalid(_))),
+                "tolerance {tolerance} was accepted"
+            );
+        }
     }
 
     /// The property the shuffle exists for: the correct *text* must survive,
     /// even though the correct *letter* changes.
     #[test]
     fn shuffling_moves_the_letter_but_not_the_answer() {
-        let (_, _, mut questions) = parsed(10, 4);
-
-        let before: Vec<String> = questions
+        let quiz = parse(good()).expect("parses");
+        let before: Vec<(String, String)> = quiz
+            .choice_questions
             .iter()
-            .map(|q| q.options[q.answer.index()].clone())
+            .map(|q| (q.id.clone(), q.options[q.answer.index()].clone()))
             .collect();
 
-        shuffle_options(&mut questions, "doc-under-test");
+        let questions = assemble(quiz, "doc-under-test");
 
-        for (q, expected) in questions.iter().zip(&before) {
+        for (id, expected) in before {
+            let q = questions.iter().find(|q| q.id == id).expect("survives");
+            let answer = q.answer.expect("multiple choice keeps its letter");
             assert_eq!(
-                &q.options[q.answer.index()],
+                q.options[answer.index()],
                 expected,
                 "the answer key must still point at the same text"
             );
@@ -780,32 +1172,47 @@ mod tests {
         // Every fixture question keys "a". If the shuffle were a no-op this
         // test would pass silently against a broken implementation, so assert
         // the distribution changed rather than that it is uniform.
-        let (_, _, mut questions) = parsed(10, 4);
-        shuffle_options(&mut questions, "doc-under-test");
+        let questions = check(good()).expect("validates");
         assert!(
-            questions.iter().any(|q| q.answer != Choice::A),
+            questions
+                .iter()
+                .any(|q| q.answer.is_some_and(|a| a != Choice::A)),
             "shuffle left every answer at 'a'"
         );
     }
 
+    /// Without this the three typed questions are always the last three, and
+    /// the reader learns the position instead of reading the prompt.
     #[test]
-    fn shuffling_is_reproducible_for_a_document() {
-        let (_, _, mut first) = parsed(10, 4);
-        let (_, _, mut second) = parsed(10, 4);
-        shuffle_options(&mut first, "same-doc");
-        shuffle_options(&mut second, "same-doc");
+    fn the_numeric_questions_are_not_all_at_the_end() {
+        let questions = check(good()).expect("validates");
+        let tail = &questions[QUESTIONS_PER_DOC - NUMERIC_QUESTIONS_PER_DOC..];
+        assert!(
+            !tail.iter().all(|q| q.format == QuestionFormat::Numeric),
+            "the numeric questions are still bunched at the end"
+        );
+    }
 
-        let keys = |qs: &[Question]| qs.iter().map(|q| q.answer).collect::<Vec<_>>();
-        assert_eq!(keys(&first), keys(&second));
+    #[test]
+    fn assembly_is_reproducible_for_a_document() {
+        let first = assemble(parse(good()).expect("parses"), "same-doc");
+        let second = assemble(parse(good()).expect("parses"), "same-doc");
+
+        let fingerprint = |qs: &[Question]| {
+            qs.iter()
+                .map(|q| (q.id.clone(), q.answer, q.format))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(fingerprint(&first), fingerprint(&second));
     }
 
     /// The schema is generated, so it can silently stop mentioning a skill the
     /// deserializer still accepts. That drift is exactly what produced a 100%
     /// failure rate under the old prose prompt.
     #[test]
-    fn the_schema_lists_the_whole_closed_vocabulary() {
+    fn the_schema_lists_the_choice_vocabulary_and_excludes_the_numeric_one() {
         let schema = quiz_schema(&[]).to_string();
-        for skill in Skill::ALL {
+        for skill in Skill::ALL.iter().filter(|s| **s != NUMERIC_SKILL) {
             assert!(
                 schema.contains(skill.as_str()),
                 "schema omits skill {skill}"
@@ -814,6 +1221,13 @@ mod tests {
         for choice in Choice::ALL {
             assert!(schema.contains(choice.as_str()));
         }
+
+        // And the numeric array must not offer a skill field at all — if it
+        // did, the model could tag a typed figure as `causal` and the history
+        // matrix would stop meaning what it says.
+        let numeric = &quiz_schema(&[])["properties"]["numeric_questions"]["items"];
+        assert!(numeric["properties"]["skill"].is_null());
+        assert!(numeric["properties"]["options"].is_null());
     }
 
     #[test]

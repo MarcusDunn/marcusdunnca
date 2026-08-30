@@ -17,7 +17,7 @@
 use serde::Serialize;
 use trainer_core::error::{Error, Result};
 use trainer_core::model::Attempt;
-use trainer_core::tags::{QuestionFormat, Skill, Topic};
+use trainer_core::tags::{Confidence, QuestionFormat, Skill, Topic};
 
 use crate::state::AppState;
 
@@ -91,6 +91,17 @@ pub struct HistoryQuestionDto {
     pub skill: Skill,
     pub topics: Vec<Topic>,
     pub correct: bool,
+    /// Absent on every question answered before confidence was asked for.
+    ///
+    /// **The client must drop these from the reliability table rather than
+    /// bucket them.** An answer given without a confidence being requested says
+    /// nothing about calibration, and folding it into the lowest band would
+    /// invent a claim the reader never made — which is precisely the error the
+    /// table exists to detect in the reader.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<Confidence>,
+    /// Points as awarded at the time. See `AttemptResponse::points`.
+    pub points: i32,
 }
 
 #[derive(Debug, Serialize)]
@@ -149,6 +160,8 @@ fn narrow(attempt: Attempt, filter: &HistoryFilter) -> Option<HistoryAttemptDto>
                 r.topics
             },
             correct: r.correct,
+            confidence: r.confidence,
+            points: r.points,
         })
         .collect();
 
@@ -193,6 +206,9 @@ mod tests {
                     skill,
                     topics: vec![Topic::parse("fiscal").expect("a valid topic")],
                     answer: Some(Choice::A),
+                    answer_text: None,
+                    confidence: Some(Confidence::FairlySure),
+                    points: Confidence::FairlySure.points(correct),
                     correct,
                 })
                 .collect(),
@@ -201,6 +217,8 @@ mod tests {
             duration_ms: 0,
             score: 0,
             total: 0,
+            points: 0,
+            max_points: 0,
         }
     }
 
@@ -223,6 +241,8 @@ mod tests {
             "skill",
             "topics",
             "correct",
+            "confidence",
+            "points",
         ] {
             assert!(
                 json.contains(required),
@@ -230,6 +250,22 @@ mod tests {
             );
         }
         assert_eq!(entry.questions.len(), 2);
+    }
+
+    /// The distinction the reliability table depends on. A response recorded
+    /// before confidence existed must arrive with the field absent, so the
+    /// client can exclude it — not defaulted to a band the reader never chose.
+    #[test]
+    fn a_response_with_no_confidence_omits_the_field_rather_than_inventing_one() {
+        let mut attempt = attempt_with(vec![Skill::Causal], vec![true]);
+        attempt.responses[0].confidence = None;
+        attempt.responses[0].points = 0;
+
+        let entry = narrow(attempt, &HistoryFilter::default()).expect("unfiltered");
+        let json = serde_json::to_string(&entry).expect("serializes");
+
+        assert!(!json.contains("confidence"), "invented a band: {json}");
+        assert!(json.contains("points"));
     }
 
     #[test]

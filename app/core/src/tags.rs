@@ -54,7 +54,20 @@
 /// version 1 carry topics drawn from the original eight and chosen by hand;
 /// attempts stamped 2 carry topics chosen by the model from an open set. Both
 /// are meaningful, they are just not the same measurement.
-pub const TAG_VERSION: u32 = 2;
+///
+/// Version 3 is where two things changed at once, both of which make an
+/// attempt's numbers mean something different:
+///
+///   - [`Confidence`] arrived, so a version-3 attempt has a points total and a
+///     calibration record and a version-2 attempt has neither. Absence is not a
+///     zero — those questions were answered without a confidence being asked
+///     for, so they cannot be pooled into a reliability estimate.
+///   - [`QuestionFormat::Numeric`] arrived and took [`Skill::FigureRecall`] with
+///     it. From version 3 a figure-recall question is typed, not picked from
+///     four options, so a version-2 figure-recall rate and a version-3 one are
+///     rates on different tasks. Guessing gets you 25% on one and 0% on the
+///     other.
+pub const TAG_VERSION: u32 = 3;
 
 /// Upper bound on how many topics one document may carry.
 ///
@@ -133,27 +146,128 @@ macro_rules! closed_vocab {
 closed_vocab! {
     /// How a question is presented and graded.
     ///
-    /// Exactly one member today. It is still an enum rather than an implicit
-    /// assumption because grading branches on it: `multiple_choice` is graded
-    /// by equality in the handler, and anything added later (short answer,
-    /// ordering) will not be, so the grader needs somewhere to dispatch.
+    /// Grading dispatches on this, which is the reason it is an enum rather
+    /// than an implicit assumption: `multiple_choice` is graded by comparing
+    /// letters, `numeric` by parsing a typed number and comparing it against a
+    /// tolerance, and the two share no code.
+    ///
+    /// **Both are still graded in this process, deterministically, with no
+    /// model call.** That is the property to preserve when a third format is
+    /// added. A format whose grading is a model call is a format whose scores
+    /// drift when the model changes, and a score series that silently changes
+    /// scale is worse than no score series.
     QuestionFormat {
         MultipleChoice => "multiple_choice",
+        Numeric        => "numeric",
     }
 }
 
-/// The only format that exists today.
+/// What a question with no stated format is.
 ///
-/// A `Default` impl on a one-variant enum looks redundant and is not: it is
-/// what lets [`crate::model::Question`] accept a question with no `format` at
-/// all, which is how the model is now asked for them. Handing a model a field
-/// with exactly one legal value is all downside — it cannot add information,
-/// and it can be filled in wrongly. It was: Sonnet returned
-/// `"format": "definitional"`, putting a *skill* in the format field, and the
-/// whole generation was discarded over a value that was never in question.
+/// **This is a compatibility rule, not a preference.** Every question written
+/// before `numeric` existed was multiple choice, and the generator was
+/// deliberately not asked for a `format` — handing a model a field with one
+/// legal value is all downside, and Sonnet proved it by returning
+/// `"format": "definitional"` and costing a whole generation.
+///
+/// Now that there are two formats the generator is *still* not asked, because
+/// it is still not a judgement call: the two kinds of question are requested in
+/// two separate arrays, so the handler knows which is which without asking. See
+/// `bedrock::assemble`.
 impl Default for QuestionFormat {
     fn default() -> Self {
         Self::MultipleChoice
+    }
+}
+
+closed_vocab! {
+    /// How sure the reader was, recorded with the answer.
+    ///
+    /// # Why this exists
+    ///
+    /// Accuracy alone cannot distinguish the two failures that matter in an
+    /// argument: not knowing something, and *not knowing that you don't know
+    /// it*. The second is the one that ends badly, and it is invisible in a
+    /// score out of ten. Recording a confidence alongside every answer makes it
+    /// measurable — and, because the scoring below is proper, makes it worth
+    /// reporting honestly.
+    ///
+    /// The band names are deliberately about consequences rather than feelings.
+    /// "Certain" means *I would say this on the record*, which is a decision,
+    /// not a mood.
+    Confidence {
+        Guessing   => "guessing",
+        FairlySure => "fairly_sure",
+        Certain    => "certain",
+    }
+}
+
+impl Confidence {
+    /// Points for an answer in this band.
+    ///
+    /// # This table is derived, not chosen
+    ///
+    /// A scoring rule is **proper** when the highest expected score comes from
+    /// reporting the confidence you actually hold. Most hand-written schemes
+    /// are not — "+3 if certain and right, −3 if certain and wrong" pays you to
+    /// misreport, which makes the resulting calibration record meaningless.
+    ///
+    /// Writing `S(band, correct)` for the entries below, the reader with a true
+    /// belief `p` that they are right earns `p·S(b, true) + (1−p)·S(b, false)`.
+    /// Two bands are equally good at the `p` where those expectations cross, so
+    /// picking the crossover points *defines* the table:
+    ///
+    /// ```text
+    /// guessing ↔ fairly_sure at p = 0.50:
+    ///     0.50·(1−2) = 0.50·(S_wrong(fairly_sure) − 0)   →  −1
+    /// fairly_sure ↔ certain at p = 0.80:
+    ///     0.80·(2−3) = 0.20·(S_wrong(certain) − (−1))    →  −5
+    /// ```
+    ///
+    /// # Why 0.50 and 0.80 rather than the published 0.67 and 0.80
+    ///
+    /// The scheme this is modelled on — Gardner-Medwin's certainty-based
+    /// marking, used in UCL's summative medical exams — sits at 0.67/0.80. Those
+    /// thresholds are correct for **true/false** questions, where guessing pays
+    /// 0.5. Multiple choice here has four options, so guessing pays 0.25 and the
+    /// bottom band has to start lower or it would never be the right report.
+    ///
+    /// # The floor is zero, not a penalty
+    ///
+    /// `guessing` + wrong scores 0. Saying "I don't know" is a *correct*
+    /// statement about your own knowledge and must never cost anything, or the
+    /// rule teaches you to bluff — the exact habit this is meant to train out.
+    pub const fn points(&self, correct: bool) -> i32 {
+        match (self, correct) {
+            (Confidence::Guessing, true) => 1,
+            (Confidence::Guessing, false) => 0,
+            (Confidence::FairlySure, true) => 2,
+            (Confidence::FairlySure, false) => -1,
+            (Confidence::Certain, true) => 3,
+            (Confidence::Certain, false) => -5,
+        }
+    }
+
+    /// The best score any single answer can earn. Used to report a total
+    /// against its ceiling rather than as a bare number.
+    pub const MAX_POINTS_PER_QUESTION: i32 = 3;
+
+    /// The belief range this band is the best report for, as percentages.
+    ///
+    /// Shown in the UI next to the band. The thresholds *are* the training
+    /// signal — a band labelled only "fairly sure" asks for a feeling, whereas
+    /// one labelled "50–80%" asks for a judgement you can be wrong about.
+    pub const fn belief_range(&self) -> (u8, u8) {
+        match self {
+            // The floor is 25 rather than 0 because four options means you
+            // cannot honestly hold less than a one-in-four belief in a guess.
+            // On a numeric question the true floor is ~0, and quoting 25 there
+            // would be wrong — so this is documented as the multiple-choice
+            // reading and the UI does not print the lower bound for `guessing`.
+            Confidence::Guessing => (25, 50),
+            Confidence::FairlySure => (50, 80),
+            Confidence::Certain => (80, 100),
+        }
     }
 }
 
@@ -459,6 +573,95 @@ mod tests {
         assert_eq!(Choice::ALL.len(), 4);
         for (i, c) in Choice::ALL.iter().enumerate() {
             assert_eq!(c.index(), i);
+        }
+    }
+
+    /// Expected score for reporting `band` while actually believing `p`.
+    fn expected(band: Confidence, p: f64) -> f64 {
+        p * f64::from(band.points(true)) + (1.0 - p) * f64::from(band.points(false))
+    }
+
+    /// **The property the whole confidence feature rests on.**
+    ///
+    /// If reporting a band you do not hold ever pays better than reporting the
+    /// one you do, the calibration record measures strategy rather than belief
+    /// and every reliability number computed from it is fiction. This walks the
+    /// belief range and asserts the honest report always wins.
+    ///
+    /// It is written against `points` rather than against the derivation in the
+    /// doc comment on purpose: the comment explains the table, this checks it.
+    #[test]
+    fn the_scoring_rule_is_proper() {
+        // Away from the crossovers themselves, where two bands legitimately tie.
+        let honest = |p: f64| {
+            if p < 0.50 {
+                Confidence::Guessing
+            } else if p < 0.80 {
+                Confidence::FairlySure
+            } else {
+                Confidence::Certain
+            }
+        };
+
+        for step in 0..=1000 {
+            let p = f64::from(step) / 1000.0;
+            // Skip the exact indifference points.
+            if (p - 0.50).abs() < 1e-9 || (p - 0.80).abs() < 1e-9 {
+                continue;
+            }
+
+            let truthful = honest(p);
+            for band in Confidence::ALL {
+                if *band == truthful {
+                    continue;
+                }
+                assert!(
+                    expected(truthful, p) > expected(*band, p),
+                    "at p={p}, reporting {band} beats the honest {truthful} — \
+                     the rule is not proper"
+                );
+            }
+        }
+    }
+
+    /// The crossovers must sit where `belief_range` says they do, or the UI is
+    /// printing thresholds that do not match the scoring.
+    #[test]
+    fn the_advertised_thresholds_are_the_real_ones() {
+        for (lower, upper) in Confidence::ALL.iter().map(|c| c.belief_range()) {
+            assert!(
+                lower < upper,
+                "an empty band would never be worth reporting"
+            );
+        }
+
+        // Ties, exactly at the advertised boundaries.
+        let eps = 1e-12;
+        assert!(
+            (expected(Confidence::Guessing, 0.50) - expected(Confidence::FairlySure, 0.50)).abs()
+                < eps
+        );
+        assert!(
+            (expected(Confidence::FairlySure, 0.80) - expected(Confidence::Certain, 0.80)).abs()
+                < eps
+        );
+
+        // And those boundaries are the ones shown to the reader.
+        assert_eq!(Confidence::Guessing.belief_range().1, 50);
+        assert_eq!(Confidence::FairlySure.belief_range().1, 80);
+    }
+
+    /// Admitting ignorance must be free. If this ever goes negative the rule
+    /// starts paying for bluffing, which is the habit it exists to train out.
+    #[test]
+    fn saying_you_do_not_know_never_costs_anything() {
+        assert_eq!(Confidence::Guessing.points(false), 0);
+        for band in Confidence::ALL {
+            assert!(
+                band.points(true) > 0,
+                "a correct answer must never score zero or less"
+            );
+            assert!(band.points(true) <= Confidence::MAX_POINTS_PER_QUESTION);
         }
     }
 }

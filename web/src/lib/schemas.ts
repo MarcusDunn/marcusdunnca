@@ -13,8 +13,56 @@ import { z } from "zod";
  * "know about" a tag in advance.
  * ------------------------------------------------------------------ */
 
-export const QuestionFormat = z.enum(["multiple_choice"]);
+export const QuestionFormat = z.enum(["multiple_choice", "numeric"]);
 export type QuestionFormat = z.infer<typeof QuestionFormat>;
+
+/**
+ * How sure the reader says they are, recorded with every answer.
+ *
+ * The bands are scored by a *proper* rule — see `Confidence::points` in
+ * `app/core/src/tags.rs`, which derives the table rather than picking it. The
+ * only thing that matters on this side is that the thresholds shown to the
+ * reader are the ones the server actually scores against, which is why
+ * CONFIDENCE_BOUNDS below is not a rounded-off paraphrase.
+ */
+export const Confidence = z.enum(["guessing", "fairly_sure", "certain"]);
+export type Confidence = z.infer<typeof Confidence>;
+export const CONFIDENCE_BANDS = Confidence.options;
+
+export const CONFIDENCE_LABELS: Record<Confidence, string> = {
+  guessing: "Guessing",
+  fairly_sure: "Fairly sure",
+  certain: "Certain",
+};
+
+/**
+ * What each band commits you to, in points.
+ *
+ * **Display only — the server computes every score.** This exists so the reader
+ * can see the price of a claim *before* making it; a cost revealed only
+ * afterwards trains nothing.
+ *
+ * It is therefore a second copy of a table that lives in `Confidence::points`,
+ * and there is no test holding the two together, because this package has no
+ * test runner (issue #33). What limits the damage is that the copy is never
+ * used to compute anything: the points on the results screen and in history are
+ * the server's, so a drift here misinforms the reader about the price without
+ * changing what they are charged. Worth fixing, not worth a wrong abstraction.
+ */
+export const CONFIDENCE_POINTS: Record<Confidence, { correct: number; wrong: number }> = {
+  guessing: { correct: 1, wrong: 0 },
+  fairly_sure: { correct: 2, wrong: -1 },
+  certain: { correct: 3, wrong: -5 },
+};
+
+/** The belief range each band is the best report for, as percentages. */
+export const CONFIDENCE_BOUNDS: Record<Confidence, { low: number; high: number }> = {
+  guessing: { low: 25, high: 50 },
+  fairly_sure: { low: 50, high: 80 },
+  certain: { low: 80, high: 100 },
+};
+
+export const MAX_POINTS_PER_QUESTION = 3;
 
 export const Skill = z.enum([
   "figure_recall",
@@ -47,6 +95,25 @@ export type Topic = z.infer<typeof Topic>;
 export const SKILLS = Skill.options;
 export const FORMATS = QuestionFormat.options;
 
+/**
+ * Which skills each format can produce, as of tag version 3.
+ *
+ * Not a cosmetic grouping — it is the rule that keeps invented statistics out
+ * of the option lists, mirrored from `NUMERIC_SKILL` in
+ * `app/generate/src/bedrock.rs`. A question about a figure is asked as a typed
+ * figure, so `figure_recall` is now numeric-only and the other four are
+ * multiple-choice-only.
+ *
+ * The history matrix uses this to decide which rows to draw. An empty row means
+ * "you have never been tested on this", which is worth seeing; a row that
+ * *cannot* be filled means nothing at all, and drawing it invites the first
+ * reading of the second thing.
+ */
+export const SKILLS_BY_FORMAT: Record<QuestionFormat, readonly Skill[]> = {
+  multiple_choice: SKILLS.filter((skill) => skill !== "figure_recall"),
+  numeric: ["figure_recall"],
+};
+
 /** Display labels. Kept next to the enums so adding a tag breaks in one place. */
 export const SKILL_LABELS: Record<Skill, string> = {
   figure_recall: "Figure recall",
@@ -68,6 +135,7 @@ export function topicLabel(topic: Topic): string {
 
 export const FORMAT_LABELS: Record<QuestionFormat, string> = {
   multiple_choice: "Multiple choice",
+  numeric: "Typed figure",
 };
 
 /* ------------------------------------------------------------------ *
@@ -161,22 +229,45 @@ export const QuestionOption = z.object({
 });
 export type QuestionOption = z.infer<typeof QuestionOption>;
 
+const QuizQuestionCommon = {
+  id: z.string().min(1),
+  skill: Skill,
+  topics: z.array(Topic).min(1),
+  prompt: z.string().min(1),
+};
+
 /**
  * `GET /docs/:id/quiz` deliberately omits the answer key. There is no optional
  * `answer` field to fall back on — if one ever appeared here it would be a
  * backend leak, and this schema strips it rather than letting UI code read it.
+ *
+ * A discriminated union rather than one object with optional fields, because
+ * the two formats need different inputs and different validation, and
+ * `question.options[0]` on a typed-figure question should not typecheck. The
+ * numeric variant carries `tolerance` and `unit` — hints about *precision*, not
+ * about the value — and conspicuously no `value`.
  */
-export const QuizQuestion = z.object({
-  id: z.string().min(1),
-  format: QuestionFormat,
-  skill: Skill,
-  topics: z.array(Topic).min(1),
-  prompt: z.string().min(1),
-  // Exactly four is a rendering invariant, not a preference: the option letters
-  // (A–D) and the grid are built against it. A quiz with three options is a
-  // generator bug we want to see immediately.
-  options: z.array(QuestionOption).length(4),
-});
+export const QuizQuestion = z.discriminatedUnion("format", [
+  z.object({
+    ...QuizQuestionCommon,
+    format: z.literal("multiple_choice"),
+    // Exactly four is a rendering invariant, not a preference: the option
+    // letters (A–D) and the grid are built against it. A quiz with three
+    // options is a generator bug we want to see immediately.
+    options: z.array(QuestionOption).length(4),
+  }),
+  z.object({
+    ...QuizQuestionCommon,
+    format: z.literal("numeric"),
+    // Present and empty, not absent. The server builds every question through
+    // one code path; an options array that went missing here would mean it had
+    // stopped doing that.
+    options: z.array(QuestionOption).length(0),
+    tolerance: z.number().positive(),
+    /** May be the empty string, for a bare count. */
+    unit: z.string(),
+  }),
+]);
 export type QuizQuestion = z.infer<typeof QuizQuestion>;
 
 export const Quiz = z.object({
@@ -187,17 +278,35 @@ export const Quiz = z.object({
 });
 export type Quiz = z.infer<typeof Quiz>;
 
-/** `POST /docs/:id/submit` — graded, with the key revealed for the first time. */
+/**
+ * `POST /docs/:id/submit` — graded, with the key revealed for the first time.
+ *
+ * Flat with nullable fields rather than a discriminated union, unlike
+ * `QuizQuestion`. The results screen renders both formats in one list and
+ * mostly cares about the parts they share; narrowing here would buy type
+ * safety on fields the renderer already guards with a `format` check, at the
+ * cost of two near-identical shapes.
+ */
 export const GradedQuestion = z.object({
   questionId: z.string().min(1),
   format: QuestionFormat,
   skill: Skill,
   topics: z.array(Topic).min(1),
   prompt: z.string().min(1),
-  options: z.array(QuestionOption).length(4),
+  /** Four on a multiple-choice question, empty on a typed figure. */
+  options: z.array(QuestionOption),
   selectedOptionId: z.string().nullable().default(null),
-  correctOptionId: z.string().min(1),
+  correctOptionId: z.string().nullable().default(null),
+  /** Verbatim, including an entry that did not parse as a number. */
+  selectedValue: z.string().nullable().default(null),
+  correctValue: z.number().nullable().default(null),
+  tolerance: z.number().nullable().default(null),
+  unit: z.string().nullable().default(null),
   correct: z.boolean(),
+  /** Null only for attempts predating confidence — not for a skipped question. */
+  confidence: Confidence.nullable().default(null),
+  /** As awarded by the server. Never recomputed here. */
+  points: z.number().int(),
   explanation: z.string().default(""),
 });
 export type GradedQuestion = z.infer<typeof GradedQuestion>;
@@ -208,6 +317,13 @@ export const AttemptResult = z.object({
   submittedAt: z.iso.datetime(),
   correct: z.number().int().nonnegative(),
   total: z.number().int().positive(),
+  /**
+   * The calibration score, and its ceiling. Negative is possible and is the
+   * whole point — reported beside `correct`, never instead of it, because they
+   * answer different questions.
+   */
+  points: z.number().int(),
+  maxPoints: z.number().int(),
   questions: z.array(GradedQuestion),
 });
 export type AttemptResult = z.infer<typeof AttemptResult>;
@@ -227,6 +343,17 @@ export const HistoryQuestion = z.object({
   skill: Skill,
   topics: z.array(Topic).min(1),
   correct: z.boolean(),
+  /**
+   * Absent on every question answered before confidence was asked for.
+   *
+   * **Absent is not "guessing".** Those answers were given without the question
+   * being put, so they carry no information about calibration and must be
+   * dropped from the reliability table rather than bucketed at the bottom —
+   * folding them in would invent a claim the reader never made, which is
+   * exactly the error the table exists to detect in the reader.
+   */
+  confidence: Confidence.optional(),
+  points: z.number().int().default(0),
 });
 export type HistoryQuestion = z.infer<typeof HistoryQuestion>;
 
@@ -290,7 +417,17 @@ export const SubmitQuizRequest = z.object({
   answers: z.array(
     z.object({
       questionId: z.string().min(1),
-      optionId: z.string().min(1),
+      /** Multiple choice only. Sending it for a typed figure is a 400. */
+      optionId: z.string().min(1).optional(),
+      /** Typed figures only, as entered. Sending it for a letter is a 400. */
+      value: z.string().min(1).optional(),
+      /**
+       * Required from this client. The server accepts its absence so a stale
+       * bundle can still submit, but an answer with no confidence scores no
+       * points and is excluded from the reliability table — so there is no
+       * version of this UI that should omit it.
+       */
+      confidence: Confidence,
     }),
   ),
   // Wall-clock time on the quiz. Stored as 0 when absent.
