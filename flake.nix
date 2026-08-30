@@ -16,6 +16,42 @@
             awscli2
             gh
             jq
+
+            # The application toolchain. Absent originally because the handlers
+            # and the SPA are built in CI — which meant the only way to learn
+            # that a handler did not compile, or read an environment variable
+            # the infrastructure never set, was to deploy it. Two production
+            # 502s came from that gap.
+            #
+            # This is deliberately not the Lambda build: that targets
+            # aarch64-unknown-linux-musl and stays in the workflow, where the
+            # runner architecture matches the function's. What this gives is
+            # `cargo check`, `cargo test` and `cargo clippy` before pushing.
+            cargo
+            rustc
+            rustfmt
+            nodejs
+            pnpm
+
+            # No clippy. The nixpkgs-unstable derivation is currently built
+            # against rustc 1.94.0-beta.1 while cargo and rustc here are 1.97.1,
+            # and cargo-clippy refuses outright on the mismatch:
+            #
+            #   rustc 1.94.0-beta.1 is not supported by the following packages:
+            #     api@0.1.0 requires rustc 1.94.1
+            #
+            # Shipping a tool that cannot run is worse than not shipping it —
+            # it reads as "clippy is available here" and fails at the moment
+            # someone tries to use it.
+
+            # webauthn-rs depends on openssl-sys, which has no pure-Rust
+            # backend and locates the library through pkg-config. Without both
+            # of these the api crate does not build at all — which is why CI
+            # installs `perl` and `make` and compiles OpenSSL from source under
+            # the `vendored-openssl` feature. Locally the system library is
+            # fine and very much faster.
+            pkg-config
+            openssl
           ];
 
           # The `marcusdunnca` profile is declared in nix-config

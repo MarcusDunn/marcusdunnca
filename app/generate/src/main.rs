@@ -24,10 +24,29 @@ use trainer_core::model::DocStatus;
 use trainer_core::store::Store;
 use trainer_core::tags::TAG_VERSION;
 
-/// Nova Lite in the Canadian inference profile. The `ca.` prefix is a genuine
-/// in-region profile rather than a globally-routed one, which is why this model
-/// was chosen over the alternatives at similar cost.
-const DEFAULT_MODEL_ID: &str = "ca.amazon.nova-lite-v1:0";
+/// Claude Sonnet 4.6 on the global inference profile.
+///
+/// This replaced Nova Lite, and the tradeoff was made knowingly: Nova Lite was
+/// the only model with a genuine in-region (`ca.`) profile, so document text
+/// stayed in ca-central-1. A `global.` profile routes outside Canada. The
+/// reason it is worth it is question quality — measured on the same document,
+/// Nova produced questions answerable from general knowledge, no reasoning
+/// mode is available on the Nova family at any price, and structural failures
+/// persisted even under a JSON Schema. Sonnet with a thinking budget produced
+/// ten schema-clean questions anchored to the document's own tables.
+///
+/// Roughly 7c per document against Nova's 0.1c. At a handful of documents a
+/// month that is inside the noise of the budget.
+const DEFAULT_MODEL_ID: &str = "global.anthropic.claude-sonnet-4-6";
+
+/// Thinking budget, in tokens. Zero disables it.
+///
+/// Reasoning is what moves questions from "a well-read person could answer
+/// this" to "you had to have opened the document" — on the reference document
+/// it was the difference between defining `bond yields` in the abstract and
+/// asking what this report says pent-up demand did in Ontario. It costs output
+/// tokens, hence configurable rather than hardcoded.
+const DEFAULT_THINKING_BUDGET_TOKENS: u32 = 3000;
 
 /// Page ceiling. A hundred pages is already a long read; beyond that the
 /// generation is expensive and the resulting ten questions cover so little of
@@ -57,6 +76,7 @@ struct Config {
     /// means the function reads from exactly one place.
     docs_bucket: String,
     model_id: String,
+    thinking_budget_tokens: u32,
     max_pages: usize,
     daily_cap: u32,
     max_document_bytes: i64,
@@ -75,6 +95,10 @@ impl Config {
             bedrock: aws_sdk_bedrockruntime::Client::new(&sdk),
             docs_bucket: config::require("DOCS_BUCKET")?,
             model_id: config::parse_or("MODEL_ID", DEFAULT_MODEL_ID.to_string())?,
+            thinking_budget_tokens: config::parse_or(
+                "THINKING_BUDGET_TOKENS",
+                DEFAULT_THINKING_BUDGET_TOKENS,
+            )?,
             max_pages: config::parse_or("MAX_PAGES", DEFAULT_MAX_PAGES)?,
             daily_cap: config::parse_or("DAILY_DOCUMENT_CAP", DEFAULT_DAILY_CAP)?,
             max_document_bytes: config::parse_or("MAX_DOCUMENT_BYTES", DEFAULT_MAX_DOCUMENT_BYTES)?,
@@ -278,22 +302,68 @@ async fn process(config: &Config, doc_id: &str) -> Result<()> {
         .reserve_daily_quota(&clock::today_utc(), config.daily_cap)
         .await?;
 
+    // Offered to the model so it reuses an existing tag rather than coining a
+    // synonym for one. A failure to read the registry degrades the tags but
+    // must not cost a generation, so it falls back to the seed set.
+    let known_topics = config.store.known_topics().await.unwrap_or_else(|e| {
+        tracing::warn!(doc_id, error = %e, "could not read the topic registry; using seeds");
+        trainer_core::tags::SEED_TOPICS
+            .iter()
+            .filter_map(|w| trainer_core::tags::Topic::parse(w))
+            .collect()
+    });
+
     tracing::info!(doc_id, pages, size_bytes = size, "invoking model");
 
-    let questions = bedrock::generate(&config.bedrock, &config.model_id, &doc.title, bytes).await?;
+    let generated = bedrock::generate(
+        &config.bedrock,
+        bedrock::Request {
+            model_id: &config.model_id,
+            thinking_budget_tokens: config.thinking_budget_tokens,
+            known_topics: &known_topics,
+            // The document id, so the option shuffle is reproducible per
+            // document rather than per invocation.
+            seed: doc_id,
+            pdf: bytes,
+        },
+    )
+    .await?;
 
     // `pages` rather than the client-reported count the row was created with.
     // The browser's number is a UX optimisation; this one was derived from the
     // bytes by the same process that enforced `MAX_PAGES` against it, so the
     // number the list shows is the number the guard checked.
+    //
+    // The title and topics land here too: both are chosen by the model, and
+    // until this write the row carries the provisional title `POST /docs`
+    // derived from the filename.
     config
         .store
-        .set_doc_ready(doc_id, &questions, pages, TAG_VERSION)
+        .set_doc_ready(
+            doc_id,
+            &generated.title,
+            &generated.topics,
+            &generated.questions,
+            pages,
+            TAG_VERSION,
+        )
         .await?;
 
-    // Counts only. The questions contain the answer key and never reach a log
-    // line, here or anywhere else.
-    tracing::info!(doc_id, questions = questions.len(), "document ready");
+    // After the document is ready, and deliberately not fatal. The generation
+    // is already paid for and stored; failing it because a convenience index
+    // did not update would throw that away to keep a cache tidy.
+    if let Err(e) = config.store.register_topics(&generated.topics).await {
+        tracing::warn!(doc_id, error = %e, "could not register topics");
+    }
+
+    // Counts and tags only. The questions contain the answer key and never
+    // reach a log line, here or anywhere else.
+    tracing::info!(
+        doc_id,
+        questions = generated.questions.len(),
+        topics = %generated.topics.iter().map(|t| t.as_str()).collect::<Vec<_>>().join(","),
+        "document ready"
+    );
 
     Ok(())
 }

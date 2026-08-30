@@ -7,7 +7,7 @@ import { api } from "../lib/api";
 import { documentUrlQuery, queryKeys, quizQuery } from "../lib/queries";
 import {
   SKILL_LABELS,
-  TOPIC_LABELS,
+  topicLabel,
   type AttemptResult,
   type Quiz,
   type QuizQuestion,
@@ -47,7 +47,13 @@ export function ReadScreen() {
 
   const submit = useMutation({
     mutationFn: (answers: Record<string, string>) => {
-      attemptIdRef.current ??= crypto.randomUUID();
+      // Written long-hand rather than with `??=`. React Compiler does not yet
+      // support logical assignment and bails on the *whole component* when it
+      // meets one — silently, as a build note — so this one operator was
+      // opting the quiz screen out of compilation entirely.
+      if (attemptIdRef.current === null) {
+        attemptIdRef.current = crypto.randomUUID();
+      }
       const startedAt = startedAtRef.current;
       return api.submitQuiz(documentId, {
         attemptId: attemptIdRef.current,
@@ -230,7 +236,7 @@ function QuestionCard({
     <fieldset>
       <legend>
         {question.prompt} ({SKILL_LABELS[question.skill]} ·{" "}
-        {question.topics.map((topic) => TOPIC_LABELS[topic]).join(", ")})
+        {question.topics.map(topicLabel).join(", ")})
       </legend>
       {question.options.map((option, optionIndex) => {
         const inputId = `${question.id}-${option.id}`;
@@ -273,7 +279,7 @@ function Results({ result }: { result: AttemptResult }) {
             <h4>{graded.prompt}</h4>
             <p>
               {graded.correct ? "Correct" : "Incorrect"} — {SKILL_LABELS[graded.skill]} ·{" "}
-              {graded.topics.map((topic) => TOPIC_LABELS[topic]).join(", ")}
+              {graded.topics.map(topicLabel).join(", ")}
             </p>
             <ul>
               {graded.options.map((option, optionIndex) => {

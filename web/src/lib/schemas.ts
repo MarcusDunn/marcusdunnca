@@ -1,12 +1,16 @@
 import { z } from "zod";
 
 /* ------------------------------------------------------------------ *
- * Closed tag vocabulary
+ * Tag vocabularies
  *
- * These three enums mirror the backend's vocabulary exactly. They live in one
- * file on purpose: a tag the generator emits that the client doesn't know about
- * must fail parsing loudly, because a silently-dropped tag corrupts every rate
- * in the history view without ever rendering an error.
+ * `Skill` and `QuestionFormat` are closed and mirror the backend's enums
+ * exactly. A value the generator emits that the client doesn't know about must
+ * fail parsing loudly, because a silently-dropped tag corrupts every rate in
+ * the history view without ever rendering an error.
+ *
+ * `Topic` is open — see `app/core/src/tags.rs`. The model coins topics as it
+ * meets new subject matter, so there is no list to mirror here and no way to
+ * "know about" a tag in advance.
  * ------------------------------------------------------------------ */
 
 export const QuestionFormat = z.enum(["multiple_choice"]);
@@ -21,20 +25,26 @@ export const Skill = z.enum([
 ]);
 export type Skill = z.infer<typeof Skill>;
 
-export const Topic = z.enum([
-  "international_economics",
-  "fiscal",
-  "energy",
-  "municipal",
-  "regulatory",
-  "audit",
-  "monetary",
-  "trade",
-]);
+/**
+ * A topic: one lowercase word, chosen by the model.
+ *
+ * Deliberately permissive — no `^[a-z]+$` regex, even though that is the rule
+ * the server enforces on everything it writes. Two reasons, and they point the
+ * same way:
+ *
+ *   - Rows written under the old closed vocabulary contain `international_economics`.
+ *     A strict schema here would throw on the document list rather than render
+ *     a slightly odd tag, and a blank screen is much worse than a stale word.
+ *   - Validating a *response* re-checks a rule the server already enforced on
+ *     the way in. The client cannot fix a bad tag; it can only refuse to draw
+ *     the page.
+ *
+ * Strictness belongs at ingress, and ingress is `Topic::parse` in Rust.
+ */
+export const Topic = z.string().min(1).max(60);
 export type Topic = z.infer<typeof Topic>;
 
 export const SKILLS = Skill.options;
-export const TOPICS = Topic.options;
 export const FORMATS = QuestionFormat.options;
 
 /** Display labels. Kept next to the enums so adding a tag breaks in one place. */
@@ -46,16 +56,15 @@ export const SKILL_LABELS: Record<Skill, string> = {
   scope: "Scope",
 };
 
-export const TOPIC_LABELS: Record<Topic, string> = {
-  international_economics: "Int'l economics",
-  fiscal: "Fiscal",
-  energy: "Energy",
-  municipal: "Municipal",
-  regulatory: "Regulatory",
-  audit: "Audit",
-  monetary: "Monetary",
-  trade: "Trade",
-};
+/**
+ * Topics get a function rather than a lookup table, because there is no longer
+ * a fixed set to write a table for. Underscores appear only in tags predating
+ * the one-word rule.
+ */
+export function topicLabel(topic: Topic): string {
+  const spaced = topic.replaceAll("_", " ");
+  return spaced.charAt(0).toUpperCase() + spaced.slice(1);
+}
 
 export const FORMAT_LABELS: Record<QuestionFormat, string> = {
   multiple_choice: "Multiple choice",
@@ -241,7 +250,7 @@ export type History = z.infer<typeof History>;
 
 /**
  * `POST /docs` serves two jobs, distinguished by `retryOf`:
- *   - new upload: title/topics/pageCount, response carries a presigned PUT URL
+ *   - new upload: filename/pageCount, response carries a presigned PUT URL
  *   - retry:      `retryOf: <failed document id>`, response carries uploadUrl: null
  *
  * Folding retry into `POST /docs` keeps the endpoint list as specified. The
@@ -250,8 +259,14 @@ export type History = z.infer<typeof History>;
  */
 export const CreateDocumentRequest = z.union([
   z.object({
-    title: z.string().min(1).max(200),
-    topics: z.array(Topic).min(1),
+    /**
+     * Used as a placeholder title until the model reads the document and
+     * replaces it, about a minute later. The uploader is no longer asked for a
+     * title or for topics — the model picks both, from the document rather
+     * than from a filename, which is better information and two fewer fields
+     * between choosing a PDF and reading it.
+     */
+    filename: z.string().max(300),
     pageCount: z.number().int().positive(),
     contentType: z.literal("application/pdf"),
     // Required, not optional. The presigned PUT signs content-length, which

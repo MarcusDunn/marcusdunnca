@@ -49,11 +49,20 @@ pub struct RetryRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UploadRequest {
-    pub title: String,
-    /// Chosen by the reader, not inferred by the model — the list view shows
-    /// them while the document is still `pending`, so they have to exist before
-    /// generation runs. Closed vocabulary, enforced by the enum.
-    pub topics: Vec<Topic>,
+    /// The name of the file being uploaded, used as a **provisional** title.
+    ///
+    /// Neither the title nor the topics are asked of the uploader any more —
+    /// the model derives both from the document itself, which is strictly
+    /// better information than a filename and removes the two fields that made
+    /// uploading a form rather than a file picker. But the row exists before
+    /// generation runs, and a document listed as `pending` with no title at all
+    /// is unidentifiable while it is the only thing the reader is waiting on.
+    ///
+    /// So this is a placeholder with a lifetime of about a minute. `generate`
+    /// overwrites it. It is never sent to the model — see the note on the
+    /// document block's `name` in `bedrock.rs`, which is a prompt injection
+    /// vector by AWS's own warning.
+    pub filename: String,
     /// Counted in the browser with pdf-lib. Recorded, but **not trusted**: the
     /// authoritative count is derived in `generate` and overwrites this.
     pub page_count: usize,
@@ -119,17 +128,7 @@ pub async fn create(state: &AppState, req: CreateDocRequest) -> Result<CreateDoc
 /// sets `Content-Length` to `file.size` automatically and the signed set is
 /// reproduced exactly — the client already hardcodes the matching content-type.
 async fn create_upload(state: &AppState, req: UploadRequest) -> Result<CreateDocResponse> {
-    let title = req.title.trim();
-    if title.is_empty() {
-        return Err(Error::Invalid("title is required".into()));
-    }
-    if title.chars().count() > 200 {
-        return Err(Error::Invalid("title is too long".into()));
-    }
-
-    if req.topics.is_empty() {
-        return Err(Error::Invalid("choose at least one topic".into()));
-    }
+    let title = provisional_title(&req.filename);
 
     // The signature pins this value, so a mismatch here is not a style check —
     // it would produce an upload URL the browser cannot use.
@@ -157,11 +156,15 @@ async fn create_upload(state: &AppState, req: UploadRequest) -> Result<CreateDoc
         pk: keys::doc_pk(&doc_id),
         sk: keys::META_SK.to_string(),
         doc_id: doc_id.clone(),
-        title: title.to_string(),
+        title,
         status: DocStatus::Pending,
         error: None,
         s3_key: s3_key.clone(),
-        topics: req.topics,
+        // Empty until the model chooses them. The list view renders a document
+        // with no topics without complaint; the alternative — asking the
+        // uploader for tags the model is about to overwrite — is the thing
+        // this change removes.
+        topics: Vec::new(),
         tag_version: TAG_VERSION,
         page_count: req.page_count,
         questions: Vec::new(),
@@ -191,6 +194,47 @@ async fn create_upload(state: &AppState, req: UploadRequest) -> Result<CreateDoc
         id: doc_id,
         upload_url: Some(presigned.uri().to_string()),
     })
+}
+
+/// A readable stand-in title, derived from the uploaded filename.
+///
+/// This is shown for roughly the minute between the row being created and
+/// `generate` replacing it with the model's title, and it only has to be good
+/// enough to tell two pending uploads apart.
+///
+/// Never fails. A filename is not something to reject an upload over — the PDF
+/// is the point, the name is incidental, and "your file name is invalid" is an
+/// absurd thing to say to someone who picked a file from their phone. Anything
+/// unusable degrades to a constant.
+fn provisional_title(filename: &str) -> String {
+    let stem = filename
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(filename)
+        .trim_end_matches(".pdf")
+        .trim_end_matches(".PDF");
+
+    let cleaned: String = stem
+        .chars()
+        // Separators become spaces; control characters are dropped outright
+        // rather than rendered. React escapes its output, so this is tidiness
+        // rather than a defence, but a title containing a newline breaks the
+        // list layout for no reason.
+        .map(|c| if c == '_' || c == '-' { ' ' } else { c })
+        .filter(|c| !c.is_control())
+        .collect();
+
+    let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    // Bounded well under DynamoDB's item limit and under what the list can
+    // show. The model's title, which replaces this, is bounded by the schema.
+    let truncated: String = collapsed.chars().take(200).collect();
+
+    if truncated.is_empty() {
+        "Untitled document".to_string()
+    } else {
+        truncated
+    }
 }
 
 /// Re-run generation for a document whose PDF is already in S3.
@@ -631,7 +675,7 @@ mod tests {
     #[test]
     fn quiz_payload_cannot_contain_the_answer_key() {
         let q = sample_question();
-        let public = PublicQuestion::new(&q, &[Topic::Fiscal]);
+        let public = PublicQuestion::new(&q, &[Topic::parse("fiscal").expect("a valid topic")]);
         let json = serde_json::to_string(&public).expect("serializes");
 
         assert!(
@@ -672,11 +716,31 @@ mod tests {
         assert!(matches!(retry, CreateDocRequest::Retry(_)));
 
         let upload: CreateDocRequest = serde_json::from_str(
-            r#"{"title":"t","topics":["fiscal"],"pageCount":4,
+            r#"{"filename":"report.pdf","pageCount":4,
                 "contentType":"application/pdf","sizeBytes":1024}"#,
         )
         .expect("upload parses");
         assert!(matches!(upload, CreateDocRequest::Upload(_)));
+    }
+
+    #[test]
+    fn a_provisional_title_is_readable_and_never_fails() {
+        assert_eq!(
+            provisional_title("Provincial_Housing-Outlook.pdf"),
+            "Provincial Housing Outlook"
+        );
+        // Phones and some browsers send a full path.
+        assert_eq!(
+            provisional_title("/private/var/tmp/td report.PDF"),
+            "td report"
+        );
+        // Every one of these would be a 400 if this validated instead of
+        // degrading, and none of them is a reason to refuse someone's PDF.
+        assert_eq!(provisional_title(""), "Untitled document");
+        assert_eq!(provisional_title(".pdf"), "Untitled document");
+        assert_eq!(provisional_title("   "), "Untitled document");
+        assert_eq!(provisional_title("a\nb.pdf"), "ab");
+        assert_eq!(provisional_title(&"x".repeat(500)).chars().count(), 200);
     }
 
     #[test]

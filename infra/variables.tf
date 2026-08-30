@@ -69,14 +69,46 @@ variable "bedrock_model_id" {
   description = <<-EOT
     Model the generate function invokes.
 
-    The `ca.` prefix is an in-region inference profile, not a foundation-model
-    ID: Nova Lite is one of the few models with a genuine Canadian profile, so
-    document text never leaves ca-central-1. Switching to a `us.` or `global.`
-    profile silently changes that, and would also need bedrock_allowed_models in
-    bootstrap/ widened to match.
+    **This is a `global.` inference profile, so document text leaves Canada.**
+    That was a deliberate trade, not an oversight. Nova Lite carried a genuine
+    in-region (`ca.`) profile and was chosen for it, but measured on a real
+    document it produced questions answerable without reading the document,
+    exposes no reasoning mode at any price, and still emitted malformed
+    questions under a JSON Schema. Sonnet with a thinking budget did not.
+
+    Reverting to in-region residency means setting this back to
+    "ca.amazon.nova-lite-v1:0" and accepting those question-quality losses;
+    nothing else in the stack depends on the choice.
+
+    Cost is roughly 7c per document against Nova's 0.1c — bounded by
+    daily_document_cap and by the budget's spend brake, both unchanged.
   EOT
   type        = string
-  default     = "ca.amazon.nova-lite-v1:0"
+  default     = "global.anthropic.claude-sonnet-4-6"
+}
+
+variable "bedrock_thinking_budget_tokens" {
+  description = <<-EOT
+    Tokens the model may spend reasoning before it answers. Zero disables it.
+
+    This is the lever that moves questions from "a well-read person could
+    answer this" to "you had to have opened the document", which is the only
+    property that makes the quiz worth taking. It bills as output tokens.
+
+    Anthropic models only. The Nova family rejects the request field outright,
+    so setting this while pointing bedrock_model_id at Nova fails every
+    generation — the handler sends the field whenever this is non-zero.
+  EOT
+  type        = number
+  default     = 3000
+
+  validation {
+    # Below about a thousand the model cannot finish a thought and the budget is
+    # spent for nothing; the upper bound is a cost guard, since these are output
+    # tokens at Sonnet's rate.
+    condition     = var.bedrock_thinking_budget_tokens == 0 || (var.bedrock_thinking_budget_tokens >= 1024 && var.bedrock_thinking_budget_tokens <= 16000)
+    error_message = "Thinking budget must be 0 (disabled) or between 1024 and 16000 tokens."
+  }
 }
 
 variable "max_pages" {
