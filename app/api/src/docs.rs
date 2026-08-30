@@ -14,10 +14,12 @@ use trainer_core::clock;
 use trainer_core::error::{aws, Error, Result};
 use trainer_core::keys;
 use trainer_core::model::{
-    Attempt, AttemptResponse, DocMeta, DocStatus, PublicQuestion, Question, QuestionOption,
+    Attempt, AttemptResponse, DocMeta, DocStatus, PublicQuestion, Question, QuestionBody,
+    QuestionOption,
 };
+use trainer_core::numeric::{self, NumericAnswer};
 use trainer_core::store::AttemptWrite;
-use trainer_core::tags::{Choice, Topic, TAG_VERSION};
+use trainer_core::tags::{Choice, Confidence, Topic, TAG_VERSION};
 
 use crate::state::AppState;
 
@@ -457,10 +459,34 @@ pub struct SubmitRequest {
 #[serde(rename_all = "camelCase")]
 pub struct SubmittedAnswer {
     pub question_id: String,
-    /// `"a"` through `"d"`. A value outside that set is a deserialization
-    /// error, which is a 400 rather than a silently ungraded question.
-    pub option_id: Choice,
+    /// `"a"` through `"d"` on a multiple-choice question. A value outside that
+    /// set is a deserialization error, which is a 400 rather than a silently
+    /// ungraded question.
+    ///
+    /// Optional at this layer because numeric questions have no letters — but
+    /// sending the wrong one of these two for a question's format is rejected,
+    /// not ignored. See [`SubmittedAnswer::for_format`].
+    #[serde(default)]
+    pub option_id: Option<Choice>,
+    /// What the reader typed on a numeric question, before parsing.
+    #[serde(default)]
+    pub value: Option<String>,
+    /// How sure they were.
+    ///
+    /// Optional so that a client which has not been redeployed yet still
+    /// submits successfully rather than 400ing mid-quiz. Its answers score
+    /// zero points and are excluded from the calibration record — which is the
+    /// honest handling, because no confidence was ever asked for.
+    #[serde(default)]
+    pub confidence: Option<Confidence>,
 }
+
+/// Longest string accepted in the numeric field.
+///
+/// It is a number. Sixty-four characters is already far past any figure plus
+/// its unit, and the cap exists so a stuck key cannot write a large attribute
+/// to a table provisioned at 5 WCU.
+const MAX_ANSWER_TEXT_LEN: usize = 64;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -471,12 +497,25 @@ pub struct GradedQuestionDto {
     pub topics: Vec<Topic>,
     pub prompt: String,
     pub options: Vec<QuestionOption>,
-    /// `null` when the question was skipped. Distinguished from wrong because
-    /// "I did not answer eight of ten" and "I got eight of ten wrong" are
-    /// different signals about the same score.
+    /// `null` when the question was skipped, and on every numeric question.
+    /// Skipped is distinguished from wrong because "I did not answer eight of
+    /// ten" and "I got eight of ten wrong" are different signals about the
+    /// same score.
     pub selected_option_id: Option<Choice>,
-    pub correct_option_id: Choice,
+    /// `null` on a numeric question.
+    pub correct_option_id: Option<Choice>,
+    /// What the reader typed, verbatim. `null` on a multiple-choice question.
+    pub selected_value: Option<String>,
+    /// The keyed figure, revealed. `null` on a multiple-choice question.
+    pub correct_value: Option<f64>,
+    pub tolerance: Option<f64>,
+    pub unit: Option<String>,
     pub correct: bool,
+    /// What they said before finding out. Echoed back because a results screen
+    /// that shows only right/wrong cannot show the thing worth seeing: which
+    /// of the wrong ones you were sure about.
+    pub confidence: Option<Confidence>,
+    pub points: i32,
     pub explanation: String,
 }
 
@@ -488,6 +527,10 @@ pub struct SubmitResponse {
     pub submitted_at: String,
     pub correct: usize,
     pub total: usize,
+    /// Sum of the per-question points, and its ceiling. Reported next to
+    /// `correct`, never instead of it — see [`Attempt::points`].
+    pub points: i32,
+    pub max_points: i32,
     /// Carries the key, correctly: the attempt has already been written by the
     /// time this is built, so it is no longer secret for this attempt. This is
     /// the *only* response type that includes it.
@@ -503,12 +546,116 @@ pub struct SubmitResponse {
 /// useless afterwards.
 const MAX_DURATION_MS: u64 = 24 * 60 * 60 * 1000;
 
+/// Grade one question against its stored key.
+///
+/// Returns the response row, ready to store. Split out of [`submit`] because
+/// there are now two formats and one loop body that branches on format is how
+/// the numeric case ends up accidentally graded by letter.
+///
+/// **Nothing in here calls a model.** Both formats are decided arithmetically —
+/// a letter comparison, or `|typed − value| ≤ tolerance`. That is what makes a
+/// score from March comparable with a score from August.
+fn grade_one(
+    question: &Question,
+    topics: &[Topic],
+    submitted: Option<&SubmittedAnswer>,
+) -> Result<AttemptResponse> {
+    // A row whose format and payload disagree cannot be graded, and marking it
+    // wrong would be a confidently false statement about the reader. Failing
+    // the submission points at the Retry button, which regenerates.
+    let body = question.body().ok_or_else(|| {
+        tracing::error!(qid = %question.id, "stored question has no usable answer key");
+        Error::Invalid(format!(
+            "question {} was stored without a usable answer; regenerate this document",
+            question.id
+        ))
+    })?;
+
+    let confidence = submitted.and_then(|s| s.confidence);
+
+    let (answered, correct, answer, answer_text) = match body {
+        QuestionBody::MultipleChoice { answer: key, .. } => {
+            if let Some(text) = submitted.and_then(|s| s.value.as_ref()) {
+                return Err(Error::Invalid(format!(
+                    "question {} is multiple choice; {text:?} is not an option letter",
+                    question.id
+                )));
+            }
+            let chosen = submitted.and_then(|s| s.option_id);
+            (chosen.is_some(), chosen == Some(key), chosen, None)
+        }
+        QuestionBody::Numeric(spec) => {
+            if submitted.and_then(|s| s.option_id).is_some() {
+                return Err(Error::Invalid(format!(
+                    "question {} is answered by typing a figure, not by choosing a letter",
+                    question.id
+                )));
+            }
+
+            let typed = submitted
+                .and_then(|s| s.value.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+
+            if let Some(text) = typed {
+                if text.chars().count() > MAX_ANSWER_TEXT_LEN {
+                    return Err(Error::Invalid(format!(
+                        "the answer to question {} is {} characters; it is a number",
+                        question.id,
+                        text.chars().count()
+                    )));
+                }
+            }
+
+            // An unparseable entry grades as wrong, not as unanswered. The
+            // client blocks submission on one, so arriving here means a stale
+            // or bypassed client — and refusing to grade the other nine
+            // questions over it would be the worse failure.
+            let correct = typed
+                .and_then(numeric::parse_reader_value)
+                .is_some_and(|v| spec.accepts(v));
+
+            (typed.is_some(), correct, None, typed.map(str::to_string))
+        }
+    };
+
+    Ok(AttemptResponse {
+        qid: question.id.clone(),
+        format: question.format,
+        skill: question.skill,
+        // Snapshots, all of them. Re-tagging a document later must not rewrite
+        // what past attempts mean.
+        topics: topics.to_vec(),
+        answer,
+        answer_text,
+        confidence,
+        points: award(confidence, answered, correct),
+        correct,
+    })
+}
+
+/// Points for one response.
+///
+/// **An unanswered question scores zero whatever confidence came with it.** The
+/// scoring rule prices a *claim*, and a blank is not a claim — charging −5 for
+/// a question marked "certain" and then left empty would be pricing a UI
+/// mishap. The client cannot produce that state; this is what happens if it
+/// ever does.
+fn award(confidence: Option<Confidence>, answered: bool, correct: bool) -> i32 {
+    match confidence {
+        Some(band) if answered => band.points(correct),
+        _ => 0,
+    }
+}
+
 /// `POST /docs/:id/submit` — grade, record, explain.
 ///
-/// Grading is `submitted == stored answer`. No model call: the key was decided
-/// once, at generation time, and re-deriving it per submission would be slower,
-/// cost money, and — worst — be non-deterministic, so the same answers could
-/// score differently on two attempts at the same document.
+/// Grading compares against the stored key: letters for multiple choice, a
+/// tolerance band for numeric. No model call, at grade time or ever. Beyond
+/// being slower and costing money, a model in this path would be
+/// non-deterministic — the same answers could score differently on two attempts
+/// at the same document, and a score series whose instrument drifts cannot be
+/// compared with itself.
 ///
 /// Every question in the document produces a response row, including ones the
 /// client did not mention. A client that omits a question must not thereby
@@ -524,10 +671,10 @@ pub async fn submit(state: &AppState, doc_id: &str, req: SubmitRequest) -> Resul
     // something, and a duplicate is a client bug rather than an attack — the
     // key is not in the client's hands, so there is nothing to gain by sending
     // a question twice.
-    let submitted: HashMap<&str, Choice> = req
+    let submitted: HashMap<&str, &SubmittedAnswer> = req
         .answers
         .iter()
-        .map(|a| (a.question_id.as_str(), a.option_id))
+        .map(|a| (a.question_id.as_str(), a))
         .collect();
 
     // Reject answers for questions that do not exist rather than ignoring them.
@@ -542,24 +689,19 @@ pub async fn submit(state: &AppState, doc_id: &str, req: SubmitRequest) -> Resul
 
     let mut responses = Vec::with_capacity(doc.questions.len());
     let mut score = 0usize;
+    let mut points = 0i32;
 
     for question in &doc.questions {
-        let chosen = submitted.get(question.id.as_str()).copied();
-        let correct = chosen == Some(question.answer);
-        if correct {
+        let response = grade_one(
+            question,
+            &doc.topics,
+            submitted.get(question.id.as_str()).copied(),
+        )?;
+        if response.correct {
             score += 1;
         }
-
-        responses.push(AttemptResponse {
-            qid: question.id.clone(),
-            format: question.format,
-            skill: question.skill,
-            // Snapshots, both of them. Re-tagging a document later must not
-            // rewrite what past attempts mean.
-            topics: doc.topics.clone(),
-            answer: chosen,
-            correct,
-        });
+        points += response.points;
+        responses.push(response);
     }
 
     let submitted_at = clock::now_iso8601();
@@ -586,6 +728,11 @@ pub async fn submit(state: &AppState, doc_id: &str, req: SubmitRequest) -> Resul
         duration_ms: req.duration_ms.unwrap_or(0).min(MAX_DURATION_MS),
         score,
         total,
+        points,
+        // The ceiling every question could have reached, including ones with no
+        // confidence attached — so a quiz answered by a stale client reads as
+        // "0 of 30", which is the truth, rather than "0 of 0".
+        max_points: total as i32 * Confidence::MAX_POINTS_PER_QUESTION,
     };
 
     // Written before the response is built. If the write fails the caller gets
@@ -612,6 +759,8 @@ pub async fn submit(state: &AppState, doc_id: &str, req: SubmitRequest) -> Resul
         submitted_at: stored.submitted_at.clone(),
         correct: stored.score,
         total: stored.total,
+        points: stored.points,
+        max_points: stored.max_points,
         questions: grade_all(&doc.questions, &doc.topics, &stored),
     })
 }
@@ -636,6 +785,15 @@ fn grade_all(
         .iter()
         .map(|q| {
             let response = recorded.get(q.id.as_str());
+            // The key is revealed here and only here, so it is read through
+            // `body()` — the same accessor the quiz payload uses to decide what
+            // it may *not* say. One source of truth for what a question's key
+            // is, whichever direction it is travelling.
+            let numeric: Option<&NumericAnswer> = match q.body() {
+                Some(QuestionBody::Numeric(answer)) => Some(answer),
+                _ => None,
+            };
+
             GradedQuestionDto {
                 question_id: q.id.clone(),
                 format: q.format,
@@ -644,8 +802,17 @@ fn grade_all(
                 prompt: q.prompt.clone(),
                 options: q.options(),
                 selected_option_id: response.and_then(|r| r.answer),
-                correct_option_id: q.answer,
+                correct_option_id: match q.body() {
+                    Some(QuestionBody::MultipleChoice { answer, .. }) => Some(answer),
+                    _ => None,
+                },
+                selected_value: response.and_then(|r| r.answer_text.clone()),
+                correct_value: numeric.map(|n| n.value),
+                tolerance: numeric.map(|n| n.tolerance),
+                unit: numeric.map(|n| n.unit.clone()),
                 correct: response.is_some_and(|r| r.correct),
+                confidence: response.and_then(|r| r.confidence),
+                points: response.map_or(0, |r| r.points),
                 explanation: q.explanation.clone(),
             }
         })
@@ -662,12 +829,48 @@ mod tests {
         Question {
             id: "q3".into(),
             format: QuestionFormat::MultipleChoice,
-            skill: Skill::FigureRecall,
+            skill: Skill::Causal,
             prompt: "What was the deficit?".into(),
             options: vec!["one".into(), "two".into(), "three".into(), "four".into()],
-            answer: Choice::B,
+            answer: Some(Choice::B),
+            numeric: None,
             explanation: "Table 2, line 4.".into(),
         }
+    }
+
+    fn sample_numeric() -> Question {
+        Question {
+            id: "n1".into(),
+            format: QuestionFormat::Numeric,
+            skill: Skill::FigureRecall,
+            prompt: "What was the forecast change in Ontario home prices?".into(),
+            options: Vec::new(),
+            answer: None,
+            numeric: Some(NumericAnswer {
+                value: -4.0,
+                tolerance: 1.0,
+                unit: "%".into(),
+            }),
+            explanation: "Table 1, Ontario row.".into(),
+        }
+    }
+
+    fn answered(
+        question_id: &str,
+        option_id: Option<Choice>,
+        value: Option<&str>,
+        confidence: Option<Confidence>,
+    ) -> SubmittedAnswer {
+        SubmittedAnswer {
+            question_id: question_id.into(),
+            option_id,
+            value: value.map(str::to_string),
+            confidence,
+        }
+    }
+
+    fn grade(question: &Question, submitted: Option<&SubmittedAnswer>) -> AttemptResponse {
+        grade_one(question, &[], submitted).expect("gradeable")
     }
 
     /// The regression test for the one bug that would quietly make the app
@@ -750,5 +953,138 @@ mod tests {
             serde_json::from_str::<SubmittedAnswer>(r#"{"questionId":"q1","optionId":"e"}"#)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn a_confidence_outside_the_three_bands_is_a_deserialization_error() {
+        assert!(serde_json::from_str::<SubmittedAnswer>(
+            r#"{"questionId":"q1","optionId":"a","confidence":"pretty_sure"}"#
+        )
+        .is_err());
+    }
+
+    /// A client that predates the confidence field must still be able to
+    /// submit. Its answers are graded normally and score no points — which is
+    /// honest, because it was never asked how sure it was.
+    #[test]
+    fn an_answer_with_no_confidence_still_grades() {
+        let submitted = answered("q3", Some(Choice::B), None, None);
+        let response = grade(&sample_question(), Some(&submitted));
+
+        assert!(response.correct);
+        assert_eq!(response.confidence, None);
+        assert_eq!(
+            response.points, 0,
+            "no claim was made, so nothing is priced"
+        );
+    }
+
+    /// The scoring rule, exercised through the handler rather than through
+    /// `Confidence::points` — this is where a wired-up-backwards mistake would
+    /// show, and it would show as a plausible-looking score.
+    #[test]
+    fn points_follow_the_band_and_the_outcome() {
+        let q = sample_question();
+
+        let cases = [
+            (Choice::B, Confidence::Certain, true, 3),
+            (Choice::A, Confidence::Certain, false, -5),
+            (Choice::B, Confidence::FairlySure, true, 2),
+            (Choice::A, Confidence::FairlySure, false, -1),
+            (Choice::B, Confidence::Guessing, true, 1),
+            (Choice::A, Confidence::Guessing, false, 0),
+        ];
+
+        for (choice, band, expect_correct, expect_points) in cases {
+            let submitted = answered("q3", Some(choice), None, Some(band));
+            let response = grade(&q, Some(&submitted));
+            assert_eq!(response.correct, expect_correct, "{band} {choice}");
+            assert_eq!(response.points, expect_points, "{band} {choice}");
+        }
+    }
+
+    /// **The rule that keeps a UI mishap from costing five points.** A blank is
+    /// not a claim, so it cannot be a confidently wrong one.
+    #[test]
+    fn an_unanswered_question_scores_zero_whatever_the_band_says() {
+        let submitted = answered("q3", None, None, Some(Confidence::Certain));
+        let response = grade(&sample_question(), Some(&submitted));
+
+        assert!(!response.correct);
+        assert_eq!(response.points, 0);
+
+        // And the same for a numeric question left empty, including one sent as
+        // whitespace rather than omitted.
+        let blank = answered("n1", None, Some("   "), Some(Confidence::Certain));
+        let response = grade(&sample_numeric(), Some(&blank));
+        assert_eq!(response.points, 0);
+        assert_eq!(response.answer_text, None, "whitespace is not an answer");
+    }
+
+    #[test]
+    fn a_numeric_answer_is_graded_against_its_tolerance() {
+        let q = sample_numeric();
+
+        for (typed, expect) in [
+            ("-4", true),
+            ("-4.0", true),
+            ("-3", true),    // the edge of the band
+            ("-5", true),    // the other edge
+            ("-4.0%", true), // the reader echoed the unit back
+            ("(4.0)", true), // accounting negative
+            ("-2.9", false),
+            ("4", false), // right magnitude, wrong sign
+            ("about -4", false),
+        ] {
+            let submitted = answered("n1", None, Some(typed), Some(Confidence::FairlySure));
+            let response = grade(&q, Some(&submitted));
+            assert_eq!(response.correct, expect, "typed {typed:?}");
+            assert_eq!(
+                response.answer_text.as_deref(),
+                Some(typed.trim()),
+                "the entry is recorded verbatim, parseable or not"
+            );
+        }
+    }
+
+    /// Sending the wrong shape for a question's format is a client bug, and a
+    /// client bug that silently grades as wrong is the kind that survives for
+    /// months looking like poor comprehension.
+    #[test]
+    fn answering_in_the_wrong_shape_is_rejected_rather_than_marked_wrong() {
+        let letter_for_a_number = answered("n1", Some(Choice::A), None, None);
+        assert!(matches!(
+            grade_one(&sample_numeric(), &[], Some(&letter_for_a_number)),
+            Err(Error::Invalid(_))
+        ));
+
+        let number_for_a_letter = answered("q3", None, Some("-4"), None);
+        assert!(matches!(
+            grade_one(&sample_question(), &[], Some(&number_for_a_letter)),
+            Err(Error::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn an_absurdly_long_numeric_entry_is_rejected() {
+        let long = "1".repeat(MAX_ANSWER_TEXT_LEN + 1);
+        let submitted = answered("n1", None, Some(&long), None);
+        assert!(matches!(
+            grade_one(&sample_numeric(), &[], Some(&submitted)),
+            Err(Error::Invalid(_))
+        ));
+    }
+
+    /// A stored row that cannot be graded fails the submission instead of
+    /// scoring zero. Zero would be a confidently false statement about the
+    /// reader; the error points at Retry, which regenerates the document.
+    #[test]
+    fn an_ungradeable_question_fails_the_submission() {
+        let mut broken = sample_numeric();
+        broken.numeric = None;
+        assert!(matches!(
+            grade_one(&broken, &[], None),
+            Err(Error::Invalid(_))
+        ));
     }
 }

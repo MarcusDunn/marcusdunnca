@@ -16,6 +16,7 @@ pub mod config;
 pub mod error;
 pub mod keys;
 pub mod model;
+pub mod numeric;
 pub mod store;
 pub mod tags;
 

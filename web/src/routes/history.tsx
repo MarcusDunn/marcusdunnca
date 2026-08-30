@@ -5,20 +5,25 @@ import { Busy, ErrorNotice } from "../components/ui";
 import {
   attemptRows,
   buildBreakdown,
+  buildCalibration,
   cellKey,
   formatN,
   formatRate,
   MIN_OBSERVATIONS,
   selectObservations,
+  selectRatedObservations,
   suppressionReason,
   type Breakdown,
+  type Calibration,
   type Rate,
 } from "../history/aggregate";
 import { historyQuery } from "../lib/queries";
 import {
+  CONFIDENCE_LABELS,
   FORMATS,
   FORMAT_LABELS,
   SKILLS,
+  SKILLS_BY_FORMAT,
   SKILL_LABELS,
   topicLabel,
   type QuestionFormat,
@@ -54,10 +59,29 @@ export function HistoryScreen() {
   ].toSorted();
 
   const observations = selectObservations(history.data, { format, skills, topics });
-  const visibleSkills = skills.length > 0 ? skills : SKILLS;
+
+  // The rows this format can produce, plus any it *has* produced. The second
+  // half is what keeps attempts from before the formats split visible: they
+  // contain multiple-choice figure-recall questions, which nothing generates
+  // any more, and dropping their row would quietly delete the history rather
+  // than mark it superseded.
+  const answeredSkills = new Set<Skill>(observations.map((o) => o.skill));
+  const axisSkills = SKILLS.filter(
+    (skill) => SKILLS_BY_FORMAT[format].includes(skill) || answeredSkills.has(skill),
+  );
+
+  const visibleSkills = skills.length > 0 ? skills : axisSkills;
   const visibleTopics = topics.length > 0 ? topics : observedTopics;
   const breakdown = buildBreakdown(observations, visibleSkills, visibleTopics);
   const rows = attemptRows(observations);
+
+  // Deliberately NOT narrowed by `format`. Calibration is a property of the
+  // reader's reports rather than of the task they were made on, so pooling the
+  // two formats is both legitimate and the only way the n reaches a usable size
+  // — see the note in history/aggregate.ts.
+  const calibration = buildCalibration(
+    selectRatedObservations(history.data, { skills, topics }),
+  );
 
   return (
     <section>
@@ -80,9 +104,11 @@ export function HistoryScreen() {
         ))}
         <p>
           One format at a time, always. There is no combined view and there
-          won&apos;t be: a multiple-choice figure-recall question and a written
-          figure-recall question measure the same skill on different scales, so
-          averaging them produces a number that doesn&apos;t describe anything.
+          won&apos;t be: guessing pays 25% on a multiple-choice question and
+          nothing at all on a typed figure, so a pooled correct-rate would move
+          with the mix of formats rather than with what you know. The
+          calibration table above is the one place both are pooled, and it can
+          be because it measures your reports rather than the questions.
         </p>
       </fieldset>
 
@@ -105,6 +131,9 @@ export function HistoryScreen() {
           onChange={setTopics}
         />
       </details>
+
+      <h2>Calibration</h2>
+      <CalibrationSection calibration={calibration} />
 
       <h2>{FORMAT_LABELS[format]} overall</h2>
       <p>
@@ -152,6 +181,115 @@ export function HistoryScreen() {
     </section>
   );
 }
+
+/**
+ * Whether each confidence band was worth what it claimed.
+ *
+ * The suppression rule from the accuracy tables applies here too and matters
+ * more: "you are overconfident" is a claim about someone's judgement, and
+ * making it off four questions is precisely the over-reading the floor exists
+ * to prevent. A band under the floor shows its count and no verdict.
+ */
+function CalibrationSection({ calibration }: { calibration: Calibration }) {
+  const rated = calibration.bands.reduce((sum, band) => sum + band.rate.n, 0);
+
+  if (rated === 0) {
+    return (
+      <p>
+        Nothing to show yet — calibration is measured from the confidence you
+        record with each answer, and none of the attempts so far carry one.
+        {calibration.unrated > 0
+          ? ` (${calibration.unrated} earlier answers predate the confidence bands and are excluded rather than counted as guesses.)`
+          : ""}
+      </p>
+    );
+  }
+
+  return (
+    <>
+      <p>
+        {calibration.points} of {calibration.maxPoints} points across {rated}{" "}
+        answered question{rated === 1 ? "" : "s"}. Both formats are pooled here:
+        this table is about your reports, not about the questions.
+        {calibration.unrated > 0
+          ? ` ${calibration.unrated} earlier answer${
+              calibration.unrated === 1 ? " is" : "s are"
+            } excluded — they were given before a confidence was asked for, which is not the same as guessing.`
+          : ""}
+      </p>
+
+      <table>
+        <caption>
+          What each band claimed, against how often it was right. A band is
+          working when the observed rate lands inside the range it asserts.
+        </caption>
+        <thead>
+          <tr>
+            <th scope="col">Band</th>
+            <th scope="col">Claimed</th>
+            <th scope="col">Observed</th>
+            <th scope="col">Reading</th>
+          </tr>
+        </thead>
+        <tbody>
+          {calibration.bands.map((band) => (
+            <tr key={band.band}>
+              <th scope="row">{CONFIDENCE_LABELS[band.band]}</th>
+              <td>
+                {band.claimed.low}–{band.claimed.high}%
+              </td>
+              <td title={suppressionReason(band.rate) ?? undefined}>
+                {formatRate(band.rate)} ({formatN(band.rate)})
+              </td>
+              <td>{VERDICT_TEXT[band.verdict ?? "unknown"]}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <p>
+        The bottom band&apos;s floor is 25% on a multiple-choice question and
+        near zero on a typed figure, so a low &ldquo;guessing&rdquo; rate is
+        less informative than it looks. The two bands above it are the ones
+        worth reading.
+      </p>
+
+      {calibration.confidentErrors.length > 0 ? (
+        <>
+          <h3>Sure, and wrong</h3>
+          <p>
+            Every answer given as certain that turned out not to be. This is the
+            shortlist worth rereading: they are the beliefs that would have been
+            stated out loud, and the ones that correct most durably once
+            contradicted.
+          </p>
+          <ul>
+            {calibration.confidentErrors.map((observation) => (
+              <li key={`${observation.attemptId}-${observation.questionId}`}>
+                <Link
+                  to="/docs/$documentId"
+                  params={{ documentId: observation.documentId }}
+                >
+                  {observation.documentTitle || "Untitled"}
+                </Link>
+                {" — "}
+                {SKILL_LABELS[observation.skill]},{" "}
+                {new Date(observation.submittedAt).toLocaleDateString()}
+              </li>
+            ))}
+          </ul>
+        </>
+      ) : null}
+    </>
+  );
+}
+
+const VERDICT_TEXT: Record<"overconfident" | "underconfident" | "calibrated" | "unknown", string> =
+  {
+    overconfident: "Overconfident — right less often than claimed",
+    underconfident: "Understated — right more often than claimed",
+    calibrated: "About right",
+    unknown: `Too few to say (need ${MIN_OBSERVATIONS})`,
+  };
 
 function CheckboxFilter<T extends string>({
   idPrefix,
