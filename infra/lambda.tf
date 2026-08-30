@@ -353,26 +353,11 @@ resource "aws_lambda_function" "api" {
 # (the JWT check is inside the handler because the WebAuthn state lives there
 # anyway), no custom domain. Function URLs are free.
 #
-# authorization_type AWS_IAM, not NONE.
+# No Function URL.
 #
-# NONE meant anyone who learned this URL could invoke the function directly, and
-# with account concurrency capped at 10 that is a trivially available
-# exhaustion vector. AWS_IAM requires a sigv4-signed request, and the only
-# signer is the CloudFront Origin Access Control — so the function is reachable
-# through the distribution and nowhere else.
-#
-# Auth for actual users is still the handler's job; this only decides who may
-# reach the handler at all.
-
-resource "aws_lambda_function_url" "api" {
-  function_name      = aws_lambda_function.api.function_name
-  authorization_type = "AWS_IAM"
-
-  # No cors block, and the handler's CORS headers are now dead code too: the
-  # SPA reaches this through the distribution at /api/*, which is same-origin,
-  # so no preflight is issued and no ACAO header is consulted. Direct callers
-  # cannot reach it at all — see authorization_type above.
-}
+# There was one, behind a CloudFront Origin Access Control, and it is now an
+# HTTP API instead — see apigateway.tf for why. Leaving the URL in place would
+# be a second, unthrottled, publicly reachable path to the same handler.
 
 resource "aws_lambda_function" "generate" {
   function_name = local.generate_function_name
@@ -454,11 +439,6 @@ resource "aws_s3_bucket_notification" "docs" {
   # configuration, so the permission has to exist first or the apply fails with
   # an unhelpful "Unable to validate the following destination configurations".
   depends_on = [aws_lambda_permission.generate_from_s3]
-}
-
-output "api_function_url" {
-  description = "Base URL the SPA calls. Baked into the front-end build, so a change here needs a redeploy of the site."
-  value       = aws_lambda_function_url.api.function_url
 }
 
 output "api_function_name" {

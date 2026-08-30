@@ -30,20 +30,6 @@ const BASE_URL: string = (() => {
   return raw.replace(/\/+$/, "");
 })();
 
-/**
- * Hex SHA-256 of a string, via SubtleCrypto.
- *
- * Exists solely to satisfy CloudFront's SigV4 signing of Lambda Function URL
- * origins — see the x-amz-content-sha256 header below. SubtleCrypto is only
- * available in a secure context, which the app always is.
- */
-async function sha256Hex(input: string): Promise<string> {
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(input));
-  return Array.from(new Uint8Array(digest))
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
-}
-
 export class ApiError extends Error {
   readonly status: number;
   readonly url: string;
@@ -97,17 +83,6 @@ async function request<T>(
   if (serialized !== undefined) {
     headers.set("content-type", "application/json");
 
-    // Required, not optional, and easy to mistake for ceremony.
-    //
-    // The api is reached through CloudFront, which signs each request to the
-    // Lambda Function URL with SigV4 via an Origin Access Control. CloudFront
-    // cannot hash a body it is merely forwarding, and Lambda rejects unsigned
-    // payloads outright — so the VIEWER has to supply the body hash. Without
-    // this header every POST fails 403 at the origin, never reaching the
-    // handler, with nothing in the Lambda logs to show for it.
-    //
-    // GET works without it only because an empty body has a fixed, known hash.
-    headers.set("x-amz-content-sha256", await sha256Hex(serialized));
   }
   if (!anonymous) {
     const token = getToken();

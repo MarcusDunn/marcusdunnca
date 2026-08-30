@@ -273,6 +273,10 @@ locals {
     "logs:*",
     "cloudfront:*",
     "dynamodb:*",
+    # API Gateway's IAM actions are HTTP verbs (apigateway:GET, POST, PATCH,
+    # PUT, DELETE) rather than service verbs, so no Get*/List* prefix reaches
+    # them — the same trap as cloudfront:DescribeFunction and dynamodb:Scan.
+    "apigateway:*",
     # Only the non-invoking, non-metered Bedrock calls live here. The actual
     # inference actions are granted separately and scoped to specific model
     # ARNs — see local.bedrock_invoke_actions.
@@ -329,6 +333,7 @@ locals {
     "logs:GetLogDelivery",
     "cloudfront:Get*",
     "cloudfront:List*",
+    "apigateway:GET",
     # CloudFront Functions use DescribeFunction, which matches neither the Get*
     # nor the List* prefix — a reminder that verb-prefix wildcards are a
     # heuristic, not a guarantee of coverage.
