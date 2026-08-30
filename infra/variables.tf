@@ -143,3 +143,15 @@ variable "registration_token" {
   sensitive   = true
   default     = ""
 }
+
+variable "api_log_level" {
+  description = <<-EOT
+    Tracing level for the api handler.
+
+    "debug" surfaces the reason an assertion was refused — which check failed,
+    never key material. Normal operation is "info"; a login that fails with a
+    bare "unauthorized" is the case to raise it for.
+  EOT
+  type        = string
+  default     = "info"
+}

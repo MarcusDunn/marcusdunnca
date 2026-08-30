@@ -322,6 +322,10 @@ resource "aws_lambda_function" "api" {
       # here — generate only ever sees a file that already exists.
       MAX_UPLOAD_BYTES = tostring(var.max_upload_bytes)
 
+      # Raise to "debug" to see why an assertion was refused; those reasons are
+      # logged at debug because they are noise in normal operation.
+      LOG_LEVEL = var.api_log_level
+
       # Bootstrap only. Non-empty turns on passkey enrolment, and ONLY while
       # webauthn_credentials is still empty — the handler models these as an
       # either/or, so a deployment can never both hold credentials and accept

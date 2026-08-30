@@ -35,8 +35,21 @@ use crate::state::AppState;
 async fn main() -> std::result::Result<(), lambda_http::Error> {
     // No timestamps and no ANSI: CloudWatch adds its own timestamp to every
     // line, and escape codes in a log group are unreadable.
+    // Level is configurable, and that is not a nicety.
+    //
+    // Every reason an assertion is refused is logged at DEBUG — deliberately,
+    // since those lines say which check failed and are noise in normal
+    // operation. With the level pinned to INFO they could never be read in
+    // production either, so a failing login produced a bare "unauthorized" with
+    // no way to find out why short of rebuilding and redeploying. Raise
+    // LOG_LEVEL to debug, reproduce, and put it back.
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
+        .with_max_level(
+            std::env::var("LOG_LEVEL")
+                .ok()
+                .and_then(|v| v.parse::<tracing::Level>().ok())
+                .unwrap_or(tracing::Level::INFO),
+        )
         .with_ansi(false)
         .without_time()
         .with_target(false)
