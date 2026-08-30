@@ -140,6 +140,27 @@ jobs:
             --query 'Invalidation.Id' --output text)
           echo "invalidation $id"
 
+      # The deploy above reported success while the api 502'd on every request:
+      # Terraform set ORIGIN and the handler read APP_ORIGIN, so it died in init.
+      # A deploy that cannot serve a request has not succeeded.
+      - name: Smoke test
+        run: |
+          base="${{ vars.API_BASE_URL }}"
+          code=$(curl -sS -o /tmp/body -w '%{http_code}' --max-time 20 \
+            -X POST -H 'content-type: application/json' -d '{}' "${base%/}/auth/challenge" || echo 000)
+          echo "POST /auth/challenge -> $code"
+          head -c 300 /tmp/body || true
+          # 4xx is fine — it means the handler booted and rejected the request.
+          # 5xx or a connection failure means it never started.
+          case "$code" in
+            2*|4*) echo "handler is alive" ;;
+            *) echo "::error::api returned $code — the handler failed to initialise. Check /aws/lambda/marcusdunnca-api."; exit 1 ;;
+          esac
+
+          site=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 https://study.aws.marcusdunn.ca/)
+          echo "GET / -> $site"
+          [ "$site" = "200" ] || { echo "::error::site returned $site"; exit 1; }
+
       - name: Summary
         if: always()
         run: |

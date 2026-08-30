@@ -297,12 +297,12 @@ resource "aws_lambda_function" "api" {
       # deliberately different — see the webauthn_rp_id variable. The handler
       # must check both: the RP ID scopes which credentials the browser will
       # offer, the origin is what actually pins an assertion to this site.
-      RP_ID  = var.webauthn_rp_id
-      ORIGIN = "https://${var.app_domain}"
+      WEBAUTHN_RP_ID = var.webauthn_rp_id
+      APP_ORIGIN     = "https://${var.app_domain}"
 
       # Name, not value. Resolved at cold start by the handler so the key never
       # appears in the function configuration, in state, or in the console.
-      JWT_SIGNING_KEY_PARAMETER = local.jwt_signing_key_parameter
+      JWT_SIGNING_KEY_PARAM = local.jwt_signing_key_parameter
 
       # The api signs the presigned PUT, so the size bound has to be enforced
       # here — generate only ever sees a file that already exists.
