@@ -6,6 +6,13 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 6.0"
     }
+
+    # Only ever used to build the placeholder Lambda package. Real code is
+    # shipped by the build workflow, not from here — see infra/lambda.tf.
+    archive = {
+      source  = "hashicorp/archive"
+      version = "~> 2.7"
+    }
   }
 }
 

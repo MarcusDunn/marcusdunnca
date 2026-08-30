@@ -1,7 +1,19 @@
 data "aws_caller_identity" "current" {}
 
+# Hardcoding "aws" would work today and break silently in any other partition.
+# The permissions boundary ARN below has to match byte-for-byte or role creation
+# is denied, so it is worth deriving rather than assuming.
+data "aws_partition" "current" {}
+
 locals {
   account_id = data.aws_caller_identity.current.account_id
+  partition  = data.aws_partition.current.partition
+
+  # Every role this module creates MUST carry this, and the value is not
+  # negotiable: bootstrap's DenyRoleWorkWithoutBoundary matches on the exact ARN
+  # and the apply role loses iam:CreateRole without it. A typo here does not
+  # degrade gracefully, it fails the apply.
+  permissions_boundary_arn = "arn:${local.partition}:iam::${local.account_id}:policy/${var.project}-ci-permissions-boundary"
 }
 
 # ---------------------------------------------------------------------------
