@@ -65,9 +65,10 @@ resource "aws_cloudfront_distribution" "site" {
 
   origin {
     origin_id = "api"
-    # The Function URL host, without scheme or trailing slash.
-    domain_name              = replace(replace(aws_lambda_function_url.api.function_url, "https://", ""), "/", "")
-    origin_access_control_id = aws_cloudfront_origin_access_control.api.id
+    # The gateway host, without scheme. No Origin Access Control: an HTTP API is
+    # an ordinary HTTPS origin, so CloudFront forwards headers through untouched
+    # rather than overwriting Authorization with its own SigV4 signature.
+    domain_name = replace(aws_apigatewayv2_api.api.api_endpoint, "https://", "")
 
     custom_origin_config {
       http_port              = 80
@@ -217,14 +218,6 @@ output "cloudfront_distribution_id" {
 # Control with AWS_IAM, only this distribution can invoke it.
 # ---------------------------------------------------------------------------
 
-resource "aws_cloudfront_origin_access_control" "api" {
-  name                              = "${var.project}-api"
-  description                       = "Signs CloudFront requests to the api Function URL."
-  origin_access_control_origin_type = "lambda"
-  signing_behavior                  = "always"
-  signing_protocol                  = "sigv4"
-}
-
 # CloudFront forwards the full path, so /api/docs would arrive as /api/docs and
 # match no route. Stripping the prefix at the edge keeps the handler's routing
 # table identical whether it is reached directly or through the distribution —
@@ -259,17 +252,6 @@ data "aws_cloudfront_origin_request_policy" "all_viewer_except_host" {
   name = "Managed-AllViewerExceptHostHeader"
 }
 
-# Without this the OAC signs a request the function refuses. Scoped to this one
-# distribution by SourceArn, so another account's distribution cannot point at
-# the Function URL and inherit the permission.
-resource "aws_lambda_permission" "api_from_cloudfront" {
-  statement_id           = "AllowCloudFrontInvoke"
-  action                 = "lambda:InvokeFunctionUrl"
-  function_name          = aws_lambda_function.api.function_name
-  principal              = "cloudfront.amazonaws.com"
-  source_arn             = aws_cloudfront_distribution.site.arn
-  function_url_auth_type = "AWS_IAM"
-}
 
 output "api_base_url" {
   description = "Same-origin path the SPA calls. Not the Function URL, which is no longer publicly invocable."
