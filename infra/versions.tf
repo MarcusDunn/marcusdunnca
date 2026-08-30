@@ -20,3 +20,18 @@ provider "aws" {
     }
   }
 }
+
+# CloudFront accepts certificates from us-east-1 and nowhere else, regardless of
+# where the distribution or its origin live.
+provider "aws" {
+  alias  = "us_east_1"
+  region = "us-east-1"
+
+  default_tags {
+    tags = {
+      Project   = var.project
+      ManagedBy = "opentofu"
+      Module    = "infra"
+    }
+  }
+}
