@@ -209,9 +209,11 @@ locals {
     "kms:DisableKey",
     "kms:DisableKeyRotation",
     "kms:PutKeyPolicy",
-    "kms:CreateGrant",
-    "kms:RetireGrant",
-    "kms:RevokeGrant",
+    # CreateGrant is handled separately below — a blanket deny here blocked ACM
+    # from issuing certificates, because AWS services legitimately create grants
+    # on AWS-managed keys on your behalf. RetireGrant/RevokeGrant are not
+    # ransomware primitives (revoking a grant is a denial of service at worst,
+    # and key deletion, disabling and policy rewriting are all still denied).
   ]
 
   # Account-level control, plus the spend tripwires. budgets:* and ce:* are
@@ -587,6 +589,29 @@ data "aws_iam_policy_document" "ci_guardrails" {
     resources = ["*"]
   }
 
+  # Grants are how a principal hands key use to something else, so an
+  # unconstrained CreateGrant is a way to widen access to a key. But AWS
+  # services create grants on AWS-managed keys as normal operation — ACM does it
+  # to store a certificate's private key.
+  #
+  # kms:GrantIsForAWSResource is set only when a service makes the call.
+  # BoolIfExists is load-bearing: on a direct user call the key is ABSENT, and
+  # IfExists makes the condition true, so the deny fires. A plain Bool would
+  # evaluate false on the absent key and let exactly the case we care about
+  # through.
+  statement {
+    sid       = "DenyUserInitiatedKeyGrants"
+    effect    = "Deny"
+    actions   = ["kms:CreateGrant"]
+    resources = ["*"]
+
+    condition {
+      test     = "BoolIfExists"
+      variable = "kms:GrantIsForAWSResource"
+      values   = ["false"]
+    }
+  }
+
   statement {
     sid       = "DenyAccountAndIdentityCenterControl"
     effect    = "Deny"
@@ -857,6 +882,29 @@ data "aws_iam_policy_document" "apply_permissions" {
     resources = local.bedrock_allowed_model_arns
   }
 
+  # ACM stores certificate private keys under the AWS-managed aws/acm key and
+  # needs a grant to do so. Conditioned so this only ever covers grants a
+  # service makes on our behalf, never a hand-rolled one.
+  statement {
+    sid       = "AllowServiceInitiatedKeyGrants"
+    effect    = "Allow"
+    actions   = ["kms:CreateGrant"]
+    resources = ["*"]
+
+    condition {
+      test     = "Bool"
+      variable = "kms:GrantIsForAWSResource"
+      values   = ["true"]
+    }
+  }
+
+  statement {
+    sid       = "ReadKeyMetadata"
+    effect    = "Allow"
+    actions   = ["kms:DescribeKey", "kms:ListGrants", "kms:ListAliases", "kms:RetireGrant"]
+    resources = ["*"]
+  }
+
   # Certificates for the CloudFront distribution. Must be issued in us-east-1 —
   # CloudFront accepts certificates from nowhere else — which the region lock
   # already permits.
@@ -1008,6 +1056,22 @@ data "aws_iam_policy_document" "ci_permissions_boundary" {
     resources = local.bedrock_allowed_model_arns
   }
 
+  # Reading a SecureString requires kms:Decrypt on the key behind it. Scoped by
+  # kms:ViaService so the grant only works through SSM — a runtime role cannot
+  # use it to decrypt anything else.
+  statement {
+    sid       = "DecryptParametersViaSSM"
+    effect    = "Allow"
+    actions   = ["kms:Decrypt"]
+    resources = ["*"]
+
+    condition {
+      test     = "StringEquals"
+      variable = "kms:ViaService"
+      values   = ["ssm.${var.aws_region}.amazonaws.com"]
+    }
+  }
+
   # Parameter namespace split — the reason secrets stay out of CI's reach:
   #
   #   /marcusdunnca/secret/*  created OUT OF BAND with `aws ssm put-parameter`.
@@ -1140,6 +1204,29 @@ data "aws_iam_policy_document" "ci_permissions_boundary" {
   # This whole group was absent. Most starkly, iam:DeleteAccountAlias was
   # permitted — the boundary allowed the exact permanent console-URL hijack the
   # guardrail spends a paragraph explaining.
+  # Grants are how a principal hands key use to something else, so an
+  # unconstrained CreateGrant is a way to widen access to a key. But AWS
+  # services create grants on AWS-managed keys as normal operation — ACM does it
+  # to store a certificate's private key.
+  #
+  # kms:GrantIsForAWSResource is set only when a service makes the call.
+  # BoolIfExists is load-bearing: on a direct user call the key is ABSENT, and
+  # IfExists makes the condition true, so the deny fires. A plain Bool would
+  # evaluate false on the absent key and let exactly the case we care about
+  # through.
+  statement {
+    sid       = "DenyUserInitiatedKeyGrants"
+    effect    = "Deny"
+    actions   = ["kms:CreateGrant"]
+    resources = ["*"]
+
+    condition {
+      test     = "BoolIfExists"
+      variable = "kms:GrantIsForAWSResource"
+      values   = ["false"]
+    }
+  }
+
   statement {
     sid       = "DenyAccountAndIdentityCenterControl"
     effect    = "Deny"
