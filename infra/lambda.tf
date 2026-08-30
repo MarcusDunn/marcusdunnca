@@ -351,21 +351,23 @@ resource "aws_lambda_function_url" "api" {
   function_name      = aws_lambda_function.api.function_name
   authorization_type = "NONE"
 
-  cors {
-    allow_origins = ["https://${var.app_domain}"]
-    allow_methods = ["GET", "POST", "PUT", "DELETE"]
-    # x-registration-task is not optional while bootstrapping passkeys: AWS
-    # answers preflight from this block without ever invoking the handler, so a
-    # custom header the handler advertises is still refused by the browser
-    # unless it is listed here. The failure mode is an opaque "network request
-    # failed" with nothing in the logs, because the request never arrives.
-    #
-    # max_age below means a browser that preflighted before this landed can
-    # cache the refusal for an hour — use a fresh profile if that bites.
-    allow_headers     = ["content-type", "authorization", "x-registration-token"]
-    allow_credentials = false
-    max_age           = 3600
-  }
+  # NO cors block here, deliberately.
+  #
+  # The handler emits CORS headers itself (app/api/src/http.rs). Configuring it
+  # in BOTH places is not additive — AWS appends its headers to the handler's,
+  # producing two Access-Control-Allow-Origin values on every response. The CORS
+  # spec permits exactly one, so browsers reject the response outright and
+  # report a generic network failure with no usable detail.
+  #
+  # That is precisely what happened: every server-side check passed, because
+  # curl does not enforce CORS, while every browser request failed. The only
+  # visible evidence was `curl -i | grep -c access-control-allow-origin` = 2.
+  #
+  # The handler owns CORS because it also has to agree with the WebAuthn
+  # relying-party origin, and keeping those two in one place is what stops them
+  # drifting. The cost is that preflight now invokes the function instead of
+  # being answered by AWS — negligible here, and the handler already implements
+  # the OPTIONS branch.
 }
 
 resource "aws_lambda_function" "generate" {
