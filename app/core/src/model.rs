@@ -45,47 +45,48 @@ pub struct Question {
     pub explanation: String,
     /// The parts that differ by format, including the key.
     ///
-    /// Flattened, so the stored item is `{id, skill, prompt, explanation,
-    /// options, answer}` or `{…, numeric}` — one level, exactly as before this
-    /// was an enum. That is what lets rows written under the old shape keep
-    /// reading without a migration.
+    /// Flattened, so the stored item stays `{id, skill, prompt, explanation,
+    /// format, options, answer}` — one level, byte-for-byte the shape the rows
+    /// already in the table have. That is what lets this become an enum with no
+    /// migration.
     #[serde(flatten)]
     pub body: QuestionBody,
 }
 
 /// The answer key, in the shape its format actually has.
 ///
-/// # Why this is an enum, and why it is untagged
+/// # Why this is an enum
 ///
-/// The two kinds of question share no answer key, so every alternative shape —
-/// a flat struct with optional fields, a `format` field plus a payload — makes
-/// "numeric question, no figure" and "multiple choice, no letter" representable
-/// states that something has to check for. This makes them unrepresentable
-/// instead, which is the difference between a rule and a habit.
+/// The two kinds of question share no answer key, so a flat struct with
+/// `options`, `answer` and `numeric` all optional makes "numeric question, no
+/// figure" and "multiple choice, no letter" representable states that something
+/// has to go and check for. It did, and the check had to fail a whole
+/// submission when it fired. These are now unrepresentable, which is the
+/// difference between a rule and a habit.
 ///
-/// **There is deliberately no `format` field.** A stored discriminant is a
-/// second statement of something the payload already says, and two statements
-/// of one fact can disagree. [`QuestionBody::format`] derives it. This also
-/// closes, permanently, the failure that removed `format` from the generator's
-/// schema in the first place: Sonnet answering `"format": "definitional"` and
-/// costing ten good questions. There is no longer a field to put a skill in.
+/// # Why it is tagged on `format`, and why `format` is no longer a field
 ///
-/// `untagged` rather than `tag = "format"` for one reason, and it is about the
-/// rows already in the table: questions written before the numeric format
-/// existed carry no `format` key at all, so there is no tag to dispatch on and
-/// an internally-tagged enum would fail on every one of them. Untagged
-/// dispatches on the shape, which those rows have. A stray `format` key left
-/// over from an even older row is ignored rather than believed — which is the
-/// right way round.
+/// Those sound contradictory and are not. `format` **is** stored — serde writes
+/// the tag — but nothing can set it independently of the payload, because it is
+/// generated from the variant. That is the property that matters: before, the
+/// discriminant and the key were two fields that could disagree, and the way
+/// they disagreed was a model answering `"format": "definitional"` and costing
+/// ten good questions. There is no longer a slot to put a skill in.
 ///
-/// Variant order matters and is not arbitrary: `MultipleChoice` requires both
-/// `options` and `answer`, so a numeric row cannot satisfy it, and a
-/// multiple-choice row cannot satisfy `Numeric` because it has no `numeric`
-/// key. Neither is a prefix of the other, so the ordering is a tie-break that
-/// never fires — stated here because untagged enums are exactly where that
-/// stops being true when someone adds a third variant.
+/// Reading is checked in the same direction: a row claiming `numeric` while
+/// carrying four options no longer deserializes at all, where an untagged enum
+/// would have quietly read it as multiple choice and been right by accident.
+///
+/// Untagged was the first attempt, on the belief that rows written after the
+/// generator stopped being asked for a `format` carry no tag to dispatch on.
+/// They do — the field was *defaulted on read* and always *written on save*, so
+/// every question in the table has `"format": "multiple_choice"`. Verified
+/// against the table rather than assumed, which is how the mistake surfaced.
+/// With no untagged rows to accommodate, tagged wins on every axis: it checks
+/// the discriminant instead of ignoring it, and it fails with the name of the
+/// field that was wrong rather than "data did not match any variant".
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
+#[serde(tag = "format", rename_all = "snake_case")]
 pub enum QuestionBody {
     MultipleChoice {
         /// Exactly four, validated at generation time so [`Choice::index`]
@@ -99,12 +100,13 @@ pub enum QuestionBody {
 }
 
 impl QuestionBody {
-    /// The format, derived rather than stored.
+    /// The format, as a value rather than as the serde tag.
     ///
-    /// Still a [`QuestionFormat`] because the *wire* and the *attempt record*
-    /// both need one: the browser discriminates on it, and an attempt stores
-    /// what the question was at the time it was answered. What has gone away is
-    /// a copy of it on the question itself.
+    /// The tag and this method are the same fact reached two ways, and both
+    /// come from the variant — so this is not a second source of truth, it is
+    /// the only one, in the form Rust can use. The wire types and the attempt
+    /// record both need it: the browser discriminates on it, and an attempt
+    /// stores what the question was at the time it was answered.
     pub const fn format(&self) -> QuestionFormat {
         match self {
             QuestionBody::MultipleChoice { .. } => QuestionFormat::MultipleChoice,
@@ -504,40 +506,51 @@ pub struct ChallengeItem {
 mod tests {
     use super::*;
 
-    /// Rows written when `format` was a stored field — some carrying it, some
-    /// not, depending on which side of PR #39 they were generated on.
+    /// **The whole compatibility claim, written as the exact shape in the
+    /// table.**
     ///
-    /// **This is the whole compatibility claim of the untagged enum**, and it is
-    /// the reason the enum is untagged rather than tagged on `format`: a tagged
-    /// enum would fail outright on the first of these, which is the shape every
-    /// question in the table currently has.
+    /// Copied from a real row rather than composed: every question stored today
+    /// carries `"format": "multiple_choice"`, because the field was defaulted
+    /// on read but always written on save. Getting that backwards is what sent
+    /// the first attempt at this enum to `untagged`.
     #[test]
     fn rows_written_before_the_body_was_an_enum_still_read() {
-        let without: Question = serde_json::from_str(
-            r#"{"id":"q1","skill":"causal","prompt":"why?",
-                "options":["a","b","c","d"],"answer":"a","explanation":"page 1"}"#,
-        )
-        .expect("a row with no format key");
-        assert_eq!(without.format(), QuestionFormat::MultipleChoice);
-        assert_eq!(without.answer(), Some(Choice::A));
-
-        let with: Question = serde_json::from_str(
+        let stored: Question = serde_json::from_str(
             r#"{"id":"q1","format":"multiple_choice","skill":"causal","prompt":"why?",
                 "options":["a","b","c","d"],"answer":"a","explanation":"page 1"}"#,
         )
-        .expect("a row that still carries the old discriminant");
-        assert_eq!(with.format(), QuestionFormat::MultipleChoice);
+        .expect("the shape every stored question has");
 
-        // A leftover discriminant is *ignored*, not believed. It is no longer
-        // stored, so the payload is the only statement of what this is — which
-        // is the point of removing the field. A row that says `numeric` while
-        // carrying four options is still four options.
-        let lying: Question = serde_json::from_str(
+        assert_eq!(stored.format(), QuestionFormat::MultipleChoice);
+        assert_eq!(stored.answer(), Some(Choice::A));
+        assert_eq!(stored.options().len(), 4);
+    }
+
+    /// A discriminant that contradicts its payload is refused, not quietly
+    /// resolved one way or the other.
+    ///
+    /// This is what the tag buys over dispatching on shape: an untagged enum
+    /// would read the first of these as multiple choice — the right answer, by
+    /// accident, from a row that is telling us something has gone wrong.
+    #[test]
+    fn a_discriminant_that_contradicts_the_payload_is_refused() {
+        for lying in [
+            // Says numeric, carries options.
             r#"{"id":"q1","format":"numeric","skill":"causal","prompt":"why?",
                 "options":["a","b","c","d"],"answer":"a","explanation":"page 1"}"#,
-        )
-        .expect("the stray key does not fail the row");
-        assert_eq!(lying.format(), QuestionFormat::MultipleChoice);
+            // Says multiple choice, carries a figure.
+            r#"{"id":"q1","format":"multiple_choice","skill":"figure_recall",
+                "prompt":"how much?","numeric":{"value":1.0,"tolerance":0.1,"unit":"%"},
+                "explanation":"table 1"}"#,
+            // A format nothing knows.
+            r#"{"id":"q1","format":"definitional","skill":"causal","prompt":"why?",
+                "options":["a","b","c","d"],"answer":"a","explanation":"page 1"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<Question>(lying).is_err(),
+                "a self-contradicting row deserialized: {lying}"
+            );
+        }
     }
 
     /// The state the enum exists to make unrepresentable.
@@ -551,13 +564,13 @@ mod tests {
             // Says nothing about how it is answered.
             r#"{"id":"q1","skill":"causal","prompt":"why?","explanation":"page 1"}"#,
             // Options with no key.
-            r#"{"id":"q1","skill":"causal","prompt":"why?",
+            r#"{"id":"q1","format":"multiple_choice","skill":"causal","prompt":"why?",
                 "options":["a","b","c","d"],"explanation":"page 1"}"#,
             // A key with no options.
-            r#"{"id":"q1","skill":"causal","prompt":"why?",
+            r#"{"id":"q1","format":"multiple_choice","skill":"causal","prompt":"why?",
                 "answer":"a","explanation":"page 1"}"#,
             // A figure that is not a figure.
-            r#"{"id":"q1","skill":"figure_recall","prompt":"how much?",
+            r#"{"id":"q1","format":"numeric","skill":"figure_recall","prompt":"how much?",
                 "numeric":{"tolerance":1.0},"explanation":"table 1"}"#,
         ] {
             assert!(
@@ -567,17 +580,31 @@ mod tests {
         }
     }
 
-    /// The stored shape must stay one level deep, or every existing row is
-    /// orphaned and the compatibility tests above are checking a shape nothing
-    /// writes. This is what `#[serde(flatten)]` is buying.
+    /// The stored shape must stay one level deep and keep the same keys, or
+    /// every existing row is orphaned and the compatibility test above is
+    /// checking a shape nothing writes. This is what `#[serde(flatten)]` buys.
     #[test]
-    fn the_body_is_flattened_into_the_row_rather_than_nested() {
+    fn the_stored_shape_is_unchanged_by_the_body_becoming_an_enum() {
         let json = serde_json::to_string(&numeric_question()).expect("serializes");
         assert!(json.contains(r#""numeric":{"#), "{json}");
-        assert!(!json.contains(r#""body":"#), "{json}");
+        assert!(!json.contains(r#""body":"#), "nothing nested: {json}");
         assert!(
-            !json.contains(r#""format":"#),
-            "the discriminant is derived, not stored: {json}"
+            json.contains(r#""format":"numeric""#),
+            "the tag is written, from the variant: {json}"
+        );
+
+        // And the multiple-choice shape is exactly what the table holds today,
+        // so a round trip through this type is a no-op on an existing row.
+        let stored = r#"{"id":"q1","format":"multiple_choice","skill":"causal","prompt":"why?",
+                "options":["a","b","c","d"],"answer":"a","explanation":"page 1"}"#;
+        let parsed: Question = serde_json::from_str(stored).expect("parses");
+        let rewritten: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&parsed).expect("serializes"))
+                .expect("valid json");
+        assert_eq!(
+            rewritten,
+            serde_json::from_str::<serde_json::Value>(stored).expect("valid json"),
+            "rewriting a stored row must not change it"
         );
     }
 
@@ -599,7 +626,7 @@ mod tests {
         use aws_sdk_dynamodb::types::AttributeValue;
 
         let mc: Question = serde_json::from_str(
-            r#"{"id":"c1","skill":"causal","prompt":"why?",
+            r#"{"id":"c1","format":"multiple_choice","skill":"causal","prompt":"why?",
                 "options":["w","x","y","z"],"answer":"c","explanation":"page 1"}"#,
         )
         .expect("parses");
@@ -666,7 +693,7 @@ mod tests {
     #[test]
     fn a_multiple_choice_payload_carries_no_numeric_fields() {
         let q: Question = serde_json::from_str(
-            r#"{"id":"q1","skill":"causal","prompt":"why?",
+            r#"{"id":"q1","format":"multiple_choice","skill":"causal","prompt":"why?",
                 "options":["w","x","y","z"],"answer":"a","explanation":"page 1"}"#,
         )
         .expect("parses");
@@ -681,7 +708,7 @@ mod tests {
     #[test]
     fn the_format_follows_the_shape_of_the_key() {
         let mc: Question = serde_json::from_str(
-            r#"{"id":"q1","skill":"causal","prompt":"why?",
+            r#"{"id":"q1","format":"multiple_choice","skill":"causal","prompt":"why?",
                 "options":["w","x","y","z"],"answer":"b","explanation":"page 1"}"#,
         )
         .expect("parses");
