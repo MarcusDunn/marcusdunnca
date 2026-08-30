@@ -134,9 +134,18 @@ jobs:
 
       - name: Invalidate CloudFront
         run: |
+          # /* rather than naming paths. Assets are content-hashed so their URLs
+          # change on every build and never need invalidating — but a DELETED
+          # file does, and naming paths cannot express "whatever went away".
+          # register.html was removed from the bucket and CloudFront kept
+          # serving it, because the sync writes non-index files with
+          # max-age=31536000,immutable.
+          #
+          # A wildcard counts as ONE path against the 1000 free per month, so
+          # this is free, and re-warming a cache at this traffic costs nothing.
           id=$(aws cloudfront create-invalidation \
             --distribution-id "${{ vars.CLOUDFRONT_DISTRIBUTION_ID }}" \
-            --paths '/index.html' '/' \
+            --paths '/*' \
             --query 'Invalidation.Id' --output text)
           echo "invalidation $id"
 

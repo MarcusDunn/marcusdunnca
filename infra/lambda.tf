@@ -349,39 +349,25 @@ resource "aws_lambda_function" "api" {
 # (the JWT check is inside the handler because the WebAuthn state lives there
 # anyway), no custom domain. Function URLs are free.
 #
-# authorization_type NONE means AWS performs no check at all: every request
-# reaches the handler and is billed, whether or not it carries a valid JWT. The
-# handler must therefore authenticate before it touches the table, and the
-# account's concurrency limit is doing the work reserved concurrency cannot —
-# see the note on the function above.
+# authorization_type AWS_IAM, not NONE.
 #
-# CORS is required, not decorative. The SPA is served from CloudFront at
-# var.app_domain and calls this URL cross-origin, so without an allowed origin
-# the browser blocks every response. Credentials stay off: the JWT travels in
-# the Authorization header, so no cookie ever needs to cross origins.
-# ---------------------------------------------------------------------------
+# NONE meant anyone who learned this URL could invoke the function directly, and
+# with account concurrency capped at 10 that is a trivially available
+# exhaustion vector. AWS_IAM requires a sigv4-signed request, and the only
+# signer is the CloudFront Origin Access Control — so the function is reachable
+# through the distribution and nowhere else.
+#
+# Auth for actual users is still the handler's job; this only decides who may
+# reach the handler at all.
 
 resource "aws_lambda_function_url" "api" {
   function_name      = aws_lambda_function.api.function_name
-  authorization_type = "NONE"
+  authorization_type = "AWS_IAM"
 
-  # NO cors block here, deliberately.
-  #
-  # The handler emits CORS headers itself (app/api/src/http.rs). Configuring it
-  # in BOTH places is not additive — AWS appends its headers to the handler's,
-  # producing two Access-Control-Allow-Origin values on every response. The CORS
-  # spec permits exactly one, so browsers reject the response outright and
-  # report a generic network failure with no usable detail.
-  #
-  # That is precisely what happened: every server-side check passed, because
-  # curl does not enforce CORS, while every browser request failed. The only
-  # visible evidence was `curl -i | grep -c access-control-allow-origin` = 2.
-  #
-  # The handler owns CORS because it also has to agree with the WebAuthn
-  # relying-party origin, and keeping those two in one place is what stops them
-  # drifting. The cost is that preflight now invokes the function instead of
-  # being answered by AWS — negligible here, and the handler already implements
-  # the OPTIONS branch.
+  # No cors block, and the handler's CORS headers are now dead code too: the
+  # SPA reaches this through the distribution at /api/*, which is same-origin,
+  # so no preflight is issued and no ACAO header is consulted. Direct callers
+  # cannot reach it at all — see authorization_type above.
 }
 
 resource "aws_lambda_function" "generate" {
