@@ -15,6 +15,29 @@
 //! 3. **Nothing here trusts the model's sense of position.** See
 //!    [`shuffle_options`].
 //!
+//! # The rule that cannot be checked here, and cost the most
+//!
+//! Every constraint below is restated in [`validate`] because a schema is an
+//! instruction rather than an enforcement point. One is not, and cannot be:
+//! **exactly one option may be a defensible answer to the prompt.** Deciding
+//! that needs the document, so it lives only in the wording handed to the
+//! model.
+//!
+//! It is worth knowing what it looks like when it fails, because the failure is
+//! invisible from the data. Asked why Canada's labour market was tightening
+//! while GDP contracted, a generation offered both of the report's own
+//! explanations — the inventory drawdown that hid resilient domestic demand,
+//! and the shrinking labour force from immigration policy. One was keyed
+//! correct. The other was almost verbatim from the report's Highlights. The
+//! reader picked it at 99% confidence, because they had read the Highlights,
+//! and lost the maximum penalty the scoring rule can impose.
+//!
+//! Note where that came from: the instruction to draw wrong options *from the
+//! document*, which exists to stop invented statistics being taught as real.
+//! That rule is right and it is what makes this one necessary — a true sentence
+//! lifted from another paragraph reads as a distractor and argues as an answer.
+//! Drawn from the document has to mean **mis-bound**, not merely true.
+//!
 //! # Why tool use rather than "return JSON"
 //!
 //! Asking for bare JSON in a prompt and parsing the reply worked, in the sense
@@ -315,13 +338,23 @@ fn quiz_schema(known: &[Topic]) -> serde_json::Value {
                                 "maxLength": limits::OPTION_MAX
                             },
                             "description":
-                                "Four options. The three wrong ones must be claims made \
-                                 somewhere in the document, or plain misreadings of it — never \
-                                 an invented statistic. A wrong option that states a number the \
-                                 document does not contain teaches that number; the reader will \
-                                 remember having considered it. If an option must carry a \
-                                 figure, use one the document prints elsewhere, attached to the \
-                                 wrong year or the wrong region."
+                                "Four options, of which EXACTLY ONE may be a defensible answer \
+                                 to the prompt. That is stronger than 'one is correct', and it \
+                                 is the rule that breaks. A prompt like 'why is X tightening \
+                                 even though Y fell' has two halves; if the document gives one \
+                                 reason for X and a different reason for Y, then an option \
+                                 stating either reason is defensible and the question has two \
+                                 answers. Test every wrong option by asking whether someone who \
+                                 had read the document could argue for it. If they could, it is \
+                                 not a wrong option.\n\
+                                 \n\
+                                 The three wrong ones must still come from the document — never \
+                                 an invented statistic, because a reader who deliberates over a \
+                                 fabricated figure remembers it. But 'from the document' means \
+                                 MIS-BOUND, not merely true: a real claim attached to the wrong \
+                                 year, the wrong province, or the wrong mechanism. A true \
+                                 sentence lifted out of another paragraph is the trap — it looks \
+                                 like a distractor and argues like an answer."
                         },
                         "answer": {
                             "type": "string",
@@ -461,10 +494,14 @@ fn system_prompt() -> String {
          weighed the number, not that they rejected it. Set each tolerance where someone \
          who genuinely absorbed the document would land.\n\
          \n\
-         2. Wrong options in `choice_questions` must be claims the document actually \
-         makes, or plain misreadings of it. An option that is obviously absurd, or \
-         noticeably longer and more qualified than the others, gives the answer away \
-         without any reading at all."
+         2. Exactly one option in a `choice_questions` item may be a defensible answer. \
+         The other three must come from the document and be MIS-BOUND — a real claim \
+         attached to the wrong year, region or mechanism — never invented, and never a \
+         claim the document makes about the thing the prompt is actually asking. \
+         Lifting a true sentence from elsewhere in the report is the specific way this \
+         goes wrong: it reads as a distractor and argues as an answer. An option that is \
+         obviously absurd, or noticeably longer and more qualified than the others, \
+         gives the answer away without any reading at all."
     )
 }
 
