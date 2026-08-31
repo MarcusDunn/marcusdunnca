@@ -151,6 +151,10 @@ fn narrow(attempt: Attempt, filter: &HistoryFilter) -> Option<HistoryAttemptDto>
     let questions: Vec<HistoryQuestionDto> = attempt
         .responses
         .into_iter()
+        // Voided answers are kept on the row and excluded from every rate. A
+        // question nobody could answer correctly must not appear in a
+        // correct-rate or a reliability curve.
+        .filter(|r| !r.voided)
         .filter(|r| filter.format.is_none_or(|f| r.format == f))
         .filter(|r| filter.skill.is_none_or(|s| r.skill == s))
         .map(|r| HistoryQuestionDto {
@@ -221,6 +225,7 @@ mod tests {
                         correct,
                         QuestionFormat::MultipleChoice,
                     ),
+                    voided: false,
                     correct,
                 })
                 .collect(),

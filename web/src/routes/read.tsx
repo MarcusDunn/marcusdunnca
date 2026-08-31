@@ -7,6 +7,7 @@ import { api } from "../lib/api";
 import { formatFigure, formatTolerance, parseFigure } from "../lib/figures";
 import { documentUrlQuery, queryKeys, quizQuery } from "../lib/queries";
 import { ConfidenceSlider, signed } from "../components/confidence";
+import { VoidQuestion } from "../components/void-question";
 import {
   CHANCE_FLOOR_PERCENT,
   CONFIDENCE_LABELS,
@@ -510,6 +511,7 @@ function Results({ result }: { result: AttemptResult }) {
               <NumericVerdict graded={graded} />
             )}
             {graded.explanation ? <p>{graded.explanation}</p> : null}
+            <VoidQuestion documentId={result.documentId} questionId={graded.questionId} />
           </li>
         ))}
       </ol>

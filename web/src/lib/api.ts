@@ -12,10 +12,12 @@ import {
   Quiz,
   ReviewQueue,
   ReviewSubmitResult,
+  VoidResult,
   type CreateDocumentRequest,
   type DocumentSummary,
   type ReviewSubmitRequest,
   type SubmitQuizRequest,
+  type VoidRequest,
 } from "./schemas";
 
 /**
@@ -181,6 +183,12 @@ export const api = {
     }),
 
   history: () => request("/history", History).then((r) => r.attempts),
+
+  voidQuestion: (documentId: string, body: VoidRequest) =>
+    request(`/docs/${encodeURIComponent(documentId)}/void`, VoidResult, {
+      method: "POST",
+      body,
+    }),
 
   reviewQueue: (signal?: AbortSignal) =>
     request("/review", ReviewQueue, signal ? { signal } : {}),

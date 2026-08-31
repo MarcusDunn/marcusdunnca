@@ -209,6 +209,10 @@ async fn dispatch(
             let entries = history::list(state, &filter).await?;
             Ok(http::json(origin, 200, &entries))
         }
+        (&Method::POST, ["docs", id, "void"]) => {
+            let result = docs::set_void(state, id, body_json(&req)?).await?;
+            Ok(http::json(origin, 200, &result))
+        }
         (&Method::GET, ["review"]) => {
             let queue = review::queue(state).await?;
             Ok(http::json(origin, 200, &queue))

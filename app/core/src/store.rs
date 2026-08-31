@@ -780,6 +780,147 @@ impl Store {
         Ok(())
     }
 
+    /// Withdraw a question, or restore one.
+    ///
+    /// # Three rows change, and they must agree
+    ///
+    /// The question is the source of truth, but two things are derived from it
+    /// and would otherwise disagree with it:
+    ///
+    ///   - **past attempts**, whose stored `score`, `total` and bits counted the
+    ///     question. Recomputed here rather than at read time so the row stays
+    ///     self-consistent — a stored total that no longer matches its own
+    ///     responses is the kind of thing that is discovered a year later.
+    ///   - **the review schedule**, which would otherwise keep offering a
+    ///     question nobody can answer correctly. Deleted outright: the schedule
+    ///     is derived state and a restore reseeds it from the next attempt.
+    ///
+    /// # This is the one operation that rewrites history
+    ///
+    /// Everything else in this file treats an attempt as a record of what was
+    /// true when it was taken, and copies rather than joins for exactly that
+    /// reason. Voiding is the deliberate exception, because the alternative is
+    /// a permanent record of a measurement that everyone agrees was invalid.
+    /// The answers themselves are never deleted — only flagged, so a voided
+    /// attempt is still auditable.
+    ///
+    /// Not transactional. A partial application leaves a voided question with a
+    /// stale attempt total, which is wrong but visible and fixable by voiding
+    /// again; a transaction across a document, its attempts and a review row
+    /// would cost far more capacity than that risk is worth on a 5 WCU table.
+    pub async fn set_question_void(
+        &self,
+        doc_id: &str,
+        qid: &str,
+        void: Option<crate::model::Void>,
+    ) -> Result<bool> {
+        let Some(mut doc) = self.get_doc(doc_id).await? else {
+            return Ok(false);
+        };
+
+        let Some(question) = doc.questions.iter_mut().find(|q| q.id == qid) else {
+            return Ok(false);
+        };
+        question.void = void.clone();
+
+        let live = doc.questions.iter().filter(|q| !q.is_void()).count();
+        let questions: AttributeValue = serde_dynamo::to_attribute_value(&doc.questions)
+            .map_err(|e| Error::Aws(e.to_string()))?;
+
+        self.client
+            .update_item()
+            .table_name(&self.table)
+            .key("pk", AttributeValue::S(keys::doc_pk(doc_id)))
+            .key("sk", AttributeValue::S(keys::META_SK.to_string()))
+            .update_expression("SET questions = :q, question_count = :n")
+            .expression_attribute_values(":q", questions)
+            .expression_attribute_values(":n", AttributeValue::N(live.to_string()))
+            .send()
+            .await
+            .map_err(aws)?;
+
+        self.revoid_attempts(doc_id, qid, void.is_some()).await?;
+
+        if void.is_some() {
+            self.client
+                .delete_item()
+                .table_name(&self.table)
+                .key("pk", AttributeValue::S(keys::REVIEW_PK.to_string()))
+                .key("sk", AttributeValue::S(keys::review_sk(doc_id, qid)))
+                .send()
+                .await
+                .map_err(aws)?;
+        }
+
+        Ok(true)
+    }
+
+    /// Flag or unflag one question across every attempt at a document, and
+    /// recompute the totals that counted it.
+    async fn revoid_attempts(&self, doc_id: &str, qid: &str, voided: bool) -> Result<()> {
+        let out = self
+            .client
+            .query()
+            .table_name(&self.table)
+            .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
+            .expression_attribute_values(":pk", AttributeValue::S(keys::doc_pk(doc_id)))
+            .expression_attribute_values(
+                ":prefix",
+                AttributeValue::S(keys::ATTEMPT_PREFIX.to_string()),
+            )
+            .send()
+            .await
+            .map_err(aws)?;
+
+        for item in out.items() {
+            let mut attempt: Attempt = match serde_dynamo::from_item(item.clone()) {
+                Ok(a) => a,
+                Err(e) => {
+                    tracing::warn!(error = %e, "skipping unreadable attempt while voiding");
+                    continue;
+                }
+            };
+
+            let mut touched = false;
+            for response in &mut attempt.responses {
+                if response.qid == qid && response.voided != voided {
+                    response.voided = voided;
+                    touched = true;
+                }
+            }
+            if !touched {
+                continue;
+            }
+
+            let live = attempt.responses.iter().filter(|r| !r.voided);
+            attempt.score = live.clone().filter(|r| r.correct).count();
+            attempt.total = live.clone().count();
+            attempt.score_bits = live.clone().map(|r| r.score_bits).sum();
+            // `max_score_bits` cannot be recomputed from the responses — the
+            // ceiling depends on the question's format, which the response
+            // carries, so scale it by the share of questions still counted.
+            // Approximate, and honest about it: the alternative is reading the
+            // document back for a number the reader sees as a denominator.
+            let kept = attempt.total as f64;
+            let all = attempt.responses.len() as f64;
+            if all > 0.0 {
+                attempt.max_score_bits *= kept / all;
+            }
+
+            let stored: Item =
+                serde_dynamo::to_item(&attempt).map_err(|e| Error::Aws(e.to_string()))?;
+            self.client
+                .put_item()
+                .table_name(&self.table)
+                .set_item(Some(stored))
+                .send()
+                .await
+                .map_err(aws)?;
+        }
+
+        Ok(())
+    }
+
     pub async fn put_challenge(&self, challenge: &ChallengeItem) -> Result<()> {
         let item: Item = serde_dynamo::to_item(challenge).map_err(|e| Error::Aws(e.to_string()))?;
 

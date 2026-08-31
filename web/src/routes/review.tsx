@@ -6,6 +6,7 @@ import { api } from "../lib/api";
 import { formatFigure, formatTolerance, parseFigure } from "../lib/figures";
 import { queryKeys, reviewQueueQuery } from "../lib/queries";
 import { ConfidenceSlider, signed } from "../components/confidence";
+import { VoidQuestion } from "../components/void-question";
 import {
   CHANCE_FLOOR_PERCENT,
   CONFIDENCE_LABELS,
@@ -359,6 +360,7 @@ function Results({
             </p>
             <Answer graded={graded} />
             {graded.explanation ? <p>{graded.explanation}</p> : null}
+            <VoidQuestion documentId={graded.documentId} questionId={graded.questionId} />
           </li>
         ))}
       </ol>

@@ -143,9 +143,15 @@ pub async fn queue(state: &AppState) -> Result<ReviewQueueResponse> {
         if doc.status != DocStatus::Ready {
             continue;
         }
-        let Some(question) = doc.questions.iter().find(|q| q.id == item.qid) else {
-            // The document was regenerated and this question no longer exists.
-            tracing::warn!(qid = %item.qid, "review row for a question that is gone");
+        let Some(question) = doc
+            .questions
+            .iter()
+            .find(|q| q.id == item.qid && !q.is_void())
+        else {
+            // Regenerated away, or voided between the schedule being written
+            // and now. Voiding deletes the row, so this is the race rather than
+            // the normal path.
+            tracing::warn!(qid = %item.qid, "review row for a question that is gone or void");
             continue;
         };
 
@@ -329,7 +335,11 @@ pub async fn submit(state: &AppState, req: ReviewSubmitRequest) -> Result<Review
         let schedule = state.store.list_reviews_for_doc(doc_id).await?;
 
         for answer in answers {
-            let Some(question) = doc.questions.iter().find(|q| q.id == answer.question_id) else {
+            let Some(question) = doc
+                .questions
+                .iter()
+                .find(|q| q.id == answer.question_id && !q.is_void())
+            else {
                 return Err(Error::Invalid(format!(
                     "no such question: {}",
                     answer.question_id
@@ -471,6 +481,7 @@ mod tests {
             shelf: trainer_core::tags::Shelf::Slow,
             prompt: "Why did the forecast change?".into(),
             explanation: "Section 2.".into(),
+            void: None,
             body: QuestionBody::MultipleChoice {
                 options: vec![
                     "stored-a".into(),
@@ -605,6 +616,7 @@ mod tests {
             shelf: trainer_core::tags::Shelf::Dated,
             prompt: "How much?".into(),
             explanation: "Table 1.".into(),
+            void: None,
             body: QuestionBody::Numeric {
                 numeric: NumericAnswer {
                     value: -4.0,
