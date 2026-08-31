@@ -6,7 +6,9 @@ import { Busy, BusyMark, ErrorNotice } from "../components/ui";
 import { api } from "../lib/api";
 import { formatFigure, formatTolerance, parseFigure } from "../lib/figures";
 import { documentUrlQuery, queryKeys, quizQuery } from "../lib/queries";
+import { ConfidenceSlider } from "../components/confidence";
 import {
+  CHANCE_FLOOR_PERCENT,
   CONFIDENCE_BANDS,
   CONFIDENCE_BOUNDS,
   CONFIDENCE_LABELS,
@@ -33,9 +35,9 @@ const OPTION_LETTERS = ["A", "B", "C", "D"] as const;
  * typed figure. Parsing happens at the boundary, not in form state, so what the
  * reader sees in the box is always what they typed.
  */
-type Entry = { answer: string; confidence: Confidence | "" };
+type Entry = { answer: string; confidencePercent: number | null };
 
-const EMPTY: Entry = { answer: "", confidence: "" };
+const EMPTY: Entry = { answer: "", confidencePercent: null };
 
 export function ReadScreen() {
   const { documentId } = useParams({ from: "/_auth/docs/$documentId" });
@@ -90,15 +92,16 @@ export function ReadScreen() {
           const questionId = question.id;
           // The form refuses to submit with any band unset, so the fallback is
           // unreachable — and is the honest one if it ever is reached.
-          const confidence = entry.confidence === "" ? "guessing" : entry.confidence;
+          const confidencePercent =
+            entry.confidencePercent ?? CHANCE_FLOOR_PERCENT[question.format];
 
           // Two whole literals rather than one with a conditional spread. The
           // server rejects the wrong key for a question's format rather than
           // ignoring it, so which key is present is the meaningful part and it
           // should be readable as such.
           return question.format === "multiple_choice"
-            ? { questionId, optionId: entry.answer, confidence }
-            : { questionId, value: entry.answer, confidence };
+            ? { questionId, optionId: entry.answer, confidencePercent }
+            : { questionId, value: entry.answer, confidencePercent };
         }),
       });
     },
@@ -187,12 +190,13 @@ export function ReadScreen() {
 function ScoringNote() {
   return (
     <details>
-      <summary>How the confidence bands are scored</summary>
+      <summary>How the confidence slider is scored</summary>
       <p>
-        Every question asks how sure you are as well as what the answer is. The
-        points are arranged so that the best score comes from saying what you
-        actually believe — overstating and understating both cost you, so there
-        is nothing to be gained by playing the scale.
+        Every question asks for a probability as well as an answer. Where that
+        probability lands decides what the answer is worth, and the bands are
+        arranged so the best score comes from stating what you actually believe
+        — overstating and understating both cost you, so there is nothing to be
+        gained by playing the scale.
       </p>
       <table>
         <caption>Points per question</caption>
@@ -333,7 +337,9 @@ function describeProblems(quiz: Quiz, entries: Record<string, Entry>): string | 
     } couldn't be read as a number. Enter a figure like -4.2 — a range or a word won't score.`;
   }
 
-  const unrated = quiz.questions.filter((q) => entries[q.id]?.confidence === "").length;
+  const unrated = quiz.questions.filter(
+    (q) => (entries[q.id]?.confidencePercent ?? null) === null,
+  ).length;
   if (unrated > 0) {
     return `${unrated} question${
       unrated === 1 ? "" : "s"
@@ -410,53 +416,13 @@ function QuestionCard({
         </div>
       )}
 
-      <ConfidencePicker
-        questionId={question.id}
-        value={entry.confidence}
-        onChange={(confidence) => onChange({ ...entry, confidence })}
+      <ConfidenceSlider
+        idPrefix={question.id}
+        format={question.format}
+        percent={entry.confidencePercent}
+        onChange={(confidencePercent) => onChange({ ...entry, confidencePercent })}
         disabled={disabled}
       />
-    </fieldset>
-  );
-}
-
-function ConfidencePicker({
-  questionId,
-  value,
-  onChange,
-  disabled,
-}: {
-  questionId: string;
-  value: Confidence | "";
-  onChange: (next: Confidence) => void;
-  disabled: boolean;
-}) {
-  return (
-    // A nested fieldset, so a screen reader announces "how sure are you" rather
-    // than reading three more options as though they were answers to the
-    // question above.
-    <fieldset>
-      <legend>How sure are you?</legend>
-      {CONFIDENCE_BANDS.map((band) => {
-        const inputId = `${questionId}-confidence-${band}`;
-        return (
-          <span key={band}>
-            <input
-              type="radio"
-              id={inputId}
-              name={`${questionId}-confidence`}
-              value={band}
-              checked={value === band}
-              disabled={disabled}
-              onChange={() => onChange(band)}
-            />
-            <label htmlFor={inputId}>
-              {CONFIDENCE_LABELS[band]} (+{CONFIDENCE_POINTS[band].correct} /{" "}
-              {CONFIDENCE_POINTS[band].wrong})
-            </label>{" "}
-          </span>
-        );
-      })}
     </fieldset>
   );
 }
@@ -507,9 +473,11 @@ function Results({ result }: { result: AttemptResult }) {
             <h4>{graded.prompt}</h4>
             <p>
               {graded.correct ? "Correct" : "Incorrect"}
-              {graded.confidence
-                ? ` after saying ${CONFIDENCE_LABELS[graded.confidence].toLowerCase()}`
-                : ""}{" "}
+              {graded.confidencePercent === null
+                ? graded.confidence
+                  ? ` after saying ${CONFIDENCE_LABELS[graded.confidence].toLowerCase()}`
+                  : ""
+                : ` after saying ${graded.confidencePercent}%`}{" "}
               ({graded.points >= 0 ? "+" : ""}
               {graded.points}) — {SKILL_LABELS[graded.skill]} ·{" "}
               {graded.topics.map(topicLabel).join(", ")}

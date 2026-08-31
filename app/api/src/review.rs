@@ -238,6 +238,22 @@ pub struct SubmittedReview {
     pub value: Option<String>,
     #[serde(default)]
     pub confidence: Option<Confidence>,
+    /// The probability stated on the slider. Authoritative when present — the
+    /// band is derived from it. See `docs::SubmittedAnswer::band`.
+    #[serde(default)]
+    pub confidence_percent: Option<u8>,
+}
+
+impl SubmittedReview {
+    fn band(&self, format: QuestionFormat) -> (Option<Confidence>, Option<u8>) {
+        match self.confidence_percent {
+            Some(stated) => {
+                let percent = stated.clamp(Confidence::chance_floor_percent(format), 100);
+                (Some(Confidence::from_percent(percent)), Some(percent))
+            }
+            None => (self.confidence, None),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -248,6 +264,7 @@ pub struct ReviewResultDto {
     pub prompt: String,
     pub correct: bool,
     pub confidence: Option<Confidence>,
+    pub confidence_percent: Option<u8>,
     pub points: i32,
     /// In the order they were shown, so the results screen lines up with the
     /// question the reader just answered.
@@ -332,11 +349,12 @@ pub async fn submit(state: &AppState, req: ReviewSubmitRequest) -> Result<Review
                 })?;
 
             let graded = grade(question, &item, answer)?;
+            let (confidence, confidence_percent) = answer.band(question.format());
 
             if graded.correct {
                 correct_count += 1;
             }
-            let awarded = match answer.confidence {
+            let awarded = match confidence {
                 Some(band) if graded.answered => band.points(graded.correct),
                 _ => 0,
             };
@@ -348,14 +366,15 @@ pub async fn submit(state: &AppState, req: ReviewSubmitRequest) -> Result<Review
                 .and_then(|stored| position_of(&item.presentation, stored.index()))
                 .and_then(|i| Choice::ALL.get(i).copied());
 
-            item.record(graded.correct, answer.confidence, &now);
+            item.record(graded.correct, confidence, &now);
 
             results.push(ReviewResultDto {
                 question_id: question.id.clone(),
                 document_id: doc.doc_id.clone(),
                 prompt: question.prompt.clone(),
                 correct: graded.correct,
-                confidence: answer.confidence,
+                confidence,
+                confidence_percent,
                 points: awarded,
                 options: shown,
                 correct_option_id: key_in_presentation,
@@ -480,6 +499,7 @@ mod tests {
             option_id,
             value: None,
             confidence: Some(Confidence::FairlySure),
+            confidence_percent: Some(65),
         }
     }
 

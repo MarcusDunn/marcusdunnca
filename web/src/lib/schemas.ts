@@ -64,6 +64,33 @@ export const CONFIDENCE_BOUNDS: Record<Confidence, { low: number; high: number }
 
 export const MAX_POINTS_PER_QUESTION = 3;
 
+/**
+ * The lowest honest probability on a question of this shape. Mirrors
+ * `Confidence::chance_floor_percent`.
+ *
+ * Below chance is not modesty, it is an error: on four options you will answer
+ * *something*, so a one-in-four belief is the floor. The slider starts here and
+ * cannot go under it, which removes a class of meaningless report rather than
+ * scoring it. A typed figure has no options and so effectively no floor.
+ */
+export const CHANCE_FLOOR_PERCENT: Record<QuestionFormat, number> = {
+  multiple_choice: 25,
+  numeric: 2,
+};
+
+/**
+ * The band a stated percentage falls in. Mirrors `Confidence::from_percent`.
+ *
+ * Used only to show the reader what their slider position is worth *before*
+ * they commit to it. The server derives the band again from the number it is
+ * sent, and that derivation is the one that scores.
+ */
+export function bandForPercent(percent: number): Confidence {
+  if (percent < CONFIDENCE_BOUNDS.guessing.high) return "guessing";
+  if (percent < CONFIDENCE_BOUNDS.fairly_sure.high) return "fairly_sure";
+  return "certain";
+}
+
 export const Skill = z.enum([
   "figure_recall",
   "relational",
@@ -305,6 +332,8 @@ export const GradedQuestion = z.object({
   correct: z.boolean(),
   /** Null only for attempts predating confidence — not for a skipped question. */
   confidence: Confidence.nullable().default(null),
+  /** The probability actually stated. Null on attempts predating the slider. */
+  confidencePercent: z.number().int().min(0).max(100).nullable().default(null),
   /** As awarded by the server. Never recomputed here. */
   points: z.number().int(),
   explanation: z.string().default(""),
@@ -383,6 +412,7 @@ export const ReviewResult = z.object({
   prompt: z.string().min(1),
   correct: z.boolean(),
   confidence: Confidence.nullable().default(null),
+  confidencePercent: z.number().int().min(0).max(100).nullable().default(null),
   points: z.number().int(),
   options: z.array(QuestionOption),
   correctOptionId: z.string().nullable().default(null),
@@ -414,7 +444,7 @@ export const ReviewSubmitRequest = z.object({
       /** The letter **as shown**. The server maps it back. */
       optionId: z.string().min(1).optional(),
       value: z.string().min(1).optional(),
-      confidence: Confidence,
+      confidencePercent: z.number().int().min(0).max(100),
     }),
   ),
 });
@@ -435,6 +465,8 @@ export const HistoryQuestion = z.object({
   skill: Skill,
   topics: z.array(Topic).min(1),
   correct: z.boolean(),
+  /** The probability stated, when one was. Absent before the slider existed. */
+  confidencePercent: z.number().int().min(0).max(100).optional(),
   /**
    * Absent on every question answered before confidence was asked for.
    *
@@ -514,12 +546,10 @@ export const SubmitQuizRequest = z.object({
       /** Typed figures only, as entered. Sending it for a letter is a 400. */
       value: z.string().min(1).optional(),
       /**
-       * Required from this client. The server accepts its absence so a stale
-       * bundle can still submit, but an answer with no confidence scores no
-       * points and is excluded from the reliability table — so there is no
-       * version of this UI that should omit it.
+       * The probability off the slider. Authoritative: the server derives the
+       * band from it and ignores `confidence` when this is present.
        */
-      confidence: Confidence,
+      confidencePercent: z.number().int().min(0).max(100),
     }),
   ),
   // Wall-clock time on the quiz. Stored as 0 when absent.

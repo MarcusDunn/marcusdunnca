@@ -248,20 +248,78 @@ impl Confidence {
 
     /// The belief range this band is the best report for, as percentages.
     ///
-    /// Shown in the UI next to the band. The thresholds *are* the training
-    /// signal — a band labelled only "fairly sure" asks for a feeling, whereas
-    /// one labelled "50–80%" asks for a judgement you can be wrong about.
+    /// The thresholds *are* the training signal — a band labelled only "fairly
+    /// sure" asks for a feeling, whereas one labelled "50–80%" asks for a
+    /// judgement you can be wrong about.
     pub const fn belief_range(&self) -> (u8, u8) {
         match self {
             // The floor is 25 rather than 0 because four options means you
             // cannot honestly hold less than a one-in-four belief in a guess.
-            // On a numeric question the true floor is ~0, and quoting 25 there
-            // would be wrong — so this is documented as the multiple-choice
-            // reading and the UI does not print the lower bound for `guessing`.
+            // On a numeric question the true floor is ~0 — see
+            // `chance_floor_percent`.
             Confidence::Guessing => (25, 50),
             Confidence::FairlySure => (50, 80),
             Confidence::Certain => (80, 100),
         }
+    }
+
+    /// The band a stated probability falls in.
+    ///
+    /// **The bands are now derived, not chosen.** The reader states a
+    /// percentage; this puts it in a bucket. Both numbers are kept: the
+    /// percentage is what a reliability curve and a Brier score are computed
+    /// from, and the band is what the points table and the review scheduler
+    /// consume — neither of which wants a continuous input, and both of which
+    /// already have years of meaning attached to three buckets.
+    ///
+    /// The cut points are the same 0.50 and 0.80 the scoring rule crosses over
+    /// at, so a reader who reports honestly lands in the band that pays best.
+    /// That is what keeps the rule proper under a finer input rather than in
+    /// spite of it.
+    pub fn from_percent(percent: u8) -> Self {
+        if percent < Confidence::Guessing.belief_range().1 {
+            Confidence::Guessing
+        } else if percent < Confidence::FairlySure.belief_range().1 {
+            Confidence::FairlySure
+        } else {
+            Confidence::Certain
+        }
+    }
+
+    /// The lowest honest probability on a question of this shape.
+    ///
+    /// Below chance is not modesty, it is an error: on four options you will
+    /// answer *something*, so a one-in-four belief is the floor. The slider
+    /// starts here and cannot go under it, which removes a whole class of
+    /// meaningless report rather than scoring it.
+    ///
+    /// A typed figure has no options and therefore no floor worth speaking of —
+    /// the space of wrong numbers is unbounded. Two percent stands in for zero
+    /// so that a log-style score would stay finite if one is ever added, and so
+    /// the slider has somewhere to sit.
+    pub const fn chance_floor_percent(format: QuestionFormat) -> u8 {
+        match format {
+            QuestionFormat::MultipleChoice => 25,
+            QuestionFormat::Numeric => 2,
+        }
+    }
+
+    /// Squared error of a stated probability against what happened.
+    ///
+    /// The Brier score, per answer, in `[0, 1]` — lower is better. Averaged
+    /// over enough answers it is *the* summary of calibration, and unlike the
+    /// band table it uses the whole of what the reader said: 79% and 51% are
+    /// the same band and very different claims.
+    ///
+    /// Kept separate from `points` on purpose. Points are what you play
+    /// against, and being sure and wrong has to hurt; a Brier score is a
+    /// measurement, and it correctly *rewards* having said 30% on something you
+    /// got wrong. One number cannot do both jobs without lying about one of
+    /// them.
+    pub fn brier(percent: u8, correct: bool) -> f64 {
+        let p = f64::from(percent) / 100.0;
+        let outcome = f64::from(u8::from(correct));
+        (p - outcome).powi(2)
     }
 }
 
@@ -715,6 +773,75 @@ mod tests {
         // And those boundaries are the ones shown to the reader.
         assert_eq!(Confidence::Guessing.belief_range().1, 50);
         assert_eq!(Confidence::FairlySure.belief_range().1, 80);
+    }
+
+    /// A stated percentage must land in the band that pays best for it, or the
+    /// slider and the scoring rule are measuring different things and the
+    /// reader is being scored on a claim they did not make.
+    #[test]
+    fn the_band_a_percentage_falls_in_is_the_one_that_pays_best_for_it() {
+        for percent in 0..=100u8 {
+            let band = Confidence::from_percent(percent);
+            let p = f64::from(percent) / 100.0;
+
+            // Skip the exact crossovers, where two bands legitimately tie.
+            if percent == 50 || percent == 80 {
+                continue;
+            }
+
+            for other in Confidence::ALL {
+                if *other == band {
+                    continue;
+                }
+                assert!(
+                    expected(band, p) >= expected(*other, p),
+                    "at {percent}% the rule pays better for {other} than the assigned {band}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_bands_tile_the_whole_range() {
+        assert_eq!(Confidence::from_percent(0), Confidence::Guessing);
+        assert_eq!(Confidence::from_percent(49), Confidence::Guessing);
+        assert_eq!(Confidence::from_percent(50), Confidence::FairlySure);
+        assert_eq!(Confidence::from_percent(79), Confidence::FairlySure);
+        assert_eq!(Confidence::from_percent(80), Confidence::Certain);
+        assert_eq!(Confidence::from_percent(100), Confidence::Certain);
+    }
+
+    /// Below chance is not modesty, it is an error — and the floor differs by
+    /// format, because four options guarantee a one-in-four hit and a typed
+    /// figure guarantees nothing.
+    #[test]
+    fn the_floor_is_chance_on_multiple_choice_and_near_zero_on_a_figure() {
+        assert_eq!(
+            Confidence::chance_floor_percent(QuestionFormat::MultipleChoice),
+            25
+        );
+        assert!(Confidence::chance_floor_percent(QuestionFormat::Numeric) < 25);
+    }
+
+    /// The Brier score is a *measurement*, not a score to play against, and the
+    /// difference shows exactly here: saying 30% and being wrong is good
+    /// calibration and scores well, while the points table still charges you
+    /// nothing for it and would have charged you for saying 90%.
+    #[test]
+    fn brier_rewards_being_uncertain_about_something_you_got_wrong() {
+        assert!((Confidence::brier(100, true) - 0.0).abs() < 1e-12);
+        assert!((Confidence::brier(100, false) - 1.0).abs() < 1e-12);
+        assert!((Confidence::brier(50, true) - 0.25).abs() < 1e-12);
+        assert!((Confidence::brier(50, false) - 0.25).abs() < 1e-12);
+
+        assert!(
+            Confidence::brier(30, false) < Confidence::brier(90, false),
+            "a hedged wrong answer must score better than a confident one"
+        );
+        assert!(
+            Confidence::brier(30, true) > Confidence::brier(90, true),
+            "and worse when it turns out you were right"
+        );
     }
 
     /// Admitting ignorance must be free. If this ever goes negative the rule
