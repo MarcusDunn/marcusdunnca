@@ -151,6 +151,18 @@ data "aws_iam_policy_document" "api" {
       # screen that lists anything.
       "dynamodb:Scan",
       "dynamodb:PutItem",
+      # Writing ten review schedules is one BatchWriteItem, not ten PutItems —
+      # a ten-question attempt would otherwise be ten round trips on the
+      # request the reader is waiting on for their score.
+      #
+      # Granting PutItem without this is exactly the gap the Scan comment above
+      # warns about, and it happened: the review schedule failed with
+      # AccessDenied on the first real submission. It failed *quietly*, because
+      # scheduling is deliberately best-effort — the attempt is already written
+      # by then, and losing someone's score to protect a schedule the next
+      # attempt would recreate is the wrong trade. So the symptom was an empty
+      # review queue and a warning nobody was watching.
+      "dynamodb:BatchWriteItem",
       "dynamodb:UpdateItem",
       "dynamodb:DeleteItem",
       "dynamodb:TransactWriteItems",
