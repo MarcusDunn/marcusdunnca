@@ -48,6 +48,14 @@ pub struct Question {
     pub shelf: Shelf,
     pub prompt: String,
     pub explanation: String,
+    /// Set when the reader judges this question broken. See [`Void`].
+    ///
+    /// On the *question*, not on an answer to it, because that is where the
+    /// defect lives: a question with two defensible options is broken for every
+    /// attempt that has ever contained it and for every review still to come,
+    /// not only for the sitting where somebody noticed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub void: Option<Void>,
     /// The parts that differ by format, including the key.
     ///
     /// Flattened, so the stored item stays `{id, skill, prompt, explanation,
@@ -56,6 +64,35 @@ pub struct Question {
     /// migration.
     #[serde(flatten)]
     pub body: QuestionBody,
+}
+
+/// Why a question was withdrawn, and when.
+///
+/// # What voiding is for
+///
+/// Not "I got this wrong and would rather not have". It is for a question that
+/// cannot be answered correctly — two defensible options, a prompt that asks
+/// one thing and keys another, a figure the document does not contain. Those
+/// exist: the generator is a model, one constraint on it cannot be checked in
+/// code, and the scoring rule charges up to six bits for a confident answer.
+/// A measurement everyone agrees was broken should not sit in the record
+/// forever being averaged.
+///
+/// # It is deliberately gameable, and that is fine
+///
+/// Nothing stops the reader voiding every question they got wrong. Nothing
+/// needs to: this is a single-user tool, and a score inflated by voiding good
+/// questions misleads exactly one person, who did it on purpose. The same
+/// reasoning already governs the client-reported quiz timer. What the record
+/// keeps is the *reason*, so a run of thin excuses is visible as one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Void {
+    pub at: String,
+    /// Free text, why. Optional because demanding a justification for every
+    /// void is how the feature stops being used and broken questions stay in
+    /// the pool instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// The answer key, in the shape its format actually has.
@@ -123,6 +160,15 @@ impl QuestionBody {
 impl Question {
     pub const fn format(&self) -> QuestionFormat {
         self.body.format()
+    }
+
+    /// Has this been withdrawn?
+    ///
+    /// Checked wherever a question is *offered* — the quiz payload and the
+    /// review queue — rather than at grading time. A voided question is not
+    /// asked, so it cannot be answered, so there is nothing to grade.
+    pub const fn is_void(&self) -> bool {
+        self.void.is_some()
     }
 
     /// Pair each option with its letter. Empty for a numeric question.
@@ -449,6 +495,15 @@ pub struct AttemptResponse {
     #[serde(default)]
     pub score_bits: f64,
     pub correct: bool,
+    /// Set when the question was voided *after* this attempt was recorded.
+    ///
+    /// The answer is kept rather than deleted — what you said about a broken
+    /// question is still a fact about you, and losing it would make a voided
+    /// attempt unauditable. What changes is that everything derived skips it:
+    /// the attempt's own score and totals are recomputed, and the history view
+    /// filters it out.
+    #[serde(default)]
+    pub voided: bool,
 }
 
 /// `DOC#<id>` / `ATTEMPT#<iso8601>`.
@@ -701,6 +756,7 @@ mod tests {
             skill: Skill::FigureRecall,
             shelf: Shelf::Dated,
             prompt: "What was the 2026 forecast change in Ontario home prices?".into(),
+            void: None,
             body: QuestionBody::Numeric {
                 numeric: NumericAnswer {
                     value: -4.0,

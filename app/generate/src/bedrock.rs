@@ -660,6 +660,7 @@ fn assemble(quiz: GeneratedQuiz, seed: &str) -> Vec<Question> {
             shelf: q.shelf,
             prompt: q.prompt,
             explanation: q.explanation,
+            void: None,
             body: QuestionBody::MultipleChoice {
                 options: q.options,
                 answer: q.answer,
@@ -671,6 +672,7 @@ fn assemble(quiz: GeneratedQuiz, seed: &str) -> Vec<Question> {
             shelf: q.shelf,
             prompt: q.prompt,
             explanation: q.explanation,
+            void: None,
             body: QuestionBody::Numeric {
                 numeric: NumericAnswer {
                     value: q.value,

@@ -429,12 +429,85 @@ pub async fn quiz(state: &AppState, doc_id: &str) -> Result<QuizResponse> {
 
     Ok(QuizResponse {
         document_id: doc.doc_id,
+        // Voided questions are not offered. A question nobody can answer
+        // correctly should not be asked again, and a retake of this document
+        // should not silently re-run the same broken item.
         questions: doc
             .questions
             .iter()
+            .filter(|q| !q.is_void())
             .map(|q| PublicQuestion::new(q, &doc.topics))
             .collect(),
         title: doc.title,
+    })
+}
+
+/// `POST /docs/:id/void` — withdraw a question, or restore one.
+///
+/// Reachable from the results screen, because that is the first moment the
+/// reader sees the key and can tell that a question was unanswerable. See
+/// [`trainer_core::model::Void`] for what this is and is not for.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoidRequest {
+    pub question_id: String,
+    /// Absent or true withdraws; false restores.
+    #[serde(default = "yes")]
+    pub voided: bool,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+const fn yes() -> bool {
+    true
+}
+
+/// Longest accepted void reason.
+///
+/// Generous — the useful ones quote the option that was also defensible — and
+/// bounded because it goes in a row on a table provisioned at 5 WCU.
+const MAX_VOID_REASON_LEN: usize = 500;
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoidResponse {
+    pub question_id: String,
+    pub voided: bool,
+}
+
+pub async fn set_void(state: &AppState, doc_id: &str, req: VoidRequest) -> Result<VoidResponse> {
+    let reason = req
+        .reason
+        .map(|r| r.trim().to_string())
+        .filter(|r| !r.is_empty());
+
+    if let Some(reason) = &reason {
+        if reason.chars().count() > MAX_VOID_REASON_LEN {
+            return Err(Error::Invalid(format!(
+                "that reason is {} characters; the limit is {MAX_VOID_REASON_LEN}",
+                reason.chars().count()
+            )));
+        }
+    }
+
+    let void = req.voided.then(|| trainer_core::model::Void {
+        at: clock::now_iso8601(),
+        reason,
+    });
+
+    if !state
+        .store
+        .set_question_void(doc_id, &req.question_id, void)
+        .await?
+    {
+        return Err(Error::NotFound);
+    }
+
+    tracing::info!(doc_id, qid = %req.question_id, voided = req.voided, "question void state changed");
+
+    Ok(VoidResponse {
+        question_id: req.question_id,
+        voided: req.voided,
     })
 }
 
@@ -663,6 +736,10 @@ fn grade_one(
         confidence_percent,
         score_bits: award(confidence_percent, answered, correct, question.format()),
         correct,
+        // A voided question is never offered, so an answer to one cannot be
+        // submitted. This only becomes true later, when a question is
+        // withdrawn after the fact.
+        voided: false,
     })
 }
 
@@ -722,7 +799,7 @@ pub async fn submit(state: &AppState, doc_id: &str, req: SubmitRequest) -> Resul
     // is the bug that would make scores wrong without making them look wrong.
     if let Some(unknown) = submitted
         .keys()
-        .find(|qid| !doc.questions.iter().any(|q| q.id == **qid))
+        .find(|qid| !doc.questions.iter().any(|q| q.id == **qid && !q.is_void()))
     {
         return Err(Error::Invalid(format!("no such question: {unknown}")));
     }
@@ -732,7 +809,7 @@ pub async fn submit(state: &AppState, doc_id: &str, req: SubmitRequest) -> Resul
     let mut score_bits = 0.0f64;
     let mut max_score_bits = 0.0f64;
 
-    for question in &doc.questions {
+    for question in doc.questions.iter().filter(|q| !q.is_void()) {
         let response = grade_one(
             question,
             &doc.topics,
@@ -851,7 +928,11 @@ async fn schedule_reviews(state: &AppState, doc: &DocMeta, attempt: &Attempt) {
     let mut updated = Vec::with_capacity(attempt.responses.len());
 
     for response in &attempt.responses {
-        let Some(question) = doc.questions.iter().find(|q| q.id == response.qid) else {
+        let Some(question) = doc
+            .questions
+            .iter()
+            .find(|q| q.id == response.qid && !q.is_void())
+        else {
             continue;
         };
 
@@ -909,6 +990,7 @@ fn grade_all(
 
     questions
         .iter()
+        .filter(|q| !q.is_void())
         .map(|q| {
             let response = recorded.get(q.id.as_str());
             // This is the one response type that may carry the key, so it reads
@@ -953,6 +1035,7 @@ mod tests {
             shelf: trainer_core::tags::Shelf::Slow,
             prompt: "What was the deficit?".into(),
             explanation: "Table 2, line 4.".into(),
+            void: None,
             body: QuestionBody::MultipleChoice {
                 options: vec!["one".into(), "two".into(), "three".into(), "four".into()],
                 answer: Choice::B,
@@ -967,6 +1050,7 @@ mod tests {
             shelf: trainer_core::tags::Shelf::Dated,
             prompt: "What was the forecast change in Ontario home prices?".into(),
             explanation: "Table 1, Ontario row.".into(),
+            void: None,
             body: QuestionBody::Numeric {
                 numeric: NumericAnswer {
                     value: -4.0,
@@ -1220,6 +1304,41 @@ mod tests {
             grade_one(&sample_question(), &[], Some(&number_for_a_letter)),
             Err(Error::Invalid(_))
         ));
+    }
+
+    /// Omitting `voided` withdraws. A client that only ever wants to void
+    /// should not have to say so twice, and the restore path is the rarer one.
+    #[test]
+    fn a_void_request_defaults_to_withdrawing() {
+        let v: VoidRequest = serde_json::from_str(r#"{"questionId":"c5"}"#).expect("parses");
+        assert!(v.voided);
+        assert_eq!(v.reason, None);
+
+        let restore: VoidRequest =
+            serde_json::from_str(r#"{"questionId":"c5","voided":false}"#).expect("parses");
+        assert!(!restore.voided);
+    }
+
+    /// A voided question is unrepresentable in the quiz payload, which is what
+    /// makes "it cannot be answered" true rather than merely intended.
+    #[test]
+    fn a_voided_question_is_not_offered_and_not_graded() {
+        let mut q = sample_question();
+        q.void = Some(trainer_core::model::Void {
+            at: "2026-08-31T00:00:00Z".into(),
+            reason: Some("two defensible options".into()),
+        });
+        assert!(q.is_void());
+
+        let live: Vec<&Question> = [&q].into_iter().filter(|q| !q.is_void()).collect();
+        assert!(live.is_empty(), "a voided question must not be offered");
+
+        // And it still deserializes both ways round, so the flag can be
+        // cleared by a restore.
+        let json = serde_json::to_string(&q).expect("serializes");
+        assert!(json.contains("two defensible options"));
+        let back: Question = serde_json::from_str(&json).expect("round-trips");
+        assert!(back.is_void());
     }
 
     #[test]

@@ -372,6 +372,32 @@ export const AttemptResult = z.object({
 });
 export type AttemptResult = z.infer<typeof AttemptResult>;
 
+/**
+ * `POST /docs/:id/void` — withdraw a question, or restore one.
+ *
+ * For a question that *cannot* be answered correctly: two defensible options, a
+ * prompt that asks one thing and keys another, a figure the document does not
+ * contain. Not for one you simply got wrong.
+ *
+ * Deliberately gameable and deliberately unguarded. Voiding good questions
+ * misleads exactly one person, who did it on purpose — the same reasoning that
+ * already trusts the client-reported quiz timer. The reason is recorded so a
+ * run of thin excuses is visible as one.
+ */
+export const VoidRequest = z.object({
+  questionId: z.string().min(1),
+  /** Omitted means withdraw; false restores. */
+  voided: z.boolean().optional(),
+  reason: z.string().max(500).optional(),
+});
+export type VoidRequest = z.infer<typeof VoidRequest>;
+
+export const VoidResult = z.object({
+  questionId: z.string().min(1),
+  voided: z.boolean(),
+});
+export type VoidResult = z.infer<typeof VoidResult>;
+
 /* ------------------------------------------------------------------ *
  * Review
  *
