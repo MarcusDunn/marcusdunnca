@@ -105,8 +105,9 @@ pub struct HistoryQuestionDto {
     /// score, because a band is not a number.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub confidence_percent: Option<u8>,
-    /// Points as awarded at the time. See `AttemptResponse::points`.
-    pub points: i32,
+    /// Bits of information over chance, as awarded at the time. See
+    /// `AttemptResponse::score_bits`.
+    pub score_bits: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -167,7 +168,7 @@ fn narrow(attempt: Attempt, filter: &HistoryFilter) -> Option<HistoryAttemptDto>
             correct: r.correct,
             confidence: r.confidence,
             confidence_percent: r.confidence_percent,
-            points: r.points,
+            score_bits: r.score_bits,
         })
         .collect();
 
@@ -215,7 +216,11 @@ mod tests {
                     answer_text: None,
                     confidence: Some(Confidence::FairlySure),
                     confidence_percent: Some(65),
-                    points: Confidence::FairlySure.points(correct),
+                    score_bits: trainer_core::tags::score_bits(
+                        65,
+                        correct,
+                        QuestionFormat::MultipleChoice,
+                    ),
                     correct,
                 })
                 .collect(),
@@ -224,8 +229,8 @@ mod tests {
             duration_ms: 0,
             score: 0,
             total: 0,
-            points: 0,
-            max_points: 0,
+            score_bits: 0.0,
+            max_score_bits: 0.0,
         }
     }
 
@@ -249,7 +254,7 @@ mod tests {
             "topics",
             "correct",
             "confidence",
-            "points",
+            "scoreBits",
         ] {
             assert!(
                 json.contains(required),
@@ -267,13 +272,13 @@ mod tests {
         let mut attempt = attempt_with(vec![Skill::Causal], vec![true]);
         attempt.responses[0].confidence = None;
         attempt.responses[0].confidence_percent = None;
-        attempt.responses[0].points = 0;
+        attempt.responses[0].score_bits = 0.0;
 
         let entry = narrow(attempt, &HistoryFilter::default()).expect("unfiltered");
         let json = serde_json::to_string(&entry).expect("serializes");
 
         assert!(!json.contains("confidence"), "invented a band: {json}");
-        assert!(json.contains("points"));
+        assert!(json.contains("scoreBits"));
 
         // And a response that carries a band but no percentage — every attempt
         // taken before the slider — keeps the band and stays out of the Brier

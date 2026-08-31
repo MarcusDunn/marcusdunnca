@@ -55,6 +55,12 @@
 /// attempts stamped 2 carry topics chosen by the model from an open set. Both
 /// are meaningful, they are just not the same measurement.
 ///
+/// Version 4 replaced the three-band points table with a continuous
+/// logarithmic score in bits over chance — see [`score_bits`]. A version-3
+/// attempt's points and a version-4 attempt's score are numbers on different
+/// scales measuring the same idea, so they must never be summed or averaged
+/// together. The bands themselves survive as the review scheduler's input.
+///
 /// Version 3 is where two things changed at once, both of which make an
 /// attempt's numbers mean something different:
 ///
@@ -67,7 +73,7 @@
 ///     four options, so a version-2 figure-recall rate and a version-3 one are
 ///     rates on different tasks. Guessing gets you 25% on one and 0% on the
 ///     other.
-pub const TAG_VERSION: u32 = 3;
+pub const TAG_VERSION: u32 = 4;
 
 /// Upper bound on how many topics one document may carry.
 ///
@@ -196,55 +202,92 @@ closed_vocab! {
     }
 }
 
-impl Confidence {
-    /// Points for an answer in this band.
-    ///
-    /// # This table is derived, not chosen
-    ///
-    /// A scoring rule is **proper** when the highest expected score comes from
-    /// reporting the confidence you actually hold. Most hand-written schemes
-    /// are not — "+3 if certain and right, −3 if certain and wrong" pays you to
-    /// misreport, which makes the resulting calibration record meaningless.
-    ///
-    /// Writing `S(band, correct)` for the entries below, the reader with a true
-    /// belief `p` that they are right earns `p·S(b, true) + (1−p)·S(b, false)`.
-    /// Two bands are equally good at the `p` where those expectations cross, so
-    /// picking the crossover points *defines* the table:
-    ///
-    /// ```text
-    /// guessing ↔ fairly_sure at p = 0.50:
-    ///     0.50·(1−2) = 0.50·(S_wrong(fairly_sure) − 0)   →  −1
-    /// fairly_sure ↔ certain at p = 0.80:
-    ///     0.80·(2−3) = 0.20·(S_wrong(certain) − (−1))    →  −5
-    /// ```
-    ///
-    /// # Why 0.50 and 0.80 rather than the published 0.67 and 0.80
-    ///
-    /// The scheme this is modelled on — Gardner-Medwin's certainty-based
-    /// marking, used in UCL's summative medical exams — sits at 0.67/0.80. Those
-    /// thresholds are correct for **true/false** questions, where guessing pays
-    /// 0.5. Multiple choice here has four options, so guessing pays 0.25 and the
-    /// bottom band has to start lower or it would never be the right report.
-    ///
-    /// # The floor is zero, not a penalty
-    ///
-    /// `guessing` + wrong scores 0. Saying "I don't know" is a *correct*
-    /// statement about your own knowledge and must never cost anything, or the
-    /// rule teaches you to bluff — the exact habit this is meant to train out.
-    pub const fn points(&self, correct: bool) -> i32 {
-        match (self, correct) {
-            (Confidence::Guessing, true) => 1,
-            (Confidence::Guessing, false) => 0,
-            (Confidence::FairlySure, true) => 2,
-            (Confidence::FairlySure, false) => -1,
-            (Confidence::Certain, true) => 3,
-            (Confidence::Certain, false) => -5,
-        }
-    }
+/// The score for one answer, in **bits of information over chance**.
+///
+/// # The rule
+///
+/// ```text
+/// correct:  log2(  p   /   c  )
+/// wrong:    log2((1−p) / (1−c))
+/// ```
+///
+/// where `p` is the probability the reader stated and `c` is what pure chance
+/// would have given them on a question of this shape — a quarter on four
+/// options, near zero on a typed figure.
+///
+/// # Why this rule and not a table of points
+///
+/// The three bands were a step function fitted to a curve. They were *proper*,
+/// so the arithmetic was honest, but they threw away most of what the reader
+/// said: 51% and 79% scored identically, and the whole reason to ask for a
+/// number rather than a feeling is that those are different claims. A step
+/// function also creates cliffs — one point of slider movement worth two points
+/// of score at the boundary, and nothing anywhere else.
+///
+/// This is the logarithmic scoring rule, which is the continuous thing the
+/// table was approximating. Scaled by roughly 1.5 it reproduces the old entries
+/// closely — `+1.85` where the table said `+3`, `−2.9` where it said `−5` — so
+/// the change is a refinement rather than a reversal.
+///
+/// # Chance-referencing is free
+///
+/// Subtracting the chance baseline looks like it might break properness. It
+/// does not, and the reason is worth writing down. With a true belief `q`:
+///
+/// ```text
+/// E[S] = q·log2(p/c) + (1−q)·log2((1−p)/(1−c))
+///      = q·log2(p) + (1−q)·log2(1−p)  −  [q·log2(c) + (1−q)·log2(1−c)]
+/// ```
+///
+/// The bracket has no `p` in it. It is an additive constant, so it shifts every
+/// score by the same amount and cannot move the maximum — which still sits at
+/// `p = q`. The rule is strictly proper before and after.
+///
+/// What the constant buys is a meaningful zero. **Reporting chance scores
+/// exactly nothing, whichever way the answer goes.** Admitting you are guessing
+/// is free, which the old table achieved by hand and this gets by construction;
+/// and getting a coin-flip right no longer pays, because luck at chance odds is
+/// not knowledge.
+///
+/// # The units are real
+///
+/// A bit is a bit: `+2` means your confidence carried two bits of information
+/// beyond guessing. That is also why a typed figure is worth more than a
+/// multiple-choice question — there is more uncertainty to remove — and why a
+/// confident error costs so much more than a confident hit earns. Those are
+/// properties of the information, not of a scale someone picked.
+pub fn score_bits(percent: u8, correct: bool, format: QuestionFormat) -> f64 {
+    let chance = f64::from(Confidence::chance_floor_percent(format)) / 100.0;
+    let p = f64::from(percent.clamp(
+        Confidence::chance_floor_percent(format),
+        Confidence::MAX_PERCENT,
+    )) / 100.0;
 
-    /// The best score any single answer can earn. Used to report a total
-    /// against its ceiling rather than as a bare number.
-    pub const MAX_POINTS_PER_QUESTION: i32 = 3;
+    if correct {
+        (p / chance).log2()
+    } else {
+        ((1.0 - p) / (1.0 - chance)).log2()
+    }
+}
+
+/// The most one answer can earn, given the format's chance baseline.
+///
+/// Used to report a total against its ceiling. It differs by format on purpose
+/// — see the note on units above.
+pub fn max_score_bits(format: QuestionFormat) -> f64 {
+    score_bits(Confidence::MAX_PERCENT, true, format)
+}
+
+impl Confidence {
+    /// The highest probability the slider will report.
+    ///
+    /// Not 100, for two reasons that agree. The arithmetic one: `log2(0)` is
+    /// negative infinity, so a claim of certainty that turned out wrong would
+    /// score `-inf` and poison every total it entered. The real one: certainty
+    /// is never warranted about a figure you read once, and a scale that offers
+    /// it invites a claim nobody should make. Forecasting tournaments cap at 99%
+    /// for the same reason.
+    pub const MAX_PERCENT: u8 = 99;
 
     /// The belief range this band is the best report for, as percentages.
     ///
@@ -700,107 +743,135 @@ mod tests {
         }
     }
 
-    /// Expected score for reporting `band` while actually believing `p`.
-    fn expected(band: Confidence, p: f64) -> f64 {
-        p * f64::from(band.points(true)) + (1.0 - p) * f64::from(band.points(false))
+    /// Expected score for stating `stated` while actually believing `belief`.
+    fn expected(stated: u8, belief: f64, format: QuestionFormat) -> f64 {
+        belief * score_bits(stated, true, format)
+            + (1.0 - belief) * score_bits(stated, false, format)
     }
 
     /// **The property the whole confidence feature rests on.**
     ///
-    /// If reporting a band you do not hold ever pays better than reporting the
-    /// one you do, the calibration record measures strategy rather than belief
-    /// and every reliability number computed from it is fiction. This walks the
-    /// belief range and asserts the honest report always wins.
-    ///
-    /// It is written against `points` rather than against the derivation in the
-    /// doc comment on purpose: the comment explains the table, this checks it.
+    /// If stating a probability you do not hold ever pays better than stating
+    /// the one you do, the record measures strategy rather than belief and
+    /// every calibration number computed from it is fiction. This walks the
+    /// belief range and asserts the truthful report maximises expected score,
+    /// for both formats, since they have different baselines.
     #[test]
     fn the_scoring_rule_is_proper() {
-        // Away from the crossovers themselves, where two bands legitimately tie.
-        let honest = |p: f64| {
-            if p < 0.50 {
-                Confidence::Guessing
-            } else if p < 0.80 {
-                Confidence::FairlySure
-            } else {
-                Confidence::Certain
-            }
-        };
+        for format in [QuestionFormat::MultipleChoice, QuestionFormat::Numeric] {
+            let floor = Confidence::chance_floor_percent(format);
 
-        for step in 0..=1000 {
-            let p = f64::from(step) / 1000.0;
-            // Skip the exact indifference points.
-            if (p - 0.50).abs() < 1e-9 || (p - 0.80).abs() < 1e-9 {
-                continue;
-            }
+            for truth in (floor..=Confidence::MAX_PERCENT).step_by(3) {
+                let belief = f64::from(truth) / 100.0;
+                let honest = expected(truth, belief, format);
 
-            let truthful = honest(p);
-            for band in Confidence::ALL {
-                if *band == truthful {
-                    continue;
+                for stated in (floor..=Confidence::MAX_PERCENT).step_by(3) {
+                    if stated == truth {
+                        continue;
+                    }
+                    assert!(
+                        honest >= expected(stated, belief, format) - 1e-12,
+                        "{format}: believing {truth}% but stating {stated}% pays better"
+                    );
                 }
-                assert!(
-                    expected(truthful, p) > expected(*band, p),
-                    "at p={p}, reporting {band} beats the honest {truthful} — \
-                     the rule is not proper"
-                );
             }
         }
     }
 
-    /// The crossovers must sit where `belief_range` says they do, or the UI is
-    /// printing thresholds that do not match the scoring.
+    /// The meaningful zero. Reporting chance earns nothing whichever way the
+    /// answer falls — so admitting a guess is free, and getting a guess right
+    /// is not mistaken for knowing something.
     #[test]
-    fn the_advertised_thresholds_are_the_real_ones() {
-        for (lower, upper) in Confidence::ALL.iter().map(|c| c.belief_range()) {
+    fn reporting_chance_scores_exactly_nothing() {
+        for format in [QuestionFormat::MultipleChoice, QuestionFormat::Numeric] {
+            let floor = Confidence::chance_floor_percent(format);
+            assert!(score_bits(floor, true, format).abs() < 1e-12, "{format}");
+            assert!(score_bits(floor, false, format).abs() < 1e-12, "{format}");
+        }
+    }
+
+    /// Continuity is the point of the change: every step of the slider has to
+    /// move the score, and in the direction you would expect.
+    #[test]
+    fn the_score_moves_with_every_step_of_the_slider() {
+        let format = QuestionFormat::MultipleChoice;
+        let floor = Confidence::chance_floor_percent(format);
+
+        for percent in floor..Confidence::MAX_PERCENT {
+            let next = percent + 1;
             assert!(
-                lower < upper,
-                "an empty band would never be worth reporting"
+                score_bits(next, true, format) > score_bits(percent, true, format),
+                "being more confident and right must pay more at {percent}%"
+            );
+            assert!(
+                score_bits(next, false, format) < score_bits(percent, false, format),
+                "being more confident and wrong must cost more at {percent}%"
             );
         }
 
-        // Ties, exactly at the advertised boundaries.
-        let eps = 1e-12;
-        assert!(
-            (expected(Confidence::Guessing, 0.50) - expected(Confidence::FairlySure, 0.50)).abs()
-                < eps
-        );
-        assert!(
-            (expected(Confidence::FairlySure, 0.80) - expected(Confidence::Certain, 0.80)).abs()
-                < eps
-        );
-
-        // And those boundaries are the ones shown to the reader.
-        assert_eq!(Confidence::Guessing.belief_range().1, 50);
-        assert_eq!(Confidence::FairlySure.belief_range().1, 80);
+        // The cliff the bands had: 51% and 79% used to score identically.
+        assert!(score_bits(79, true, format) > score_bits(51, true, format));
     }
 
-    /// A stated percentage must land in the band that pays best for it, or the
-    /// slider and the scoring rule are measuring different things and the
-    /// reader is being scored on a claim they did not make.
+    /// A confident error has to cost more than a confident hit earns, or
+    /// overconfidence is cheap and the rule trains the wrong habit.
     #[test]
-    fn the_band_a_percentage_falls_in_is_the_one_that_pays_best_for_it() {
-        for percent in 0..=100u8 {
-            let band = Confidence::from_percent(percent);
-            let p = f64::from(percent) / 100.0;
+    fn being_sure_and_wrong_costs_more_than_being_sure_and_right_earns() {
+        for format in [QuestionFormat::MultipleChoice, QuestionFormat::Numeric] {
+            let gain = score_bits(Confidence::MAX_PERCENT, true, format);
+            let loss = score_bits(Confidence::MAX_PERCENT, false, format);
+            assert!(gain > 0.0 && loss < 0.0, "{format}");
+            assert!(
+                loss.abs() > gain,
+                "{format}: sure-and-wrong {loss} must hurt more than sure-and-right {gain} pays"
+            );
+        }
+    }
 
-            // Skip the exact crossovers, where two bands legitimately tie.
-            if percent == 50 || percent == 80 {
-                continue;
-            }
-
-            for other in Confidence::ALL {
-                if *other == band {
-                    continue;
+    /// Every score must be finite. An infinity would poison the attempt total
+    /// and every average downstream, which is what capping the slider below
+    /// 100% buys — including for a percentage no UI should ever send.
+    #[test]
+    fn no_stated_probability_produces_an_infinite_score() {
+        for format in [QuestionFormat::MultipleChoice, QuestionFormat::Numeric] {
+            for percent in 0..=255u8 {
+                for correct in [true, false] {
+                    let s = score_bits(percent, correct, format);
+                    assert!(
+                        s.is_finite(),
+                        "{format} {percent}% correct={correct} -> {s}"
+                    );
                 }
-                assert!(
-                    expected(band, p) >= expected(*other, p),
-                    "at {percent}% the rule pays better for {other} than the assigned {band}"
-                );
             }
         }
     }
 
+    /// The new rule should be recognisably the old table rather than a
+    /// different scheme wearing its name — the bands were a step function
+    /// fitted to this curve, so scaled by about 1.5 they should still line up.
+    #[test]
+    fn the_curve_reproduces_the_shape_of_the_table_it_replaces() {
+        let mc = QuestionFormat::MultipleChoice;
+        let scaled = |p: u8, c: bool| score_bits(p, c, mc) * 1.5;
+
+        // The old table: guessing 1/0, fairly_sure 2/-1, certain 3/-5.
+        assert!((scaled(65, true) - 2.0).abs() < 0.5, "{}", scaled(65, true));
+        assert!(
+            (scaled(65, false) + 1.0).abs() < 0.8,
+            "{}",
+            scaled(65, false)
+        );
+        assert!((scaled(90, true) - 3.0).abs() < 0.5, "{}", scaled(90, true));
+        assert!(
+            (scaled(90, false) + 5.0).abs() < 1.0,
+            "{}",
+            scaled(90, false)
+        );
+    }
+
+    /// The bands survive only as the review scheduler's input — the score no
+    /// longer uses them. The cut points must still be the ones the UI
+    /// advertises, or the scheduler grades a claim the reader did not make.
     #[test]
     fn the_bands_tile_the_whole_range() {
         assert_eq!(Confidence::from_percent(0), Confidence::Guessing);
@@ -842,19 +913,5 @@ mod tests {
             Confidence::brier(30, true) > Confidence::brier(90, true),
             "and worse when it turns out you were right"
         );
-    }
-
-    /// Admitting ignorance must be free. If this ever goes negative the rule
-    /// starts paying for bluffing, which is the habit it exists to train out.
-    #[test]
-    fn saying_you_do_not_know_never_costs_anything() {
-        assert_eq!(Confidence::Guessing.points(false), 0);
-        for band in Confidence::ALL {
-            assert!(
-                band.points(true) > 0,
-                "a correct answer must never score zero or less"
-            );
-            assert!(band.points(true) <= Confidence::MAX_POINTS_PER_QUESTION);
-        }
     }
 }

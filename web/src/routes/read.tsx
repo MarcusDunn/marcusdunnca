@@ -6,17 +6,16 @@ import { Busy, BusyMark, ErrorNotice } from "../components/ui";
 import { api } from "../lib/api";
 import { formatFigure, formatTolerance, parseFigure } from "../lib/figures";
 import { documentUrlQuery, queryKeys, quizQuery } from "../lib/queries";
-import { ConfidenceSlider } from "../components/confidence";
+import { ConfidenceSlider, signed } from "../components/confidence";
 import {
   CHANCE_FLOOR_PERCENT,
-  CONFIDENCE_BANDS,
-  CONFIDENCE_BOUNDS,
   CONFIDENCE_LABELS,
-  CONFIDENCE_POINTS,
+  MAX_PERCENT,
+  scoreBits,
   SKILL_LABELS,
   topicLabel,
   type AttemptResult,
-  type Confidence,
+  type QuestionFormat,
   type GradedQuestion,
   type Quiz,
   type QuizQuestion,
@@ -183,56 +182,68 @@ export function ReadScreen() {
 /**
  * The scoring rule, stated once at the top of the quiz.
  *
- * On the page rather than in a help link on purpose. The bands only measure
- * anything if the reader knows what each one costs *before* choosing it — a
- * price revealed afterwards teaches nothing about the decision that was made.
+ * On the page rather than behind a help link on purpose. A price revealed only
+ * afterwards teaches nothing about the decision that was made — and the slider
+ * shows the live figure beside every question, so this is the explanation of a
+ * number the reader is already watching move.
  */
 function ScoringNote() {
+  const mc: QuestionFormat = "multiple_choice";
+  const rows = [25, 50, 75, 90, MAX_PERCENT];
+
   return (
     <details>
       <summary>How the confidence slider is scored</summary>
       <p>
-        Every question asks for a probability as well as an answer. Where that
-        probability lands decides what the answer is worth, and the bands are
-        arranged so the best score comes from stating what you actually believe
-        — overstating and understating both cost you, so there is nothing to be
-        gained by playing the scale.
+        Every question asks for a probability as well as an answer, and the
+        score moves continuously with it — there are no bands and no cliffs.
+        The rule is arranged so the best score comes from stating what you
+        actually believe: overstating and understating both cost you, so there
+        is nothing to be gained by playing the scale.
+      </p>
+      <p>
+        The unit is <strong>bits of information over chance</strong>. Saying 25%
+        on a four-option question scores exactly zero whichever way it goes —
+        that is what guessing is worth, and admitting it is free. Everything
+        above that is what your confidence added; everything below is what it
+        cost.
       </p>
       <table>
-        <caption>Points per question</caption>
+        <caption>
+          A four-option question. A typed figure is worth more, because there is
+          more uncertainty to remove.
+        </caption>
         <thead>
           <tr>
-            <th scope="col">Band</th>
-            <th scope="col">Means</th>
-            <th scope="col">Right</th>
-            <th scope="col">Wrong</th>
+            <th scope="col">You say</th>
+            <th scope="col">If right</th>
+            <th scope="col">If wrong</th>
           </tr>
         </thead>
         <tbody>
-          {CONFIDENCE_BANDS.map((band) => (
-            <tr key={band}>
-              <th scope="row">{CONFIDENCE_LABELS[band]}</th>
-              <td>{describeBand(band)}</td>
-              <td>+{CONFIDENCE_POINTS[band].correct}</td>
-              <td>{CONFIDENCE_POINTS[band].wrong}</td>
+          {rows.map((percent) => (
+            <tr key={percent}>
+              <th scope="row">{percent}%</th>
+              <td>{signed(scoreBits(percent, true, mc))}</td>
+              <td>{signed(scoreBits(percent, false, mc))}</td>
             </tr>
           ))}
         </tbody>
       </table>
       <p>
-        Admitting a guess is free — it is a correct statement about what you
-        know, and it should never cost anything. What is expensive is being sure
-        and wrong, because that is the one that would have been said out loud.
+        Notice the asymmetry at the bottom of the table: being sure and wrong
+        costs about three times what being sure and right earns. That is not a
+        thumb on the scale — it falls out of the arithmetic, and it is the
+        reason the rule is worth taking seriously. A confident error is the one
+        that would have been said out loud.
+      </p>
+      <p>
+        The slider stops at {MAX_PERCENT}%. Certainty about a figure you read
+        once is never warranted, and a scale that offered it would invite a
+        claim nobody should make.
       </p>
     </details>
   );
-}
-
-function describeBand(band: Confidence): string {
-  const { low, high } = CONFIDENCE_BOUNDS[band];
-  if (band === "guessing") return `below ${high}% — no real idea`;
-  if (band === "certain") return `above ${low}% — I'd say this on the record`;
-  return `${low}–${high}% — probably right`;
 }
 
 function QuizForm({
@@ -435,8 +446,8 @@ function Results({ result }: { result: AttemptResult }) {
   return (
     <>
       <h3 role="status">
-        {result.correct} of {result.total} correct · {result.points} of{" "}
-        {result.maxPoints} points
+        {result.correct} of {result.total} correct · {signed(result.scoreBits)} of{" "}
+        {result.maxScoreBits.toFixed(2)} bits
       </h3>
       <p>
         Two numbers because they answer two questions. The first is how much you
@@ -478,8 +489,7 @@ function Results({ result }: { result: AttemptResult }) {
                   ? ` after saying ${CONFIDENCE_LABELS[graded.confidence].toLowerCase()}`
                   : ""
                 : ` after saying ${graded.confidencePercent}%`}{" "}
-              ({graded.points >= 0 ? "+" : ""}
-              {graded.points}) — {SKILL_LABELS[graded.skill]} ·{" "}
+              ({signed(graded.scoreBits)} bits) — {SKILL_LABELS[graded.skill]} ·{" "}
               {graded.topics.map(topicLabel).join(", ")}
             </p>
             {graded.format === "multiple_choice" ? (

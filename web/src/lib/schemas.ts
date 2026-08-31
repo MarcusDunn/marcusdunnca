@@ -36,24 +36,41 @@ export const CONFIDENCE_LABELS: Record<Confidence, string> = {
 };
 
 /**
- * What each band commits you to, in points.
+ * The score for one answer, in bits over chance. Mirrors `tags::score_bits`.
  *
- * **Display only — the server computes every score.** This exists so the reader
- * can see the price of a claim *before* making it; a cost revealed only
- * afterwards trains nothing.
+ * **Display only — the server computes every score that is stored.** This
+ * exists so the slider can show what a position is worth *before* it is
+ * committed to; a price revealed only afterwards trains nothing, and with a
+ * continuous rule the price is the whole point of moving the slider at all.
  *
- * It is therefore a second copy of a table that lives in `Confidence::points`,
- * and there is no test holding the two together, because this package has no
- * test runner (issue #33). What limits the damage is that the copy is never
- * used to compute anything: the points on the results screen and in history are
- * the server's, so a drift here misinforms the reader about the price without
- * changing what they are charged. Worth fixing, not worth a wrong abstraction.
+ * It is a second copy of a formula, and there is no test holding the two
+ * together because this package has no test runner (issue #33). What limits the
+ * damage is that the copy computes nothing that is kept: every score on a
+ * results screen or in history is the server's.
  */
-export const CONFIDENCE_POINTS: Record<Confidence, { correct: number; wrong: number }> = {
-  guessing: { correct: 1, wrong: 0 },
-  fairly_sure: { correct: 2, wrong: -1 },
-  certain: { correct: 3, wrong: -5 },
-};
+export function scoreBits(
+  percent: number,
+  correct: boolean,
+  format: QuestionFormat,
+): number {
+  const chance = CHANCE_FLOOR_PERCENT[format] / 100;
+  const p = Math.min(Math.max(percent, CHANCE_FLOOR_PERCENT[format]), MAX_PERCENT) / 100;
+  return correct ? Math.log2(p / chance) : Math.log2((1 - p) / (1 - chance));
+}
+
+export function maxScoreBits(format: QuestionFormat): number {
+  return scoreBits(MAX_PERCENT, true, format);
+}
+
+/**
+ * The highest probability the slider offers.
+ *
+ * Not 100. `log2(0)` is negative infinity, so a claim of certainty that turned
+ * out wrong would poison every total it entered — and, less mechanically,
+ * certainty is never warranted about a figure you read once. Forecasting
+ * tournaments cap here for the same reason.
+ */
+export const MAX_PERCENT = 99;
 
 /** The belief range each band is the best report for, as percentages. */
 export const CONFIDENCE_BOUNDS: Record<Confidence, { low: number; high: number }> = {
@@ -61,8 +78,6 @@ export const CONFIDENCE_BOUNDS: Record<Confidence, { low: number; high: number }
   fairly_sure: { low: 50, high: 80 },
   certain: { low: 80, high: 100 },
 };
-
-export const MAX_POINTS_PER_QUESTION = 3;
 
 /**
  * The lowest honest probability on a question of this shape. Mirrors
@@ -334,8 +349,8 @@ export const GradedQuestion = z.object({
   confidence: Confidence.nullable().default(null),
   /** The probability actually stated. Null on attempts predating the slider. */
   confidencePercent: z.number().int().min(0).max(100).nullable().default(null),
-  /** As awarded by the server. Never recomputed here. */
-  points: z.number().int(),
+  /** Bits over chance, as awarded by the server. Never recomputed here. */
+  scoreBits: z.number(),
   explanation: z.string().default(""),
 });
 export type GradedQuestion = z.infer<typeof GradedQuestion>;
@@ -347,12 +362,12 @@ export const AttemptResult = z.object({
   correct: z.number().int().nonnegative(),
   total: z.number().int().positive(),
   /**
-   * The calibration score, and its ceiling. Negative is possible and is the
-   * whole point — reported beside `correct`, never instead of it, because they
-   * answer different questions.
+   * Bits of information over chance, and the ceiling for this question mix.
+   * Negative is possible and is the whole point — reported beside `correct`,
+   * never instead of it, because they answer different questions.
    */
-  points: z.number().int(),
-  maxPoints: z.number().int(),
+  scoreBits: z.number(),
+  maxScoreBits: z.number(),
   questions: z.array(GradedQuestion),
 });
 export type AttemptResult = z.infer<typeof AttemptResult>;
@@ -413,7 +428,7 @@ export const ReviewResult = z.object({
   correct: z.boolean(),
   confidence: Confidence.nullable().default(null),
   confidencePercent: z.number().int().min(0).max(100).nullable().default(null),
-  points: z.number().int(),
+  scoreBits: z.number(),
   options: z.array(QuestionOption),
   correctOptionId: z.string().nullable().default(null),
   selectedOptionId: z.string().nullable().default(null),
@@ -430,8 +445,8 @@ export type ReviewResult = z.infer<typeof ReviewResult>;
 export const ReviewSubmitResult = z.object({
   correct: z.number().int().nonnegative(),
   total: z.number().int().nonnegative(),
-  points: z.number().int(),
-  maxPoints: z.number().int(),
+  scoreBits: z.number(),
+  maxScoreBits: z.number(),
   results: z.array(ReviewResult),
 });
 export type ReviewSubmitResult = z.infer<typeof ReviewSubmitResult>;
@@ -477,7 +492,7 @@ export const HistoryQuestion = z.object({
    * exactly the error the table exists to detect in the reader.
    */
   confidence: Confidence.optional(),
-  points: z.number().int().default(0),
+  scoreBits: z.number().default(0),
 });
 export type HistoryQuestion = z.infer<typeof HistoryQuestion>;
 

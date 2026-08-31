@@ -208,7 +208,9 @@ function CalibrationSection({ calibration }: { calibration: Calibration }) {
   return (
     <>
       <p>
-        {calibration.points} of {calibration.maxPoints} points across {rated}{" "}
+        {calibration.scoreBits >= 0 ? "+" : "\u2212"}
+        {Math.abs(calibration.scoreBits).toFixed(2)} of{" "}
+        {calibration.maxScoreBits.toFixed(2)} bits across {rated}{" "}
         answered question{rated === 1 ? "" : "s"}
         {calibration.brier.score === null
           ? ""
