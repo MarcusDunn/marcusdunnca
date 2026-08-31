@@ -100,6 +100,11 @@ pub struct HistoryQuestionDto {
     /// table exists to detect in the reader.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub confidence: Option<Confidence>,
+    /// The probability stated, when one was. Absent on attempts predating the
+    /// slider — those count toward the band table and not toward the Brier
+    /// score, because a band is not a number.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence_percent: Option<u8>,
     /// Points as awarded at the time. See `AttemptResponse::points`.
     pub points: i32,
 }
@@ -161,6 +166,7 @@ fn narrow(attempt: Attempt, filter: &HistoryFilter) -> Option<HistoryAttemptDto>
             },
             correct: r.correct,
             confidence: r.confidence,
+            confidence_percent: r.confidence_percent,
             points: r.points,
         })
         .collect();
@@ -208,6 +214,7 @@ mod tests {
                     answer: Some(Choice::A),
                     answer_text: None,
                     confidence: Some(Confidence::FairlySure),
+                    confidence_percent: Some(65),
                     points: Confidence::FairlySure.points(correct),
                     correct,
                 })
@@ -259,6 +266,7 @@ mod tests {
     fn a_response_with_no_confidence_omits_the_field_rather_than_inventing_one() {
         let mut attempt = attempt_with(vec![Skill::Causal], vec![true]);
         attempt.responses[0].confidence = None;
+        attempt.responses[0].confidence_percent = None;
         attempt.responses[0].points = 0;
 
         let entry = narrow(attempt, &HistoryFilter::default()).expect("unfiltered");
@@ -266,6 +274,16 @@ mod tests {
 
         assert!(!json.contains("confidence"), "invented a band: {json}");
         assert!(json.contains("points"));
+
+        // And a response that carries a band but no percentage — every attempt
+        // taken before the slider — keeps the band and stays out of the Brier
+        // score, rather than having a midpoint invented for it.
+        let mut banded = attempt_with(vec![Skill::Causal], vec![true]);
+        banded.responses[0].confidence_percent = None;
+        let entry = narrow(banded, &HistoryFilter::default()).expect("unfiltered");
+        let json = serde_json::to_string(&entry).expect("serializes");
+        assert!(json.contains(r#""confidence":"fairly_sure""#), "{json}");
+        assert!(!json.contains("confidencePercent"), "{json}");
     }
 
     #[test]

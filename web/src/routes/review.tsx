@@ -5,12 +5,11 @@ import { Busy, BusyMark, ErrorNotice } from "../components/ui";
 import { api } from "../lib/api";
 import { formatFigure, formatTolerance, parseFigure } from "../lib/figures";
 import { queryKeys, reviewQueueQuery } from "../lib/queries";
+import { ConfidenceSlider } from "../components/confidence";
 import {
-  CONFIDENCE_BANDS,
+  CHANCE_FLOOR_PERCENT,
   CONFIDENCE_LABELS,
-  CONFIDENCE_POINTS,
   SKILL_LABELS,
-  type Confidence,
   type ReviewQuestion,
   type ReviewQueue,
   type ReviewResult,
@@ -19,8 +18,8 @@ import {
 
 const OPTION_LETTERS = ["A", "B", "C", "D"] as const;
 
-type Entry = { answer: string; confidence: Confidence | "" };
-const EMPTY: Entry = { answer: "", confidence: "" };
+type Entry = { answer: string; confidencePercent: number | null };
+const EMPTY: Entry = { answer: "", confidencePercent: null };
 
 export function ReviewScreen() {
   const queryClient = useQueryClient();
@@ -34,15 +33,16 @@ export function ReviewScreen() {
           const entry = entries[question.questionId] ?? EMPTY;
           const documentId = question.documentId;
           const questionId = question.questionId;
-          // Unreachable: the form will not submit with a band unset.
-          const confidence = entry.confidence === "" ? ("guessing" as const) : entry.confidence;
+          // Unreachable: the form refuses to submit with any slider untouched.
+          const confidencePercent =
+            entry.confidencePercent ?? CHANCE_FLOOR_PERCENT[question.format];
 
           // Two whole literals rather than a conditional spread. Which key is
           // present is the meaningful part — the server rejects the wrong one
           // for a question's format — so it should be readable as such.
           return question.format === "multiple_choice"
-            ? { documentId, questionId, optionId: entry.answer, confidence }
-            : { documentId, questionId, value: entry.answer, confidence };
+            ? { documentId, questionId, optionId: entry.answer, confidencePercent }
+            : { documentId, questionId, value: entry.answer, confidencePercent };
         }),
       });
     },
@@ -233,7 +233,7 @@ function describeProblems(queue: ReviewQueue, entries: Record<string, Entry>): s
   }
 
   const unrated = queue.questions.filter(
-    (q) => entries[q.questionId]?.confidence === "",
+    (q) => (entries[q.questionId]?.confidencePercent ?? null) === null,
   ).length;
   if (unrated > 0) {
     return `${unrated} question${unrated === 1 ? "" : "s"} still need a confidence.`;
@@ -307,29 +307,13 @@ function ReviewCard({
         </div>
       )}
 
-      <fieldset>
-        <legend>How sure are you?</legend>
-        {CONFIDENCE_BANDS.map((band) => {
-          const inputId = `${inputName}-confidence-${band}`;
-          return (
-            <span key={band}>
-              <input
-                type="radio"
-                id={inputId}
-                name={`${inputName}-confidence`}
-                value={band}
-                checked={entry.confidence === band}
-                disabled={disabled}
-                onChange={() => onChange({ ...entry, confidence: band })}
-              />
-              <label htmlFor={inputId}>
-                {CONFIDENCE_LABELS[band]} (+{CONFIDENCE_POINTS[band].correct} /{" "}
-                {CONFIDENCE_POINTS[band].wrong})
-              </label>{" "}
-            </span>
-          );
-        })}
-      </fieldset>
+      <ConfidenceSlider
+        idPrefix={inputName}
+        format={question.format}
+        percent={entry.confidencePercent}
+        onChange={(confidencePercent) => onChange({ ...entry, confidencePercent })}
+        disabled={disabled}
+      />
     </fieldset>
   );
 }
@@ -364,9 +348,11 @@ function Results({
             <h3>{graded.prompt}</h3>
             <p>
               {graded.correct ? "Correct" : "Incorrect"}
-              {graded.confidence
-                ? ` after saying ${CONFIDENCE_LABELS[graded.confidence].toLowerCase()}`
-                : ""}{" "}
+              {graded.confidencePercent === null
+                ? graded.confidence
+                  ? ` after saying ${CONFIDENCE_LABELS[graded.confidence].toLowerCase()}`
+                  : ""
+                : ` after saying ${graded.confidencePercent}%`}{" "}
               ({graded.points >= 0 ? "+" : ""}
               {graded.points}) — back in {graded.intervalDays} day
               {graded.intervalDays === 1 ? "" : "s"}, on{" "}

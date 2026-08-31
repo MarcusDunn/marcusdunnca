@@ -33,6 +33,8 @@ export type Observation = {
   correct: boolean;
   /** Undefined on answers given before confidence was asked for. */
   confidence?: Confidence;
+  /** Undefined on answers given before the slider — a band is not a number. */
+  confidencePercent?: number;
   points: number;
 };
 
@@ -110,6 +112,9 @@ function flatten(
     topics: question.topics,
     correct: question.correct,
     ...(question.confidence ? { confidence: question.confidence } : {}),
+    ...(question.confidencePercent === undefined
+      ? {}
+      : { confidencePercent: question.confidencePercent }),
     points: question.points,
   };
 }
@@ -188,6 +193,20 @@ export type Calibration = {
   points: number;
   maxPoints: number;
   /**
+   * Mean Brier score over every answer that stated a probability, and how many
+   * did. `null` below the observation floor.
+   *
+   * **A measurement, not a score to play against.** Lower is better; 0.25 is
+   * what saying 50% to everything gets you, so that is the line worth beating.
+   * It correctly rewards having said 30% about something you got wrong, which
+   * is exactly why it cannot double as `points` — points have to make being
+   * sure and wrong hurt.
+   *
+   * Answers recorded before the slider carry a band and no number, and are
+   * excluded rather than assigned a midpoint.
+   */
+  brier: { score: number | null; n: number };
+  /**
    * Wrong answers given as `certain`, newest first.
    *
    * The most useful list on the page. These are the beliefs that would have
@@ -218,6 +237,16 @@ export function buildCalibration(observations: readonly Observation[]): Calibrat
     }
   }
 
+  let brierSum = 0;
+  let brierN = 0;
+  for (const observation of observations) {
+    if (observation.confidencePercent === undefined) continue;
+    const p = observation.confidencePercent / 100;
+    const outcome = observation.correct ? 1 : 0;
+    brierSum += (p - outcome) ** 2;
+    brierN += 1;
+  }
+
   const bands = CONFIDENCE_BANDS.map((band) => {
     const tally = tallies.get(band) ?? { n: 0, correct: 0 };
     const rate = toRate(tally.correct, tally.n);
@@ -232,7 +261,19 @@ export function buildCalibration(observations: readonly Observation[]): Calibrat
 
   confidentErrors.sort((a, b) => Date.parse(b.submittedAt) - Date.parse(a.submittedAt));
 
-  return { bands, unrated, points, maxPoints, confidentErrors };
+  return {
+    bands,
+    unrated,
+    points,
+    maxPoints,
+    // Suppressed on the same floor as every other rate here. A Brier score off
+    // three answers is a number, not an estimate.
+    brier: {
+      score: brierN >= MIN_OBSERVATIONS ? brierSum / brierN : null,
+      n: brierN,
+    },
+    confidentErrors,
+  };
 }
 
 function judge(rate: number, claimed: { low: number; high: number }): Verdict {

@@ -480,6 +480,36 @@ pub struct SubmittedAnswer {
     /// honest handling, because no confidence was ever asked for.
     #[serde(default)]
     pub confidence: Option<Confidence>,
+    /// The probability stated on the slider, 0–100.
+    ///
+    /// When present it is authoritative and `confidence` is ignored: the band
+    /// is derived from the number, so a client that sent both and disagreed
+    /// would otherwise be scored on whichever the server happened to read
+    /// first. See [`SubmittedAnswer::band`].
+    #[serde(default)]
+    pub confidence_percent: Option<u8>,
+}
+
+impl SubmittedAnswer {
+    /// The band this answer is scored in, and the percentage behind it.
+    ///
+    /// One place, so the derivation cannot differ between the two grading paths
+    /// — and clamped to the floor for the question's format, because a report
+    /// below chance is not a belief anyone holds and scoring it as one would
+    /// put noise into the reliability curve.
+    fn band(&self, format: trainer_core::tags::QuestionFormat) -> (Option<Confidence>, Option<u8>) {
+        match self.confidence_percent {
+            Some(stated) => {
+                let floor = Confidence::chance_floor_percent(format);
+                let percent = stated.clamp(floor, 100);
+                (Some(Confidence::from_percent(percent)), Some(percent))
+            }
+            // A client that predates the slider. Its band is taken as stated
+            // and contributes no percentage, which keeps it out of the Brier
+            // score rather than inventing a midpoint for it.
+            None => (self.confidence, None),
+        }
+    }
 }
 
 /// Longest string accepted in the numeric field.
@@ -516,6 +546,9 @@ pub struct GradedQuestionDto {
     /// that shows only right/wrong cannot show the thing worth seeing: which
     /// of the wrong ones you were sure about.
     pub confidence: Option<Confidence>,
+    /// Echoed back so the results screen can show what was claimed, not just
+    /// which bucket it fell in.
+    pub confidence_percent: Option<u8>,
     pub points: i32,
     pub explanation: String,
 }
@@ -561,7 +594,9 @@ fn grade_one(
     topics: &[Topic],
     submitted: Option<&SubmittedAnswer>,
 ) -> Result<AttemptResponse> {
-    let confidence = submitted.and_then(|s| s.confidence);
+    let (confidence, confidence_percent) = submitted
+        .map(|s| s.band(question.format()))
+        .unwrap_or((None, None));
 
     // No fallible unwrapping before the match, and none needed: `QuestionBody`
     // is an enum, so "a question with no usable answer key" is not a state a
@@ -624,6 +659,7 @@ fn grade_one(
         answer,
         answer_text,
         confidence,
+        confidence_percent,
         points: award(confidence, answered, correct),
         correct,
     })
@@ -882,6 +918,7 @@ fn grade_all(
                 unit: numeric.map(|n| n.unit.clone()),
                 correct: response.is_some_and(|r| r.correct),
                 confidence: response.and_then(|r| r.confidence),
+                confidence_percent: response.and_then(|r| r.confidence_percent),
                 points: response.map_or(0, |r| r.points),
                 explanation: q.explanation.clone(),
             }
@@ -937,6 +974,7 @@ mod tests {
             option_id,
             value: value.map(str::to_string),
             confidence,
+            confidence_percent: None,
         }
     }
 

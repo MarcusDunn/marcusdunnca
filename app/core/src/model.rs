@@ -422,6 +422,21 @@ pub struct AttemptResponse {
     /// reliability estimate rather than pooled in at the bottom band.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confidence: Option<Confidence>,
+    /// The probability the reader actually stated, 0–100.
+    ///
+    /// `confidence` is derived from this — see `Confidence::from_percent`. Both
+    /// are stored because they answer different questions and one cannot be
+    /// recovered from the other: the band is what the points table and the
+    /// review scheduler consume, and the percentage is what a reliability curve
+    /// and a Brier score need. 79% and 51% are the same band and very different
+    /// claims.
+    ///
+    /// `None` on attempts recorded before the slider, which carry a band and no
+    /// number. Those still count toward the band table and are excluded from
+    /// the Brier score, because inventing a midpoint for them would be
+    /// fabricating a claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence_percent: Option<u8>,
     /// Points earned, under the scoring rule in force when this was submitted.
     ///
     /// Denormalized deliberately. If the points table is ever retuned, a stored
@@ -756,6 +771,7 @@ mod tests {
         .expect("legacy response still reads");
 
         assert_eq!(r.confidence, None, "absent is not `guessing`");
+        assert_eq!(r.confidence_percent, None);
         assert_eq!(r.points, 0);
         assert_eq!(r.answer_text, None);
     }

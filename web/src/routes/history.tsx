@@ -209,8 +209,12 @@ function CalibrationSection({ calibration }: { calibration: Calibration }) {
     <>
       <p>
         {calibration.points} of {calibration.maxPoints} points across {rated}{" "}
-        answered question{rated === 1 ? "" : "s"}. Both formats are pooled here:
-        this table is about your reports, not about the questions.
+        answered question{rated === 1 ? "" : "s"}
+        {calibration.brier.score === null
+          ? ""
+          : `, Brier ${calibration.brier.score.toFixed(3)} over ${calibration.brier.n}`}
+        . Both formats are pooled here: this table is about your reports, not
+        about the questions.
         {calibration.unrated > 0
           ? ` ${calibration.unrated} earlier answer${
               calibration.unrated === 1 ? " is" : "s are"
@@ -252,6 +256,16 @@ function CalibrationSection({ calibration }: { calibration: Calibration }) {
         less informative than it looks. The two bands above it are the ones
         worth reading.
       </p>
+      {calibration.brier.score === null ? null : (
+        <p>
+          The Brier score uses the whole probability you stated rather than the
+          bucket it fell in — 79% and 51% are the same band and very different
+          claims. Lower is better; saying 50% to everything scores 0.250, so
+          that is the line to beat. It is a measurement, not a score to play
+          against: unlike points, it correctly rewards having been unsure about
+          something you got wrong.
+        </p>
+      )}
 
       {calibration.confidentErrors.length > 0 ? (
         <>
