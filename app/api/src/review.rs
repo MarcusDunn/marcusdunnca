@@ -265,7 +265,7 @@ pub struct ReviewResultDto {
     pub correct: bool,
     pub confidence: Option<Confidence>,
     pub confidence_percent: Option<u8>,
-    pub points: i32,
+    pub score_bits: f64,
     /// In the order they were shown, so the results screen lines up with the
     /// question the reader just answered.
     pub options: Vec<QuestionOption>,
@@ -286,8 +286,8 @@ pub struct ReviewResultDto {
 pub struct ReviewSubmitResponse {
     pub correct: usize,
     pub total: usize,
-    pub points: i32,
-    pub max_points: i32,
+    pub score_bits: f64,
+    pub max_score_bits: f64,
     pub results: Vec<ReviewResultDto>,
 }
 
@@ -321,7 +321,8 @@ pub async fn submit(state: &AppState, req: ReviewSubmitRequest) -> Result<Review
     let mut results = Vec::with_capacity(req.answers.len());
     let mut updated: Vec<ReviewItem> = Vec::new();
     let mut correct_count = 0usize;
-    let mut points = 0i32;
+    let mut score_bits = 0.0f64;
+    let mut max_score_bits = 0.0f64;
 
     for (doc_id, answers) in by_document {
         let doc = state.store.get_doc(doc_id).await?.ok_or(Error::NotFound)?;
@@ -354,11 +355,14 @@ pub async fn submit(state: &AppState, req: ReviewSubmitRequest) -> Result<Review
             if graded.correct {
                 correct_count += 1;
             }
-            let awarded = match confidence {
-                Some(band) if graded.answered => band.points(graded.correct),
-                _ => 0,
+            let awarded = match confidence_percent {
+                Some(percent) if graded.answered => {
+                    trainer_core::tags::score_bits(percent, graded.correct, question.format())
+                }
+                _ => 0.0,
             };
-            points += awarded;
+            score_bits += awarded;
+            max_score_bits += trainer_core::tags::max_score_bits(question.format());
 
             let shown = permuted_options(question, &item.presentation);
             let key_in_presentation = question
@@ -375,7 +379,7 @@ pub async fn submit(state: &AppState, req: ReviewSubmitRequest) -> Result<Review
                 correct: graded.correct,
                 confidence,
                 confidence_percent,
-                points: awarded,
+                score_bits: awarded,
                 options: shown,
                 correct_option_id: key_in_presentation,
                 selected_option_id: answer.option_id,
@@ -399,8 +403,8 @@ pub async fn submit(state: &AppState, req: ReviewSubmitRequest) -> Result<Review
     Ok(ReviewSubmitResponse {
         correct: correct_count,
         total,
-        points,
-        max_points: total as i32 * Confidence::MAX_POINTS_PER_QUESTION,
+        score_bits,
+        max_score_bits,
         results,
     })
 }

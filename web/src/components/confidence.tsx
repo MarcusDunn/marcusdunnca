@@ -1,25 +1,27 @@
 import {
-  bandForPercent,
   CHANCE_FLOOR_PERCENT,
-  CONFIDENCE_LABELS,
-  CONFIDENCE_POINTS,
+  MAX_PERCENT,
+  scoreBits,
   type QuestionFormat,
 } from "../lib/schemas";
 
 /**
  * How sure you are, as a number.
  *
- * # Why a slider rather than three buttons
+ * # Why a slider
  *
- * The three bands are still what gets *scored* — the points table and the
- * review scheduler both want buckets — but they are a poor thing to ask for.
+ * The score is continuous in this number — every step of the track changes what
+ * the answer is worth, in both directions. The three bands survive only as the
+ * review scheduler's input, and nothing the reader sees depends on them.
+ *
+ * Asking for a band was a poor thing to ask for.
  * "Fairly sure" invites a feeling; "68%" is a claim you can be wrong about, and
  * being asked to produce one is most of what calibration training consists of.
  *
- * It also makes the record far more useful. Two answers in the same band can be
- * 51% and 79%, which are very different statements, and a reliability curve
- * built from three buckets needs a great deal of data before it says anything.
- * A stated probability gives a Brier score from the first attempt.
+ * It also makes the record far more useful. 51% and 79% used to score
+ * identically; now they are different claims priced differently, and a
+ * reliability curve built from real probabilities says something after one
+ * attempt rather than after months.
  *
  * # Why it starts at chance and cannot go below it
  *
@@ -49,8 +51,8 @@ export function ConfidenceSlider({
 }) {
   const floor = CHANCE_FLOOR_PERCENT[format];
   const value = percent ?? floor;
-  const band = bandForPercent(value);
-  const points = CONFIDENCE_POINTS[band];
+  const ifRight = scoreBits(value, true, format);
+  const ifWrong = scoreBits(value, false, format);
   const inputId = `${idPrefix}-confidence`;
 
   return (
@@ -61,14 +63,14 @@ export function ConfidenceSlider({
         id={inputId}
         name={inputId}
         min={floor}
-        max={100}
+        max={MAX_PERCENT}
         step={1}
         value={value}
         disabled={disabled}
         // `aria-valuetext` because a screen reader announcing "68" is much less
         // use than "68 percent, fairly sure, plus 2 or minus 1" — the price is
         // the part being decided, and it is not in the number.
-        aria-valuetext={`${value}%, ${CONFIDENCE_LABELS[band].toLowerCase()}, +${points.correct} if right, ${points.wrong} if wrong`}
+        aria-valuetext={`${value} percent: ${signed(ifRight)} bits if right, ${signed(ifWrong)} if wrong`}
         onChange={(event) => onChange(Number(event.target.value))}
       />{" "}
       <output htmlFor={inputId}>
@@ -78,10 +80,15 @@ export function ConfidenceSlider({
           <>not set — drag to state a probability</>
         ) : (
           <>
-            {value}% · {CONFIDENCE_LABELS[band]} (+{points.correct} / {points.wrong})
+            {value}% · {signed(ifRight)} if right, {signed(ifWrong)} if wrong
           </>
         )}
       </output>
     </div>
   );
+}
+
+/** Two decimals with an explicit sign, so a gain and a cost read differently. */
+export function signed(bits: number): string {
+  return `${bits >= 0 ? "+" : "\u2212"}${Math.abs(bits).toFixed(2)}`;
 }

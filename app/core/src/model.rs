@@ -426,9 +426,9 @@ pub struct AttemptResponse {
     ///
     /// `confidence` is derived from this — see `Confidence::from_percent`. Both
     /// are stored because they answer different questions and one cannot be
-    /// recovered from the other: the band is what the points table and the
-    /// review scheduler consume, and the percentage is what a reliability curve
-    /// and a Brier score need. 79% and 51% are the same band and very different
+    /// recovered from the other: the band is what the review scheduler and the
+    /// band table consume, and the percentage is what the score itself, a
+    /// reliability curve and a Brier score are computed from. 79% and 51% are the same band and very different
     /// claims.
     ///
     /// `None` on attempts recorded before the slider, which carry a band and no
@@ -437,14 +437,17 @@ pub struct AttemptResponse {
     /// fabricating a claim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confidence_percent: Option<u8>,
-    /// Points earned, under the scoring rule in force when this was submitted.
+    /// Bits of information over chance, under the rule in force when this was
+    /// submitted. See `tags::score_bits`.
     ///
-    /// Denormalized deliberately. If the points table is ever retuned, a stored
-    /// value keeps this attempt reporting the score it was actually given,
-    /// which is the same reasoning that copies `skill` and `topics` onto the
-    /// row instead of joining back. Zero on a response with no confidence.
+    /// Denormalized deliberately. If the rule is ever retuned, a stored value
+    /// keeps this attempt reporting the score it was actually given — the same
+    /// reasoning that copies `skill` and `topics` onto the row rather than
+    /// joining back. Zero on a response with no confidence, which is also what
+    /// reporting chance scores, and the two are distinguished by
+    /// `confidence_percent` being absent rather than by the score.
     #[serde(default)]
-    pub points: i32,
+    pub score_bits: f64,
     pub correct: bool,
 }
 
@@ -481,21 +484,25 @@ pub struct Attempt {
     pub score: usize,
     pub total: usize,
 
-    /// Sum of `responses[].points`. Can be negative — that is the point of it.
+    /// Sum of `responses[].score_bits`. Negative is normal and is the point of
+    /// it — a session of confident errors should read as worse than knowing
+    /// nothing, because it is.
     ///
     /// **Reported alongside `score`, never instead of it.** They answer
-    /// different questions: `score` is how much you knew, `points` is how well
-    /// you knew what you knew. Collapsing the two into one number destroys the
-    /// only diagnostic the confidence bands produce, because six confident
-    /// rights and four confident wrongs scores the same as ten hedged rights
-    /// and looks nothing like it.
+    /// different questions: `score` is how much you knew, this is how well you
+    /// knew what you knew. Collapsing them destroys the only diagnostic the
+    /// confidence slider produces — six confident rights and four confident
+    /// wrongs scores the same as ten hedged rights and looks nothing like it.
     #[serde(default)]
-    pub points: i32,
-    /// `total * MAX_POINTS_PER_QUESTION`, so a points total can be read against
-    /// its ceiling. Stored rather than computed for the same reason as
-    /// `points`: a change to the rule must not restate old attempts.
+    pub score_bits: f64,
+    /// What this attempt could have earned at maximum confidence throughout.
+    ///
+    /// Summed per question rather than multiplied out, because the ceiling
+    /// differs by format: a typed figure removes more uncertainty than a
+    /// four-way choice, so it is worth more bits. Stored for the same reason as
+    /// the score itself.
     #[serde(default)]
-    pub max_points: i32,
+    pub max_score_bits: f64,
 }
 
 /// `AUTH` / `CHALLENGE#<b64url>`, and — during the one-shot enrolment described
@@ -772,7 +779,7 @@ mod tests {
 
         assert_eq!(r.confidence, None, "absent is not `guessing`");
         assert_eq!(r.confidence_percent, None);
-        assert_eq!(r.points, 0);
+        assert_eq!(r.score_bits, 0.0);
         assert_eq!(r.answer_text, None);
     }
 }

@@ -20,7 +20,7 @@ use trainer_core::model::{
 use trainer_core::numeric::{self, NumericAnswer};
 use trainer_core::review::ReviewItem;
 use trainer_core::store::AttemptWrite;
-use trainer_core::tags::{Choice, Confidence, Topic, TAG_VERSION};
+use trainer_core::tags::{self, Choice, Confidence, Topic, TAG_VERSION};
 
 use crate::state::AppState;
 
@@ -549,7 +549,7 @@ pub struct GradedQuestionDto {
     /// Echoed back so the results screen can show what was claimed, not just
     /// which bucket it fell in.
     pub confidence_percent: Option<u8>,
-    pub points: i32,
+    pub score_bits: f64,
     pub explanation: String,
 }
 
@@ -561,10 +561,11 @@ pub struct SubmitResponse {
     pub submitted_at: String,
     pub correct: usize,
     pub total: usize,
-    /// Sum of the per-question points, and its ceiling. Reported next to
-    /// `correct`, never instead of it — see [`Attempt::points`].
-    pub points: i32,
-    pub max_points: i32,
+    /// Bits of information over chance, and the ceiling for this question mix.
+    /// Reported next to `correct`, never instead of it — see
+    /// [`Attempt::score_bits`].
+    pub score_bits: f64,
+    pub max_score_bits: f64,
     /// Carries the key, correctly: the attempt has already been written by the
     /// time this is built, so it is no longer secret for this attempt. This is
     /// the *only* response type that includes it.
@@ -660,22 +661,30 @@ fn grade_one(
         answer_text,
         confidence,
         confidence_percent,
-        points: award(confidence, answered, correct),
+        score_bits: award(confidence_percent, answered, correct, question.format()),
         correct,
     })
 }
 
-/// Points for one response.
+/// The score for one response, in bits over chance.
 ///
 /// **An unanswered question scores zero whatever confidence came with it.** The
-/// scoring rule prices a *claim*, and a blank is not a claim — charging −5 for
-/// a question marked "certain" and then left empty would be pricing a UI
-/// mishap. The client cannot produce that state; this is what happens if it
-/// ever does.
-fn award(confidence: Option<Confidence>, answered: bool, correct: bool) -> i32 {
-    match confidence {
-        Some(band) if answered => band.points(correct),
-        _ => 0,
+/// rule prices a *claim*, and a blank is not a claim — charging six bits for a
+/// question set to 99% and then left empty would be pricing a UI mishap. The
+/// client cannot produce that state; this is what happens if it ever does.
+///
+/// An answer from a client that predates the slider also scores zero. It has a
+/// band but no probability, and the rule needs a number — inventing a midpoint
+/// for it would be scoring a claim nobody made.
+fn award(
+    percent: Option<u8>,
+    answered: bool,
+    correct: bool,
+    format: trainer_core::tags::QuestionFormat,
+) -> f64 {
+    match percent {
+        Some(percent) if answered => tags::score_bits(percent, correct, format),
+        _ => 0.0,
     }
 }
 
@@ -720,7 +729,8 @@ pub async fn submit(state: &AppState, doc_id: &str, req: SubmitRequest) -> Resul
 
     let mut responses = Vec::with_capacity(doc.questions.len());
     let mut score = 0usize;
-    let mut points = 0i32;
+    let mut score_bits = 0.0f64;
+    let mut max_score_bits = 0.0f64;
 
     for question in &doc.questions {
         let response = grade_one(
@@ -731,7 +741,11 @@ pub async fn submit(state: &AppState, doc_id: &str, req: SubmitRequest) -> Resul
         if response.correct {
             score += 1;
         }
-        points += response.points;
+        score_bits += response.score_bits;
+        // Per question, not `total * a constant`: the ceiling differs by
+        // format, because a typed figure removes more uncertainty than a
+        // four-way choice and is worth more bits.
+        max_score_bits += tags::max_score_bits(question.format());
         responses.push(response);
     }
 
@@ -759,11 +773,11 @@ pub async fn submit(state: &AppState, doc_id: &str, req: SubmitRequest) -> Resul
         duration_ms: req.duration_ms.unwrap_or(0).min(MAX_DURATION_MS),
         score,
         total,
-        points,
-        // The ceiling every question could have reached, including ones with no
-        // confidence attached — so a quiz answered by a stale client reads as
-        // "0 of 30", which is the truth, rather than "0 of 0".
-        max_points: total as i32 * Confidence::MAX_POINTS_PER_QUESTION,
+        score_bits,
+        // Counted over every question, including ones answered with no
+        // confidence — so a quiz taken on a stale client reads as "0 of 19.9
+        // bits", which is the truth, rather than "0 of 0".
+        max_score_bits,
     };
 
     // Written before the response is built. If the write fails the caller gets
@@ -797,8 +811,8 @@ pub async fn submit(state: &AppState, doc_id: &str, req: SubmitRequest) -> Resul
         submitted_at: stored.submitted_at.clone(),
         correct: stored.score,
         total: stored.total,
-        points: stored.points,
-        max_points: stored.max_points,
+        score_bits: stored.score_bits,
+        max_score_bits: stored.max_score_bits,
         questions: grade_all(&doc.questions, &doc.topics, &stored),
     })
 }
@@ -919,7 +933,7 @@ fn grade_all(
                 correct: response.is_some_and(|r| r.correct),
                 confidence: response.and_then(|r| r.confidence),
                 confidence_percent: response.and_then(|r| r.confidence_percent),
-                points: response.map_or(0, |r| r.points),
+                score_bits: response.map_or(0.0, |r| r.score_bits),
                 explanation: q.explanation.clone(),
             }
         })
@@ -1072,61 +1086,95 @@ mod tests {
         .is_err());
     }
 
-    /// A client that predates the confidence field must still be able to
-    /// submit. Its answers are graded normally and score no points — which is
-    /// honest, because it was never asked how sure it was.
-    #[test]
-    fn an_answer_with_no_confidence_still_grades() {
-        let submitted = answered("q3", Some(Choice::B), None, None);
-        let response = grade(&sample_question(), Some(&submitted));
-
-        assert!(response.correct);
-        assert_eq!(response.confidence, None);
-        assert_eq!(
-            response.points, 0,
-            "no claim was made, so nothing is priced"
-        );
-    }
-
-    /// The scoring rule, exercised through the handler rather than through
-    /// `Confidence::points` — this is where a wired-up-backwards mistake would
-    /// show, and it would show as a plausible-looking score.
-    #[test]
-    fn points_follow_the_band_and_the_outcome() {
-        let q = sample_question();
-
-        let cases = [
-            (Choice::B, Confidence::Certain, true, 3),
-            (Choice::A, Confidence::Certain, false, -5),
-            (Choice::B, Confidence::FairlySure, true, 2),
-            (Choice::A, Confidence::FairlySure, false, -1),
-            (Choice::B, Confidence::Guessing, true, 1),
-            (Choice::A, Confidence::Guessing, false, 0),
-        ];
-
-        for (choice, band, expect_correct, expect_points) in cases {
-            let submitted = answered("q3", Some(choice), None, Some(band));
-            let response = grade(&q, Some(&submitted));
-            assert_eq!(response.correct, expect_correct, "{band} {choice}");
-            assert_eq!(response.points, expect_points, "{band} {choice}");
+    fn with_percent(
+        question_id: &str,
+        option_id: Option<Choice>,
+        value: Option<&str>,
+        percent: u8,
+    ) -> SubmittedAnswer {
+        SubmittedAnswer {
+            question_id: question_id.into(),
+            option_id,
+            value: value.map(str::to_string),
+            confidence: None,
+            confidence_percent: Some(percent),
         }
     }
 
-    /// **The rule that keeps a UI mishap from costing five points.** A blank is
+    /// A client that predates the slider still submits. It carries a band and
+    /// no probability, so it is graded normally and scores nothing — the rule
+    /// needs a number, and inventing a midpoint would price a claim nobody
+    /// made.
+    #[test]
+    fn an_answer_with_no_stated_probability_still_grades() {
+        let submitted = answered("q3", Some(Choice::B), None, Some(Confidence::Certain));
+        let response = grade(&sample_question(), Some(&submitted));
+
+        assert!(response.correct);
+        assert_eq!(response.confidence, Some(Confidence::Certain));
+        assert_eq!(response.confidence_percent, None);
+        assert_eq!(response.score_bits, 0.0, "no probability, nothing to price");
+    }
+
+    /// The scoring rule wired through the handler, where a backwards
+    /// connection would show up as a plausible-looking score.
+    #[test]
+    fn the_score_follows_the_stated_probability_and_the_outcome() {
+        let q = sample_question();
+
+        // Chance is the zero point, in both directions.
+        for choice in [Choice::B, Choice::A] {
+            let response = grade(&q, Some(&with_percent("q3", Some(choice), None, 25)));
+            assert!(
+                response.score_bits.abs() < 1e-12,
+                "reporting chance must score nothing, got {}",
+                response.score_bits
+            );
+        }
+
+        // Above chance: right pays, wrong costs, and both grow with confidence.
+        let sure_right = grade(&q, Some(&with_percent("q3", Some(Choice::B), None, 95)));
+        let hedged_right = grade(&q, Some(&with_percent("q3", Some(Choice::B), None, 60)));
+        let sure_wrong = grade(&q, Some(&with_percent("q3", Some(Choice::A), None, 95)));
+        let hedged_wrong = grade(&q, Some(&with_percent("q3", Some(Choice::A), None, 60)));
+
+        assert!(sure_right.score_bits > hedged_right.score_bits);
+        assert!(hedged_right.score_bits > 0.0);
+        assert!(sure_wrong.score_bits < hedged_wrong.score_bits);
+        assert!(hedged_wrong.score_bits < 0.0);
+        assert!(
+            sure_wrong.score_bits.abs() > sure_right.score_bits,
+            "a confident error must cost more than a confident hit earns"
+        );
+    }
+
+    /// A report below chance is not a belief anyone holds. Clamping it to the
+    /// floor keeps it out of the reliability curve rather than scoring noise.
+    #[test]
+    fn a_probability_below_chance_is_clamped_to_it() {
+        let response = grade(
+            &sample_question(),
+            Some(&with_percent("q3", Some(Choice::B), None, 5)),
+        );
+        assert_eq!(response.confidence_percent, Some(25));
+        assert!(response.score_bits.abs() < 1e-12);
+    }
+
+    /// **The rule that keeps a UI mishap from costing six bits.** A blank is
     /// not a claim, so it cannot be a confidently wrong one.
     #[test]
-    fn an_unanswered_question_scores_zero_whatever_the_band_says() {
-        let submitted = answered("q3", None, None, Some(Confidence::Certain));
+    fn an_unanswered_question_scores_zero_however_sure_it_claimed_to_be() {
+        let submitted = with_percent("q3", None, None, 99);
         let response = grade(&sample_question(), Some(&submitted));
 
         assert!(!response.correct);
-        assert_eq!(response.points, 0);
+        assert_eq!(response.score_bits, 0.0);
 
         // And the same for a numeric question left empty, including one sent as
         // whitespace rather than omitted.
-        let blank = answered("n1", None, Some("   "), Some(Confidence::Certain));
+        let blank = with_percent("n1", None, Some("   "), 99);
         let response = grade(&sample_numeric(), Some(&blank));
-        assert_eq!(response.points, 0);
+        assert_eq!(response.score_bits, 0.0);
         assert_eq!(response.answer_text, None, "whitespace is not an answer");
     }
 

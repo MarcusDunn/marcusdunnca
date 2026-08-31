@@ -5,7 +5,7 @@ import { Busy, BusyMark, ErrorNotice } from "../components/ui";
 import { api } from "../lib/api";
 import { formatFigure, formatTolerance, parseFigure } from "../lib/figures";
 import { queryKeys, reviewQueueQuery } from "../lib/queries";
-import { ConfidenceSlider } from "../components/confidence";
+import { ConfidenceSlider, signed } from "../components/confidence";
 import {
   CHANCE_FLOOR_PERCENT,
   CONFIDENCE_LABELS,
@@ -328,8 +328,8 @@ function Results({
   return (
     <>
       <h2 role="status">
-        {result.correct} of {result.total} correct · {result.points} of{" "}
-        {result.maxPoints} points
+        {result.correct} of {result.total} correct · {signed(result.scoreBits)} of{" "}
+        {result.maxScoreBits.toFixed(2)} bits
       </h2>
       <p>
         Each answer moved that question&apos;s schedule. The interval beside each
@@ -353,8 +353,7 @@ function Results({
                   ? ` after saying ${CONFIDENCE_LABELS[graded.confidence].toLowerCase()}`
                   : ""
                 : ` after saying ${graded.confidencePercent}%`}{" "}
-              ({graded.points >= 0 ? "+" : ""}
-              {graded.points}) — back in {graded.intervalDays} day
+              ({signed(graded.scoreBits)} bits) — back in {graded.intervalDays} day
               {graded.intervalDays === 1 ? "" : "s"}, on{" "}
               {new Date(graded.nextDueAt).toLocaleDateString()}
             </p>

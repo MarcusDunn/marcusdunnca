@@ -1,7 +1,7 @@
 import {
   CONFIDENCE_BANDS,
   CONFIDENCE_BOUNDS,
-  MAX_POINTS_PER_QUESTION,
+  maxScoreBits as ceilingFor,
   type Confidence,
   type HistoryAttempt,
   type QuestionFormat,
@@ -35,7 +35,7 @@ export type Observation = {
   confidence?: Confidence;
   /** Undefined on answers given before the slider — a band is not a number. */
   confidencePercent?: number;
-  points: number;
+  scoreBits: number;
 };
 
 export type Rate = {
@@ -115,7 +115,7 @@ function flatten(
     ...(question.confidencePercent === undefined
       ? {}
       : { confidencePercent: question.confidencePercent }),
-    points: question.points,
+    scoreBits: question.scoreBits,
   };
 }
 
@@ -190,8 +190,8 @@ export type Calibration = {
    * describing a small slice of the history and the reader should know which.
    */
   unrated: number;
-  points: number;
-  maxPoints: number;
+  scoreBits: number;
+  maxScoreBits: number;
   /**
    * Mean Brier score over every answer that stated a probability, and how many
    * did. `null` below the observation floor.
@@ -220,8 +220,8 @@ export type Calibration = {
 export function buildCalibration(observations: readonly Observation[]): Calibration {
   const tallies = new Map<Confidence, Tally>();
   let unrated = 0;
-  let points = 0;
-  let maxPoints = 0;
+  let scoreBits = 0;
+  let maxScoreBits = 0;
   const confidentErrors: Observation[] = [];
 
   for (const observation of observations) {
@@ -230,8 +230,8 @@ export function buildCalibration(observations: readonly Observation[]): Calibrat
       continue;
     }
     bump(tallies, observation.confidence, observation.correct);
-    points += observation.points;
-    maxPoints += MAX_POINTS_PER_QUESTION;
+    scoreBits += observation.scoreBits;
+    maxScoreBits += ceilingFor(observation.format);
     if (observation.confidence === "certain" && !observation.correct) {
       confidentErrors.push(observation);
     }
@@ -264,8 +264,8 @@ export function buildCalibration(observations: readonly Observation[]): Calibrat
   return {
     bands,
     unrated,
-    points,
-    maxPoints,
+    scoreBits,
+    maxScoreBits,
     // Suppressed on the same floor as every other rate here. A Brier score off
     // three answers is a number, not an estimate.
     brier: {
