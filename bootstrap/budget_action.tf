@@ -15,6 +15,12 @@
 # Deliberately one-way. Detaching the brake requires a human with Identity
 # Center admin — CI cannot modify its own role (DenyTamperingWithCIControlPlane),
 # which is exactly the property wanted in a runaway-spend scenario.
+#
+# One-way holds only because the brake policy and the executor role below are
+# BOTH in ci_control_plane_arns. Without that, the apply role's policy-version
+# and trust-policy permissions reached them, and the brake could be rewritten
+# into a no-op or its executor re-trusted before it ever fired. Anything added
+# to this file that the brake depends on goes in that list too.
 # ---------------------------------------------------------------------------
 
 data "aws_iam_policy_document" "spend_brake" {
@@ -89,21 +95,29 @@ resource "aws_iam_role" "budgets_action" {
 # actions this account has no use for. Budgets only needs to attach and detach
 # this one policy, on these two roles.
 data "aws_iam_policy_document" "budgets_action" {
+  # The policy ARN is a CONDITION, not a resource. For Attach/DetachRolePolicy
+  # the resource is the role, and listing the policy ARN beside the roles did
+  # nothing — this role could attach any managed policy in the account,
+  # AdministratorAccess included, to the CI roles. iam:PolicyARN is what
+  # limits it to the brake.
   statement {
-    sid    = "AttachAndDetachTheBrake"
-    effect = "Allow"
-    actions = [
-      "iam:AttachRolePolicy",
-      "iam:DetachRolePolicy",
-      "iam:ListAttachedRolePolicies",
-      "iam:GetRole",
-      "iam:GetPolicy",
-    ]
-    resources = [
-      local.plan_role_arn,
-      local.apply_role_arn,
-      aws_iam_policy.spend_brake.arn,
-    ]
+    sid       = "AttachAndDetachTheBrake"
+    effect    = "Allow"
+    actions   = ["iam:AttachRolePolicy", "iam:DetachRolePolicy"]
+    resources = [local.plan_role_arn, local.apply_role_arn]
+
+    condition {
+      test     = "ArnEquals"
+      variable = "iam:PolicyARN"
+      values   = [aws_iam_policy.spend_brake.arn]
+    }
+  }
+
+  statement {
+    sid       = "ReadWhatTheBrakeTouches"
+    effect    = "Allow"
+    actions   = ["iam:ListAttachedRolePolicies", "iam:GetRole", "iam:GetPolicy"]
+    resources = [local.plan_role_arn, local.apply_role_arn, aws_iam_policy.spend_brake.arn]
   }
 }
 

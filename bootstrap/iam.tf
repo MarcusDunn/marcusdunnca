@@ -11,9 +11,18 @@
 #   * Neither role uses an AWS managed policy. AdministratorAccess and
 #     ReadOnlyAccess are both far wider than this account needs, and AWS can
 #     widen them further without notice. Every permission is enumerated.
-#   * The apply role holds NO IAM role or policy write permission whatsoever.
-#     It cannot create a role, attach a policy, or edit its own grants, so
-#     privilege escalation has no first step.
+#   * The apply role's IAM write permission is confined to application roles
+#     and policies named `${project}-*`, every role it creates or edits must
+#     carry the permissions boundary, and it may pass a role only to Lambda
+#     and only if the role is named `${project}-*-execution`. Anything else in
+#     IAM — its own identities, the boundary, the guardrails, the spend brake
+#     and the role AWS Budgets uses to apply it, Identity Center's roles — is
+#     out of reach by name, so privilege escalation has no first step.
+#
+#     NAMING IS LOAD-BEARING. A boundary-less role named `${project}-*` that a
+#     human creates by hand must be added to ci_control_plane_arns, or CI can
+#     re-trust it. Execution roles created by infra/ must end in `-execution`
+#     or CI cannot pass them to Lambda.
 #   * Everything is region-locked. The standard denial-of-wallet play is to
 #     launch compute in every region simultaneously; here all but two regions
 #     reject the call outright.
@@ -36,24 +45,53 @@ locals {
 
   iam_root = "arn:${local.partition}:iam::${local.account_id}"
 
-  plan_role_arn  = "${local.iam_root}:role/${local.plan_role_name}"
-  apply_role_arn = "${local.iam_root}:role/${local.apply_role_name}"
-  boundary_arn   = "${local.iam_root}:policy/${local.boundary_name}"
-  guardrail_arn  = "${local.iam_root}:policy/${local.guardrail_name}"
-  oidc_arn       = "${local.iam_root}:oidc-provider/token.actions.githubusercontent.com"
+  app_guardrail_name = "${var.project}-ci-app-guardrails"
+
+  plan_role_arn     = "${local.iam_root}:role/${local.plan_role_name}"
+  apply_role_arn    = "${local.iam_root}:role/${local.apply_role_name}"
+  boundary_arn      = "${local.iam_root}:policy/${local.boundary_name}"
+  guardrail_arn     = "${local.iam_root}:policy/${local.guardrail_name}"
+  app_guardrail_arn = "${local.iam_root}:policy/${local.app_guardrail_name}"
+  oidc_arn          = "${local.iam_root}:oidc-provider/token.actions.githubusercontent.com"
+  budgets_role_arn  = "${local.iam_root}:role/${var.project}-budgets-action"
+  spend_brake_arn   = "${local.iam_root}:policy/${var.project}-spend-brake"
 
   # The things CI must never be able to touch: its own identities, the policies
-  # that constrain it, and the trust anchor.
+  # that constrain it, the trust anchor, and the spend brake together with the
+  # role AWS Budgets assumes to apply it.
+  #
+  # The last two were missing. Both are bootstrap-owned and carry no boundary,
+  # and ManageApplicationRoles below grants role and policy writes — so CI
+  # could rewrite the brake into a no-op with CreatePolicyVersion, delete it,
+  # or re-trust its executor. A circuit breaker CI can disarm is not one-way.
   ci_control_plane_arns = [
     local.plan_role_arn,
     local.apply_role_arn,
     local.boundary_arn,
     local.guardrail_arn,
+    local.app_guardrail_arn,
     local.oidc_arn,
+    local.budgets_role_arn,
+    local.spend_brake_arn,
   ]
+
+  # The IAM objects CI is allowed to manage, by name. infra/ creates
+  # `${project}-api-execution` and `${project}-generate-execution`; nothing it
+  # creates may ever be named otherwise, and nothing bootstrap creates under
+  # this prefix may lack the boundary without also appearing in the list above.
+  app_role_arn_pattern       = "${local.iam_root}:role/${var.project}-*"
+  app_policy_arn_pattern     = "${local.iam_root}:policy/${var.project}-*"
+  execution_role_arn_pattern = "${local.iam_root}:role/${var.project}-*-execution"
 
   state_bucket_arn = aws_s3_bucket.state.arn
   trail_bucket_arn = aws_s3_bucket.trail.arn
+
+  # The application's document bucket, owned by infra/ and named there as
+  # `${project}-docs-<account>-<region>-an` (see infra/s3.tf). Constructed
+  # rather than read from infra's state, because this module cannot depend on
+  # infra's — but the two names must match or the denies below protect
+  # nothing. Uploaded PDFs are the only user data in the system.
+  docs_bucket_arn = "arn:${local.partition}:s3:::${var.project}-docs-${local.account_id}-${var.aws_region}-an"
 
   # Immutable-form subject. See var.github_owner_id.
   github_sub_prefix = "repo:${var.github_owner}@${var.github_owner_id}/${var.github_repo}@${var.github_repo_id}"
@@ -268,6 +306,11 @@ locals {
     "budgets:UpdateBudget",
     "budgets:DeleteBudget",
     "budgets:DeleteBudgetAction",
+    # Raising the brake's threshold to a number it never reaches, or pointing
+    # it at a different policy, silences it as surely as deleting it.
+    "budgets:CreateBudgetAction",
+    "budgets:UpdateBudgetAction",
+    "budgets:ExecuteBudgetAction",
     "budgets:DeleteNotification",
     "budgets:DeleteSubscriber",
     "budgets:UpdateSubscriber",
@@ -395,9 +438,14 @@ locals {
   ]
 
   # Taking over a pre-existing unbounded role is how a boundary-wearing
-  # principal escapes: rewrite that role's trust policy to trust itself, assume
-  # it, and the boundary no longer applies. DenyRoleCreationWithoutThisBoundary
-  # only covers roles being created.
+  # principal escapes: rewrite that role's trust policy to trust a service it
+  # controls (the apply role has no sts:AssumeRole, but it can pass a role to
+  # Lambda), and the boundary no longer applies. DenyRoleWorkWithoutBoundary
+  # only covers roles being created or having policies attached.
+  #
+  # Denied outside `${project}-*` by DenyRoleTakeoverOutsideApplicationRoles in
+  # the app guardrails. This list existed for a while without being attached
+  # to any statement; that was the gap.
   role_takeover_actions = [
     "iam:UpdateAssumeRolePolicy",
     "iam:AttachRolePolicy",
@@ -579,6 +627,11 @@ data "aws_iam_policy_document" "ci_guardrails" {
       "iam:PutRolePolicy",
       "iam:AttachRolePolicy",
       "iam:PutRolePermissionsBoundary",
+      # Stripping a boundary-less role's policies is not an escalation, but it
+      # is tampering with something CI did not create, and the key is
+      # available for these two as well.
+      "iam:DetachRolePolicy",
+      "iam:DeleteRolePolicy",
     ]
     resources = ["${local.iam_root}:role/*"]
 
@@ -592,6 +645,11 @@ data "aws_iam_policy_document" "ci_guardrails" {
   # PassRole unconstrained is an escalation primitive: hand a powerful role to a
   # service you control and inherit it. Constrained to the app services it is
   # ordinary wiring. A missing iam:PassedToService key fails closed here too.
+  #
+  # This confines WHERE a role may go. WHICH role may be passed is confined by
+  # name in the app guardrails (DenyPassRoleOutsideExecutionRoles); without
+  # that half, a re-trusted unbounded role passed to Lambda runs with no
+  # boundary and no guardrail at all.
   statement {
     sid       = "DenyPassRoleExceptToAppServices"
     effect    = "Deny"
@@ -676,6 +734,83 @@ resource "aws_iam_policy" "ci_guardrails" {
   name        = local.guardrail_name
   description = "Deny-only guardrails attached to both CI roles. Explicit Deny beats any Allow, so these bound the blast radius of a compromised pipeline."
   policy      = data.aws_iam_policy_document.ci_guardrails.json
+}
+
+# ---------------------------------------------------------------------------
+# Application guardrails — the second deny-only policy, attached to BOTH roles.
+#
+# A second policy rather than more statements in the first, because IAM caps a
+# managed policy at 6144 characters and ci_guardrails sits within a few hundred
+# of it. Splitting on subject keeps each one readable: the policy above is
+# about the account, this one is about the roles CI manages and the data the
+# application keeps. Both ARNs are in ci_control_plane_arns, so neither can be
+# edited or detached by the roles they bind.
+# ---------------------------------------------------------------------------
+
+data "aws_iam_policy_document" "ci_app_guardrails" {
+  # ManageApplicationRoles is already scoped to `${project}-*` by resource,
+  # which is what actually keeps Identity Center's roles and the budgets
+  # executor out of reach. This restates the same boundary as a Deny, so the
+  # protection survives a later widening of that Allow — which is the whole
+  # reason the guardrail policies exist.
+  statement {
+    sid           = "DenyRoleTakeoverOutsideApplicationRoles"
+    effect        = "Deny"
+    actions       = concat(local.role_takeover_actions, ["iam:DeleteRole", "iam:UpdateRole", "iam:PutRolePermissionsBoundary"])
+    not_resources = [local.app_role_arn_pattern]
+  }
+
+  # The other half of DenyPassRoleExceptToAppServices. The CI roles and the
+  # budgets executor are `${project}-*` too, so the pattern is deliberately
+  # narrower than the one above: only an execution role may be handed to a
+  # service. Every role infra/ creates for a function must be named
+  # `${project}-<name>-execution`, or CreateFunction fails on PassRole.
+  statement {
+    sid           = "DenyPassRoleOutsideExecutionRoles"
+    effect        = "Deny"
+    actions       = ["iam:PassRole"]
+    not_resources = [local.execution_role_arn_pattern]
+  }
+
+  # The reading history cannot be reconstructed, and the permissions boundary
+  # already denies these to any role CI creates. The apply role itself holds
+  # dynamodb:* and was not denied them — so a compromised pipeline could
+  # switch off point-in-time recovery and drop the table. UpdateContinuousBackups
+  # is the load-bearing one: rows can always be deleted through the data plane,
+  # and PITR is the recovery for that.
+  #
+  # Consequence worth knowing: CI cannot recreate the application table, and
+  # cannot enable PITR on a new table — both call UpdateContinuousBackups.
+  # That is intended. Replacing the table is a human decision.
+  statement {
+    sid    = "DenyApplicationDataDestruction"
+    effect = "Deny"
+    actions = [
+      "dynamodb:DeleteTable",
+      "dynamodb:DeleteBackup",
+      "dynamodb:UpdateContinuousBackups",
+      "dynamodb:DeleteTableReplica",
+    ]
+    resources = ["*"]
+  }
+
+  # Uploaded PDFs are versioned, and the noncurrent versions are what make a
+  # bad delete recoverable for thirty days. DeleteObjectVersion and suspending
+  # versioning are the two ways past that. Lifecycle changes are not denied:
+  # infra/ manages that configuration through CI, and a rule that expires
+  # objects is a slow delete rather than an instant one.
+  statement {
+    sid       = "DenyDocumentDestruction"
+    effect    = "Deny"
+    actions   = ["s3:DeleteBucket", "s3:DeleteObjectVersion", "s3:PutBucketVersioning"]
+    resources = [local.docs_bucket_arn, "${local.docs_bucket_arn}/*"]
+  }
+}
+
+resource "aws_iam_policy" "ci_app_guardrails" {
+  name        = local.app_guardrail_name
+  description = "Deny-only guardrails for the roles CI manages and the data the application keeps. Attached to both CI roles alongside the account guardrails."
+  policy      = data.aws_iam_policy_document.ci_app_guardrails.json
 }
 
 # ---------------------------------------------------------------------------
@@ -838,6 +973,11 @@ resource "aws_iam_role_policy" "plan_permissions" {
 resource "aws_iam_role_policy_attachment" "plan_guardrails" {
   role       = aws_iam_role.plan.name
   policy_arn = aws_iam_policy.ci_guardrails.arn
+}
+
+resource "aws_iam_role_policy_attachment" "plan_app_guardrails" {
+  role       = aws_iam_role.plan.name
+  policy_arn = aws_iam_policy.ci_app_guardrails.arn
 }
 
 # ---------------------------------------------------------------------------
@@ -1006,7 +1146,18 @@ data "aws_iam_policy_document" "apply_permissions" {
 
   # Execution roles for the application. Safe to grant only because
   # DenyRoleWorkWithoutBoundary forces every one of them to carry the boundary,
-  # and DenyPassRoleExceptToAppServices confines where they can be handed.
+  # DenyPassRoleExceptToAppServices confines where they can be handed, and the
+  # resources below confine WHICH roles this reaches.
+  #
+  # Not "*". With "*", iam:UpdateAssumeRolePolicy reached every boundary-less
+  # role in the account — the budgets executor, Identity Center's roles — and
+  # re-trusting one to lambda.amazonaws.com then passing it to a function is a
+  # complete escape from both the boundary and the guardrails. The app
+  # guardrails deny the same by name; this is the Allow being honest.
+  #
+  # iam:CreateServiceLinkedRole is deliberately absent. Its resource is
+  # role/aws-service-role/..., which no prefix here matches, and the
+  # conditioned statement below grants it for the one service that needs it.
   statement {
     sid    = "ManageApplicationRoles"
     effect = "Allow"
@@ -1038,9 +1189,11 @@ data "aws_iam_policy_document" "apply_permissions" {
       "iam:ListEntitiesForPolicy",
       "iam:TagPolicy",
       "iam:UntagPolicy",
-      "iam:CreateServiceLinkedRole",
     ]
-    resources = ["*"]
+    resources = [
+      local.app_role_arn_pattern,
+      local.app_policy_arn_pattern,
+    ]
   }
 
   # Access Analyzer provisions its own service-linked role on first use. This is
@@ -1078,14 +1231,19 @@ resource "aws_iam_role_policy_attachment" "apply_guardrails" {
   policy_arn = aws_iam_policy.ci_guardrails.arn
 }
 
+resource "aws_iam_role_policy_attachment" "apply_app_guardrails" {
+  role       = aws_iam_role.apply.name
+  policy_arn = aws_iam_policy.ci_app_guardrails.arn
+}
+
 # ---------------------------------------------------------------------------
 # Permissions boundary.
 #
-# Unused today: the apply role cannot create roles at all, which is a stronger
-# guarantee than bounding what the roles it creates may do. Kept because the
-# moment iam:CreateRole is added to the allowlist — when the application needs
-# an execution role — the boundary and the condition enforcing it must already
-# exist, or that expansion silently becomes an escalation path.
+# In use: the apply role creates the two Lambda execution roles in infra/, and
+# DenyRoleWorkWithoutBoundary refuses to create or attach a policy to any role
+# that does not carry this. It is the ceiling on what a CI-created role can do
+# whatever its inline policy says, which is what makes iam:CreateRole safe to
+# grant at all.
 # ---------------------------------------------------------------------------
 
 data "aws_iam_policy_document" "ci_permissions_boundary" {
@@ -1186,6 +1344,6 @@ data "aws_iam_policy_document" "ci_permissions_boundary" {
 
 resource "aws_iam_policy" "ci_permissions_boundary" {
   name        = local.boundary_name
-  description = "Maximum privilege any future CI-created role may hold. Not yet in use — the apply role cannot create roles."
+  description = "Maximum privilege any CI-created role may hold, whatever policy is attached to it. Every role the apply role creates must carry this."
   policy      = data.aws_iam_policy_document.ci_permissions_boundary.json
 }

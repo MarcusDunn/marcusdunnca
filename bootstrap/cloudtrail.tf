@@ -77,6 +77,30 @@ resource "aws_s3_bucket_lifecycle_configuration" "trail" {
   depends_on = [aws_s3_bucket_versioning.trail]
 }
 
+# The same Object Lock the state bucket has, for the same reason: "log versions
+# cannot be deleted" should be a property of the bucket, not something that is
+# true only while the guardrail policy says so. GOVERNANCE, seven days, so a
+# human admin keeps an escape hatch and the lifecycle rules above still work
+# (noncurrent versions expire at thirty days, well past the retention).
+#
+# CloudTrail delivers to Object Lock buckets without configuration changes —
+# each log file is a new object, and retention only constrains deletion.
+# Verify after applying with the get-trail-status command in the README; a
+# delivery failure would show up as LatestDeliveryError, and the health job
+# checks it on every PR.
+resource "aws_s3_bucket_object_lock_configuration" "trail" {
+  bucket = aws_s3_bucket.trail.id
+
+  rule {
+    default_retention {
+      mode = "GOVERNANCE"
+      days = 7
+    }
+  }
+
+  depends_on = [aws_s3_bucket_versioning.trail]
+}
+
 data "aws_iam_policy_document" "trail_bucket" {
   statement {
     sid    = "AllowCloudTrailAclCheck"
@@ -265,6 +289,31 @@ resource "aws_cloudtrail" "management" {
     field_selector {
       field       = "resources.ARN"
       starts_with = ["${aws_s3_bucket.state.arn}/"]
+    }
+  }
+
+  # The documents bucket holds the only user data in the system, and until
+  # this selector existed a read of every uploaded PDF produced no audit
+  # record. A handful of object operations per upload and per reading session,
+  # so the per-event billing is fractions of a cent. The bucket is named by
+  # convention in iam.tf because infra/ owns it; if the name there changes,
+  # this selector silently records nothing.
+  advanced_event_selector {
+    name = "Document bucket object events"
+
+    field_selector {
+      field  = "eventCategory"
+      equals = ["Data"]
+    }
+
+    field_selector {
+      field  = "resources.type"
+      equals = ["AWS::S3::Object"]
+    }
+
+    field_selector {
+      field       = "resources.ARN"
+      starts_with = ["${local.docs_bucket_arn}/"]
     }
   }
 
