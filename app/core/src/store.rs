@@ -656,6 +656,60 @@ impl Store {
         Ok(attempts)
     }
 
+    /// Every attempt at one document, newest first.
+    ///
+    /// A `Query` on the document's own partition, where [`Store::list_attempts`]
+    /// scans the table: reading one document's history has a partition key to
+    /// work with. Attempts sort under `ATTEMPT#<rfc3339>`, so
+    /// `scan_index_forward(false)` returns them newest-first off the index
+    /// rather than needing a sort here — see [`keys::attempt_sk`].
+    ///
+    /// **Deliberately not [`Store::find_attempt_by_id`], which looks like the
+    /// right tool and is not.** That resolves an id through the idempotency
+    /// marker, and the marker carries a thirty-day TTL because its job is
+    /// recognising a client's retry within the window one could plausibly
+    /// arrive. Reading history is the opposite case — the attempts worth
+    /// looking at are the old ones — and following an expired marker would
+    /// report a perfectly intact attempt as missing.
+    pub async fn list_attempts_for_doc(&self, doc_id: &str) -> Result<Vec<Attempt>> {
+        let mut attempts = Vec::new();
+        let mut start_key: Option<Item> = None;
+
+        loop {
+            let out = self
+                .client
+                .query()
+                .table_name(&self.table)
+                .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
+                .expression_attribute_values(":pk", AttributeValue::S(keys::doc_pk(doc_id)))
+                .expression_attribute_values(
+                    ":prefix",
+                    AttributeValue::S(keys::ATTEMPT_PREFIX.to_string()),
+                )
+                .scan_index_forward(false)
+                .set_exclusive_start_key(start_key.clone())
+                .send()
+                .await
+                .map_err(aws)?;
+
+            for item in out.items() {
+                match serde_dynamo::from_item::<_, Attempt>(item.clone()) {
+                    Ok(a) => attempts.push(a),
+                    // As in `list_attempts`: one unreadable row must not take a
+                    // document's whole history down with it.
+                    Err(e) => tracing::warn!(error = %e, "skipping unreadable attempt row"),
+                }
+            }
+
+            start_key = out.last_evaluated_key().cloned();
+            if start_key.is_none() {
+                break;
+            }
+        }
+
+        Ok(attempts)
+    }
+
     // ---- auth challenges --------------------------------------------------
 
     /// Every question's schedule, whether due or not.

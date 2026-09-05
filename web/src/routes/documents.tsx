@@ -117,6 +117,19 @@ function DocumentRow({
           <Link to="/docs/$documentId" params={{ documentId: doc.id }}>
             Read &amp; quiz
           </Link>
+          {/*
+            Only once there is something to look at. A "Past attempts" link on a
+            document nobody has sat yet leads to a page whose only content is
+            that it is empty.
+          */}
+          {doc.attemptCount > 0 ? (
+            <>
+              {" · "}
+              <Link to="/docs/$documentId/attempts" params={{ documentId: doc.id }}>
+                Past attempts
+              </Link>
+            </>
+          ) : null}
         </p>
       ) : null}
     </>

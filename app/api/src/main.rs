@@ -190,6 +190,14 @@ async fn dispatch(
             let quiz = docs::quiz(state, id).await?;
             Ok(http::json(origin, 200, &quiz))
         }
+        (&Method::GET, ["docs", id, "attempts"]) => {
+            let attempts = docs::attempts(state, id).await?;
+            Ok(http::json(origin, 200, &attempts))
+        }
+        (&Method::GET, ["docs", id, "attempts", attempt_id]) => {
+            let attempt = docs::attempt(state, id, attempt_id).await?;
+            Ok(http::json(origin, 200, &attempt))
+        }
         (&Method::POST, ["docs", id, "submit"]) => {
             let result = docs::submit(state, id, body_json(&req)?).await?;
             Ok(http::json(origin, 200, &result))
