@@ -1344,6 +1344,11 @@ data "aws_iam_policy_document" "ci_permissions_boundary" {
 
 resource "aws_iam_policy" "ci_permissions_boundary" {
   name        = local.boundary_name
-  description = "Maximum privilege any CI-created role may hold, whatever policy is attached to it. Every role the apply role creates must carry this."
+  # The description is FROZEN at its original, now-stale wording. `description`
+  # on aws_iam_policy forces replacement, and replacing this policy means
+  # deleting the boundary every execution role carries and every guardrail
+  # condition names, then recreating it under the same name. The comment
+  # above is where the accurate wording lives.
+  description = "Maximum privilege any future CI-created role may hold. Not yet in use — the apply role cannot create roles."
   policy      = data.aws_iam_policy_document.ci_permissions_boundary.json
 }
