@@ -442,6 +442,105 @@ pub async fn quiz(state: &AppState, doc_id: &str) -> Result<QuizResponse> {
     })
 }
 
+/// One past attempt, as the list of them shows it.
+///
+/// The stored numbers, not recomputed ones. `score` and `total` are what the
+/// attempt currently records — voiding a question rewrites them across every
+/// attempt that counted it (see `Store::revoid_attempts`), so the row is
+/// already the corrected figure and recomputing here would be a second,
+/// divergent opinion about the same fact.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttemptSummaryDto {
+    pub attempt_id: String,
+    pub submitted_at: String,
+    pub correct: usize,
+    pub total: usize,
+    pub score_bits: f64,
+    pub max_score_bits: f64,
+    pub duration_ms: u64,
+    /// How many of this attempt's answers have since been voided.
+    ///
+    /// Surfaced because it is the one thing that makes an old score not
+    /// comparable with a new one at a glance: an attempt showing 7 of 9 with
+    /// one voided answer was taken as a ten-question quiz.
+    pub voided: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttemptListResponse {
+    pub document_id: String,
+    pub document_title: String,
+    pub attempts: Vec<AttemptSummaryDto>,
+}
+
+/// `GET /docs/:id/attempts` — every sitting of this document, newest first.
+pub async fn attempts(state: &AppState, doc_id: &str) -> Result<AttemptListResponse> {
+    let doc = state.store.get_doc(doc_id).await?.ok_or(Error::NotFound)?;
+    let attempts = state.store.list_attempts_for_doc(doc_id).await?;
+
+    Ok(AttemptListResponse {
+        document_id: doc.doc_id,
+        // The document's current title, not the one copied onto the attempt.
+        // They differ only until generation replaces the provisional filename,
+        // and a list of sittings headed by a stale filename is confusing in a
+        // way the denormalized copy exists to prevent elsewhere, not to cause.
+        document_title: doc.title,
+        attempts: attempts
+            .into_iter()
+            .map(|a| AttemptSummaryDto {
+                voided: a.responses.iter().filter(|r| r.voided).count(),
+                attempt_id: a.attempt_id,
+                submitted_at: a.submitted_at,
+                correct: a.score,
+                total: a.total,
+                score_bits: a.score_bits,
+                max_score_bits: a.max_score_bits,
+                duration_ms: a.duration_ms,
+            })
+            .collect(),
+    })
+}
+
+/// `GET /docs/:id/attempts/:attemptId` — one past sitting, graded, with the key.
+///
+/// # Why this carries the answer key
+///
+/// For the same reason the submit response does, and it is worth stating rather
+/// than assuming: the attempt has already been recorded, so nothing about this
+/// document's questions is still secret *to this reader for this sitting*. What
+/// would leak a key early is the quiz payload, and that is a different type
+/// with no field to put one in — see [`trainer_core::model::PublicQuestion`].
+///
+/// Retaking the document is unaffected: `GET /docs/:id/quiz` still withholds
+/// everything, and a reader who looks up an old attempt to reread the answers
+/// is doing the thing this app is for.
+pub async fn attempt(state: &AppState, doc_id: &str, attempt_id: &str) -> Result<SubmitResponse> {
+    let doc = state.store.get_doc(doc_id).await?.ok_or(Error::NotFound)?;
+
+    let attempt = state
+        .store
+        .list_attempts_for_doc(doc_id)
+        .await?
+        .into_iter()
+        .find(|a| a.attempt_id == attempt_id)
+        .ok_or(Error::NotFound)?;
+
+    Ok(SubmitResponse {
+        attempt_id: attempt.attempt_id.clone(),
+        document_id: doc.doc_id.clone(),
+        submitted_at: attempt.submitted_at.clone(),
+        correct: attempt.score,
+        total: attempt.total,
+        score_bits: attempt.score_bits,
+        max_score_bits: attempt.max_score_bits,
+        // `Show`: a voided question is frequently the reason someone opened an
+        // old attempt at all.
+        questions: grade_all(&doc.questions, &doc.topics, &attempt, Withdrawn::Show),
+    })
+}
+
 /// `POST /docs/:id/void` — withdraw a question, or restore one.
 ///
 /// Reachable from the results screen, because that is the first moment the
@@ -624,8 +723,30 @@ pub struct GradedQuestionDto {
     pub confidence_percent: Option<u8>,
     pub score_bits: f64,
     pub explanation: String,
+    /// Whether this question has since been withdrawn.
+    ///
+    /// Always false in a submission's own results — a voided question is never
+    /// offered, so it cannot be in one. It exists for the historical view,
+    /// where the answer is sometimes yes and the reader needs to see which
+    /// question the void applies to in order to judge, or reverse, it.
+    pub voided: bool,
+    /// When it was withdrawn, and why, when a reason was given.
+    ///
+    /// The reason is recorded so that "a run of thin excuses is visible as one"
+    /// — and until this field existed there was no screen that ever showed one
+    /// back, which made the note write-only and the claim untestable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voided_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub void_reason: Option<String>,
 }
 
+/// A graded attempt, whether just submitted or read back later.
+///
+/// One type for both because they are the same thing seen at two moments, and
+/// the client parses one schema for them. The name is historical: `POST
+/// /docs/:id/submit` was the only thing that produced this shape before
+/// `GET /docs/:id/attempts/:attemptId` existed.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SubmitResponse {
@@ -890,7 +1011,7 @@ pub async fn submit(state: &AppState, doc_id: &str, req: SubmitRequest) -> Resul
         total: stored.total,
         score_bits: stored.score_bits,
         max_score_bits: stored.max_score_bits,
-        questions: grade_all(&doc.questions, &doc.topics, &stored),
+        questions: grade_all(&doc.questions, &doc.topics, &stored, Withdrawn::Hide),
     })
 }
 
@@ -977,10 +1098,25 @@ async fn schedule_reviews(state: &AppState, doc: &DocMeta, attempt: &Attempt) {
 /// So a replayed duplicate reports what was recorded rather than what was just
 /// sent — those are the same thing on the happy path, and the difference is
 /// exactly what makes the replay correct when they are not.
+/// Whether a withdrawn question appears in a graded view.
+///
+/// Two callers want opposite things and both are right. A fresh submission
+/// never offered its voided questions, so listing them beside answers the
+/// reader actually gave would be revealing a key for something never asked.
+/// The historical view is the exact opposite: a voided question is often the
+/// one somebody came to look at, and hiding it would make a void impossible to
+/// review or reverse from the only screen that shows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Withdrawn {
+    Hide,
+    Show,
+}
+
 fn grade_all(
     questions: &[Question],
     topics: &[Topic],
     attempt: &Attempt,
+    withdrawn: Withdrawn,
 ) -> Vec<GradedQuestionDto> {
     let recorded: HashMap<&str, &AttemptResponse> = attempt
         .responses
@@ -990,7 +1126,7 @@ fn grade_all(
 
     questions
         .iter()
-        .filter(|q| !q.is_void())
+        .filter(|q| withdrawn == Withdrawn::Show || !q.is_void())
         .map(|q| {
             let response = recorded.get(q.id.as_str());
             // This is the one response type that may carry the key, so it reads
@@ -1017,6 +1153,9 @@ fn grade_all(
                 confidence_percent: response.and_then(|r| r.confidence_percent),
                 score_bits: response.map_or(0.0, |r| r.score_bits),
                 explanation: q.explanation.clone(),
+                voided: q.is_void(),
+                voided_at: q.void.as_ref().map(|v| v.at.clone()),
+                void_reason: q.void.as_ref().and_then(|v| v.reason.clone()),
             }
         })
         .collect()
@@ -1083,6 +1222,47 @@ mod tests {
     /// The regression test for the one bug that would quietly make the app
     /// pointless. It asserts on the *serialized bytes*, not on the struct,
     /// because the failure mode is a field appearing on the wire.
+    #[test]
+    fn a_withdrawn_question_is_hidden_when_grading_and_shown_when_reviewing() {
+        let mut voided = sample_question();
+        voided.id = "q9".into();
+        voided.void = Some(trainer_core::model::Void {
+            at: "2026-09-01T00:00:00.000Z".into(),
+            reason: Some("two defensible options".into()),
+        });
+
+        let questions = vec![sample_question(), voided];
+        let attempt = Attempt {
+            pk: "DOC#d".into(),
+            sk: "ATTEMPT#2026-09-01T00:00:00.000Z".into(),
+            attempt_id: "a".into(),
+            doc_id: "d".into(),
+            doc_title: "t".into(),
+            submitted_at: "2026-09-01T00:00:00.000Z".into(),
+            responses: Vec::new(),
+            topics: Vec::new(),
+            tag_version: TAG_VERSION,
+            duration_ms: 0,
+            score: 0,
+            total: 1,
+            score_bits: 0.0,
+            max_score_bits: 0.0,
+        };
+
+        // A submission never offered the voided question, so its results must
+        // not reveal a key for something that was never asked.
+        let graded = grade_all(&questions, &[], &attempt, Withdrawn::Hide);
+        assert_eq!(graded.len(), 1);
+        assert_eq!(graded[0].question_id, "q3");
+
+        // The historical view is where a void is judged and reversed, so it has
+        // to be visible there — and flagged, or it reads as an ordinary miss.
+        let reviewed = grade_all(&questions, &[], &attempt, Withdrawn::Show);
+        assert_eq!(reviewed.len(), 2);
+        assert!(!reviewed[0].voided);
+        assert!(reviewed[1].voided, "the withdrawn question is not flagged");
+    }
+
     #[test]
     fn quiz_payload_cannot_contain_the_answer_key() {
         let q = sample_question();

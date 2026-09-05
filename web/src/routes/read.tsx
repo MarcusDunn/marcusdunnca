@@ -4,25 +4,20 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useParams } from "@tanstack/react-router";
 import { Busy, BusyMark, ErrorNotice } from "../components/ui";
 import { api } from "../lib/api";
-import { formatFigure, formatTolerance, parseFigure } from "../lib/figures";
+import { formatTolerance, parseFigure } from "../lib/figures";
 import { documentUrlQuery, queryKeys, quizQuery } from "../lib/queries";
 import { ConfidenceSlider, signed } from "../components/confidence";
-import { VoidQuestion } from "../components/void-question";
+import { OPTION_LETTERS, Results } from "../components/results";
 import {
   CHANCE_FLOOR_PERCENT,
-  CONFIDENCE_LABELS,
   MAX_PERCENT,
   scoreBits,
   SKILL_LABELS,
   topicLabel,
-  type AttemptResult,
   type QuestionFormat,
-  type GradedQuestion,
   type Quiz,
   type QuizQuestion,
 } from "../lib/schemas";
-
-const OPTION_LETTERS = ["A", "B", "C", "D"] as const;
 
 /**
  * One question's state: what was answered, and how sure of it.
@@ -439,98 +434,3 @@ function QuestionCard({
   );
 }
 
-function Results({ result }: { result: AttemptResult }) {
-  const confidentErrors = result.questions.filter(
-    (q) => q.confidence === "certain" && !q.correct,
-  );
-
-  return (
-    <>
-      <h3 role="status">
-        {result.correct} of {result.total} correct · {signed(result.scoreBits)} of{" "}
-        {result.maxScoreBits.toFixed(2)} bits
-      </h3>
-      <p>
-        Two numbers because they answer two questions. The first is how much you
-        knew; the second is how well you knew what you knew — it drops when you
-        were sure and wrong, and it barely moves when you admit a guess.
-      </p>
-      <p>
-        One attempt is a fact, not a rate — the <Link to="/history">history view</Link>{" "}
-        is where the rates live, and it won&apos;t quote one until there are enough
-        observations behind it.
-      </p>
-
-      {confidentErrors.length > 0 ? (
-        <>
-          <h4>Sure, and wrong</h4>
-          <p>
-            {confidentErrors.length === 1
-              ? "One answer you"
-              : `${confidentErrors.length} answers you`}{" "}
-            would have stated on the record. These are the ones worth rereading
-            — and, as it happens, the ones that stick once corrected.
-          </p>
-          <ul>
-            {confidentErrors.map((graded) => (
-              <li key={graded.questionId}>{graded.prompt}</li>
-            ))}
-          </ul>
-        </>
-      ) : null}
-
-      <ol>
-        {result.questions.map((graded) => (
-          <li key={graded.questionId}>
-            <h4>{graded.prompt}</h4>
-            <p>
-              {graded.correct ? "Correct" : "Incorrect"}
-              {graded.confidencePercent === null
-                ? graded.confidence
-                  ? ` after saying ${CONFIDENCE_LABELS[graded.confidence].toLowerCase()}`
-                  : ""
-                : ` after saying ${graded.confidencePercent}%`}{" "}
-              ({signed(graded.scoreBits)} bits) — {SKILL_LABELS[graded.skill]} ·{" "}
-              {graded.topics.map(topicLabel).join(", ")}
-            </p>
-            {graded.format === "multiple_choice" ? (
-              <ul>
-                {graded.options.map((option, optionIndex) => {
-                  const isAnswer = option.id === graded.correctOptionId;
-                  const isChosen = option.id === graded.selectedOptionId;
-                  return (
-                    <li key={option.id}>
-                      {OPTION_LETTERS[optionIndex] ?? "?"}. {option.text}
-                      {isAnswer ? " — correct answer" : ""}
-                      {isChosen && !isAnswer ? " — you picked this" : ""}
-                    </li>
-                  );
-                })}
-              </ul>
-            ) : (
-              <NumericVerdict graded={graded} />
-            )}
-            {graded.explanation ? <p>{graded.explanation}</p> : null}
-            <VoidQuestion documentId={result.documentId} questionId={graded.questionId} />
-          </li>
-        ))}
-      </ol>
-    </>
-  );
-}
-
-function NumericVerdict({ graded }: { graded: GradedQuestion }) {
-  const unit = graded.unit ? ` ${graded.unit}` : "";
-  return (
-    <p>
-      You said {graded.selectedValue === null ? "nothing" : graded.selectedValue}
-      {unit}. The document says{" "}
-      {graded.correctValue === null ? "—" : formatFigure(graded.correctValue)}
-      {unit}
-      {graded.tolerance === null
-        ? ""
-        : `, and anything within ${formatTolerance(graded.tolerance, graded.unit ?? "")} counted`}
-      .
-    </p>
-  );
-}

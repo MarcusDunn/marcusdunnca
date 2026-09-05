@@ -2,6 +2,7 @@ import type { z } from "zod";
 import { clearSession, getToken } from "./auth";
 import {
   ApiErrorBody,
+  AttemptList,
   AttemptResult,
   AuthChallenge,
   AuthSession,
@@ -175,6 +176,15 @@ export const api = {
     request(`/docs/${encodeURIComponent(id)}/url`, DocumentUrl),
 
   quiz: (id: string) => request(`/docs/${encodeURIComponent(id)}/quiz`, Quiz),
+
+  documentAttempts: (id: string) =>
+    request(`/docs/${encodeURIComponent(id)}/attempts`, AttemptList),
+
+  documentAttempt: (id: string, attemptId: string) =>
+    request(
+      `/docs/${encodeURIComponent(id)}/attempts/${encodeURIComponent(attemptId)}`,
+      AttemptResult,
+    ),
 
   submitQuiz: (id: string, body: SubmitQuizRequest) =>
     request(`/docs/${encodeURIComponent(id)}/submit`, AttemptResult, {
