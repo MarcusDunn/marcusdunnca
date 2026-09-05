@@ -38,7 +38,7 @@ export function DocumentsScreen() {
     <section>
       <h1>Documents</h1>
       <p>
-        <Link to="/upload">Upload a PDF</Link>
+        <Link to="/upload">Upload PDFs</Link>
       </p>
 
       {polling ? (
@@ -51,7 +51,7 @@ export function DocumentsScreen() {
       {retry.isError ? <ErrorNotice error={retry.error} /> : null}
 
       {rows.length === 0 ? (
-        <p>Nothing here yet. Upload a PDF to get started.</p>
+        <p>Nothing here yet. Upload a PDF or two to get started.</p>
       ) : (
         <ul>
           {rows.map((doc) => (

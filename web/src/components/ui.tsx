@@ -19,6 +19,20 @@ export function BusyMark({ label }: { label: string }) {
 }
 
 /**
+ * The one sentence to show for a thrown value.
+ *
+ * Exported because errors are reported in two shapes: `ErrorNotice` below, and
+ * a bare line of text where a whole section would be too much — one row of a
+ * multi-file upload, say. Both must say the same thing about the same error, so
+ * neither reaches for `.message` itself.
+ */
+export function describeError(error: unknown): string {
+  return error instanceof ApiError || error instanceof Error
+    ? error.message
+    : "Something went wrong.";
+}
+
+/**
  * A schema mismatch is not transient, so it says so plainly instead of offering a
  * retry that will fail identically. Everything else gets a retry button.
  */
@@ -30,10 +44,7 @@ export function ErrorNotice({
   onRetry?: (() => void) | undefined;
 }) {
   const isSchema = error instanceof SchemaError;
-  const message =
-    error instanceof ApiError || error instanceof Error
-      ? error.message
-      : "Something went wrong.";
+  const message = describeError(error);
 
   return (
     <section role="alert">
