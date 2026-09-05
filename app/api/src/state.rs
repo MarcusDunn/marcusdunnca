@@ -106,16 +106,30 @@ impl AppState {
         let sdk = aws_config::load_from_env().await;
 
         let table = config::require("TABLE_NAME")?;
+        let auth_table = config::require("AUTH_TABLE_NAME")?;
         let docs_bucket = config::require("DOCS_BUCKET")?;
         let origin = config::require("APP_ORIGIN")?;
         let rp_id = config::require("WEBAUTHN_RP_ID")?;
         let jwt_param = config::require("JWT_SIGNING_KEY_PARAM")?;
         let max_upload_bytes = config::parse_or("MAX_UPLOAD_BYTES", DEFAULT_MAX_UPLOAD_BYTES)?;
 
-        let store = Store::new(aws_sdk_dynamodb::Client::new(&sdk), table);
+        // Ceremony state goes in its own table. See `Store::with_auth_table`
+        // for why the routes that need no session must not write where the
+        // routes that do go on to scan.
+        let store =
+            Store::new(aws_sdk_dynamodb::Client::new(&sdk), table).with_auth_table(auth_table);
         let s3 = aws_sdk_s3::Client::new(&sdk);
+        let ssm = aws_sdk_ssm::Client::new(&sdk);
 
-        let secret = fetch_signing_key(&aws_sdk_ssm::Client::new(&sdk), &jwt_param).await?;
+        let secret = fetch_secret(&ssm, &jwt_param).await?;
+        // A short key makes HMAC-SHA256 weak in a way nothing else here would
+        // catch. The documented provisioning command uses `openssl rand -base64 48`,
+        // which is 64 characters.
+        if secret.len() < MIN_SIGNING_KEY_LEN {
+            return Err(Error::Config(format!(
+                "{jwt_param} is too short to be a signing key"
+            )));
+        }
         let jwt_key = JwtKeys {
             encoding: jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
             decoding: jsonwebtoken::DecodingKey::from_secret(secret.as_bytes()),
@@ -142,7 +156,7 @@ impl AppState {
             .build()
             .map_err(|e| Error::Config(format!("webauthn configuration: {e}")))?;
 
-        let access = load_access()?;
+        let access = load_access(&ssm).await?;
 
         Ok(Self {
             store,
@@ -184,16 +198,21 @@ impl AppState {
     }
 }
 
-/// Read the JWT signing key from SSM Parameter Store.
+/// Shortest signing key this will accept. See the check in [`AppState::load`].
+const MIN_SIGNING_KEY_LEN: usize = 32;
+
+/// Read a `SecureString` from SSM Parameter Store.
 ///
-/// `with_decryption` is required — the parameter is a `SecureString`, and
-/// without the flag SSM returns the ciphertext rather than failing, which would
-/// produce a function that signs tokens with a base64 blob and verifies them
-/// consistently. It would *work*, and the key would be public.
+/// `with_decryption` is required — without the flag SSM returns the ciphertext
+/// rather than failing, which for the signing key would produce a function that
+/// signs tokens with a base64 blob and verifies them consistently. It would
+/// *work*, and the key would be public.
 ///
 /// The value never appears in a log line, an error, or a `Debug` impl. That is
-/// why the error below reports only the parameter name.
-async fn fetch_signing_key(ssm: &aws_sdk_ssm::Client, name: &str) -> Result<String> {
+/// why the error below reports only the parameter name. Both secrets this
+/// function reads grant everything — one mints sessions, the other enrols the
+/// passkey that mints them — so there is no "safe to show" tier.
+async fn fetch_secret(ssm: &aws_sdk_ssm::Client, name: &str) -> Result<String> {
     let out = ssm
         .get_parameter()
         .name(name)
@@ -202,28 +221,16 @@ async fn fetch_signing_key(ssm: &aws_sdk_ssm::Client, name: &str) -> Result<Stri
         .await
         .map_err(aws)?;
 
-    let value = out
-        .parameter
+    out.parameter
         .and_then(|p| p.value)
-        .ok_or_else(|| Error::Config(format!("{name} has no value")))?;
-
-    // A short key makes HMAC-SHA256 weak in a way nothing else here would
-    // catch. The documented provisioning command uses `openssl rand -base64 48`,
-    // which is 64 characters.
-    if value.len() < 32 {
-        return Err(Error::Config(format!(
-            "{name} is too short to be a signing key"
-        )));
-    }
-
-    Ok(value)
+        .ok_or_else(|| Error::Config(format!("{name} has no value")))
 }
 
-/// Shortest `REGISTRATION_TOKEN` this will accept.
+/// Shortest registration token this will accept.
 ///
-/// The registration routes sit on an unauthenticated Function URL with no rate
-/// limit in front of them, so the token is the only thing between an
-/// unenrolled deployment and whoever guesses it. Thirty-two characters is what
+/// The registration routes need no session, and the gateway throttles them to
+/// one request a second, so the token is the only thing between an unenrolled
+/// deployment and whoever guesses it. Thirty-two characters is what
 /// `openssl rand -base64 24` produces, and refusing anything shorter at cold
 /// start is the only moment this code gets to have an opinion — after that the
 /// value is just a string being compared.
@@ -239,11 +246,20 @@ const MIN_REGISTRATION_TOKEN_LEN: usize = 32;
 /// into configuration.
 ///
 /// The exception is the bootstrap, and it is narrow: a *non-empty* list is
-/// checked first and wins unconditionally, so `REGISTRATION_TOKEN` is dead
-/// configuration the instant a credential exists. Leaving the token set after
-/// enrolment is untidy, not dangerous. The reverse — clearing
-/// `WEBAUTHN_CREDENTIALS` — reopens enrolment, which is the correct behaviour
-/// for a deployment that can no longer authenticate anyone but is worth knowing.
+/// checked first and wins unconditionally, so the registration token is dead
+/// configuration the instant a credential exists — it is not even fetched.
+/// The reverse — clearing `WEBAUTHN_CREDENTIALS` — reopens enrolment, which is
+/// the correct behaviour for a deployment that can no longer authenticate
+/// anyone but is worth knowing.
+///
+/// The token is an SSM `SecureString` named by `REGISTRATION_TOKEN_PARAM`,
+/// read here rather than taken from an environment variable. An environment
+/// variable is Lambda configuration and Terraform state, both of which the
+/// plan role can read from any pull request, and state keeps its version
+/// history for ninety days. A parameter under `/secret/` is readable by this
+/// function's role and by nothing CI holds. It is resolved only on this
+/// branch, so a deployment holding credentials never needs the parameter, or
+/// the variable naming it, to exist.
 ///
 /// A *malformed* list is an error in both modes. Falling through to registration
 /// mode on a parse failure would turn a typo in configuration into an open
@@ -259,50 +275,69 @@ const MIN_REGISTRATION_TOKEN_LEN: usize = 32;
 /// this app is used with, and it protects against cloning of *hardware* keys
 /// that synced passkeys are not.
 ///
-/// An empty list with no registration token is still refused. A deployment with
-/// no credentials cannot authenticate anyone, and failing at cold start says so,
-/// whereas starting successfully produces a login page that rejects every
-/// attempt for reasons that look like a passkey problem.
-fn load_access() -> Result<Access> {
+/// An empty list with no readable registration token is still refused. A
+/// deployment with no credentials cannot authenticate anyone, and failing at
+/// cold start says so, whereas starting successfully produces a login page that
+/// rejects every attempt for reasons that look like a passkey problem.
+async fn load_access(ssm: &aws_sdk_ssm::Client) -> Result<Access> {
     // Not `config::require`: absent and `"[]"` are the same state — no
     // credentials — and Terraform's default for this variable is `"[]"`, so
     // both spellings reach here on a first deploy.
     let raw = std::env::var("WEBAUTHN_CREDENTIALS").unwrap_or_default();
-
-    let credentials: Vec<Passkey> = if raw.trim().is_empty() {
-        Vec::new()
-    } else {
-        serde_json::from_str(&raw).map_err(|e| {
-            // The error deliberately does not echo `raw`. Credentials are
-            // public, but echoing configuration into logs is a habit that
-            // eventually echoes something that is not.
-            Error::Config(format!(
-                "WEBAUTHN_CREDENTIALS is not a JSON array of webauthn-rs Passkeys: {e}"
-            ))
-        })?
-    };
+    let credentials = parse_credentials(&raw)?;
 
     if !credentials.is_empty() {
         return Ok(Access::Live { credentials });
     }
 
-    let token = std::env::var("REGISTRATION_TOKEN").unwrap_or_default();
-    let token = token.trim();
+    // Only now. Everything about registration mode is resolved lazily so that
+    // a deployment holding credentials depends on none of it.
+    let param = config::require("REGISTRATION_TOKEN_PARAM").map_err(|e| {
+        Error::Config(format!(
+            "WEBAUTHN_CREDENTIALS is empty; no one could log in, and registration mode \
+             is unavailable because {e}"
+        ))
+    })?;
 
-    if token.is_empty() {
-        return Err(Error::Config(
-            "WEBAUTHN_CREDENTIALS is empty; no one could log in \
-             (set REGISTRATION_TOKEN to start in registration mode instead)"
-                .into(),
-        ));
+    let token = fetch_secret(ssm, &param).await.map_err(|e| {
+        // Names the parameter, never its value. Put the parameter to start in
+        // registration mode; the message says which one.
+        Error::Config(format!(
+            "WEBAUTHN_CREDENTIALS is empty; no one could log in, and the registration \
+             token could not be read: {e}"
+        ))
+    })?;
+
+    registration_access(&token)
+}
+
+/// Parse `WEBAUTHN_CREDENTIALS`. Absent, empty and `[]` are all "none".
+fn parse_credentials(raw: &str) -> Result<Vec<Passkey>> {
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
     }
 
-    // Length only. The value is never logged, never returned and never included
-    // in an error, for the same reason the JWT secret is not: this one grants
-    // enrolment, which grants everything.
+    serde_json::from_str(raw).map_err(|e| {
+        // The error deliberately does not echo `raw`. Credentials are public,
+        // but echoing configuration into logs is a habit that eventually echoes
+        // something that is not.
+        Error::Config(format!(
+            "WEBAUTHN_CREDENTIALS is not a JSON array of webauthn-rs Passkeys: {e}"
+        ))
+    })
+}
+
+/// Registration mode, from the token as read.
+///
+/// Length only. The value is never logged, never returned and never included
+/// in an error, for the same reason the JWT secret is not: this one grants
+/// enrolment, which grants everything.
+fn registration_access(token: &str) -> Result<Access> {
+    let token = token.trim();
+
     if token.len() < MIN_REGISTRATION_TOKEN_LEN {
         return Err(Error::Config(format!(
-            "REGISTRATION_TOKEN is shorter than {MIN_REGISTRATION_TOKEN_LEN} characters"
+            "the registration token is shorter than {MIN_REGISTRATION_TOKEN_LEN} characters"
         )));
     }
 
@@ -314,4 +349,62 @@ fn load_access() -> Result<Access> {
     Ok(Access::Registration {
         token: token.to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One real, public credential record — the shape `register::finish` hands
+    /// back and `infra/credentials.auto.tfvars` commits. A public key and a
+    /// credential id cannot forge an assertion, which is why it can live here.
+    const ONE_CREDENTIAL: &str = r#"[{"cred":{"cred_id":"3_n2sKu6yizY440mVTQ3Zw","cred":{"type_":"ES256","key":{"EC_EC2":{"curve":"SECP256R1","x":"aQtimriv0Re14d4vq_2hkS6hIVCzTeNzGorRw2DzWc0","y":"g-cKQpqKr0XHUtN7PXJsvbXGZEbBJy0AKnS1FcnQIeo"}}},"counter":0,"transports":null,"user_verified":true,"backup_eligible":true,"backup_state":true,"registration_policy":"required","extensions":{"cred_protect":"Ignored","hmac_create_secret":"NotRequested","appid":"NotRequested","cred_props":{"Unsigned":{"rk":true}}},"attestation":{"data":"None","metadata":"None"},"attestation_format":"none"}}]"#;
+
+    #[test]
+    fn absent_empty_and_empty_list_are_all_no_credentials() {
+        for raw in ["", "   ", "[]", " [] "] {
+            assert!(
+                parse_credentials(raw).expect("parses").is_empty(),
+                "{raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_real_credential_record_parses() {
+        assert_eq!(parse_credentials(ONE_CREDENTIAL).expect("parses").len(), 1);
+    }
+
+    /// A typo in configuration must not fall through to registration mode on a
+    /// deployment that was enrolled a moment ago.
+    #[test]
+    fn a_malformed_list_is_an_error_not_an_open_enrolment_window() {
+        for raw in ["{", "[{}]", "null", "\"[]\""] {
+            assert!(
+                matches!(parse_credentials(raw), Err(Error::Config(_))),
+                "{raw:?} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn a_short_token_is_refused_and_a_long_one_is_kept_trimmed() {
+        assert!(matches!(
+            registration_access("0123456789abcdef0123456789abcde"),
+            Err(Error::Config(_))
+        ));
+        // Padding does not count toward the length.
+        assert!(matches!(
+            registration_access("   0123456789abcdef0123456789abcde   "),
+            Err(Error::Config(_))
+        ));
+
+        let access = registration_access("  0123456789abcdef0123456789abcdef\n").expect("accepted");
+        match access {
+            Access::Registration { token } => {
+                assert_eq!(token, "0123456789abcdef0123456789abcdef");
+            }
+            Access::Live { .. } => panic!("no credentials cannot be live"),
+        }
+    }
 }

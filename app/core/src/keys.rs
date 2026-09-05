@@ -65,6 +65,10 @@ pub fn review_sk_prefix(doc_id: &str) -> String {
 /// All auth challenges share one partition. That is fine — they live 60
 /// seconds and there is one user, so this is not a hot partition, and putting
 /// them together means TTL sweeps touch one place.
+///
+/// The partition lives in the ceremony table, not the application table, so
+/// that anonymous callers cannot write where the authenticated routes scan.
+/// See `Store::with_auth_table`.
 pub const AUTH_PK: &str = "AUTH";
 
 /// The challenge itself is the sort key. Making the challenge the key is what

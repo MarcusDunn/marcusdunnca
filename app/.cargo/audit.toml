@@ -1,0 +1,14 @@
+# Read by `cargo audit` when run from app/ (the audit workflow does). Every
+# entry carries a date and a reason: an ignore without either is how an
+# advisory gets ignored forever.
+
+[advisories]
+ignore = [
+  # 2026-09. rsa 0.9 — Marvin, a timing side-channel on RSA private-key
+  # operations. Pulled in by jsonwebtoken's rust_crypto feature for
+  # RSA-signed tokens. This api signs and verifies HS256 only and never
+  # constructs an RSA key, so the affected code does not execute. No fixed
+  # release exists upstream. Revisit if jsonwebtoken gains a feature flag that
+  # drops the dependency.
+  "RUSTSEC-2023-0071",
+]

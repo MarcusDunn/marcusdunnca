@@ -9,10 +9,10 @@ publish.workspace = true
 [dependencies]
 trainer-core = { version = "0.1.0", path = "../core" }
 
-aws-config = { version = "1.11.0", features = ["behavior-version-latest"] }
-aws-sdk-dynamodb = "1.123.0"
-aws-sdk-s3 = "1.144.0"
-aws-sdk-ssm = "1.121.0"
+aws-config = { version = "1.11.0", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client"] }
+aws-sdk-dynamodb = { version = "1.123.0", default-features = false, features = ["rt-tokio", "default-https-client"] }
+aws-sdk-s3 = { version = "1.144.0", default-features = false, features = ["rt-tokio", "default-https-client", "http-1x"] }
+aws-sdk-ssm = { version = "1.121.0", default-features = false, features = ["rt-tokio", "default-https-client"] }
 base64 = "0.23.1"
 # jsonwebtoken 11 requires a CryptoProvider and ships none by default: exactly
 # one of `rust_crypto` or `aws_lc_rs` must be enabled. With neither, it compiles
