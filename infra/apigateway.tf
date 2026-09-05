@@ -134,6 +134,17 @@ resource "aws_apigatewayv2_stage" "default" {
       integError = "$context.integrationErrorMessage"
     })
   }
+
+  # Route settings name routes by key, and API Gateway refuses a stage update
+  # that names a route which does not exist yet. Nothing above references the
+  # route resources, so without this OpenTofu updated the stage in parallel
+  # with creating them and lost the race on the first apply:
+  #   NotFoundException: Unable to find Route by key POST /auth/challenge
+  #   within the provided RouteSettings
+  depends_on = [
+    aws_apigatewayv2_route.auth_challenge,
+    aws_apigatewayv2_route.auth_verify,
+  ]
 }
 
 resource "aws_lambda_permission" "api_from_apigateway" {
