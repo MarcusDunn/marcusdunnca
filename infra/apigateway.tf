@@ -26,7 +26,7 @@
 resource "aws_apigatewayv2_api" "api" {
   name          = "${var.project}-api"
   protocol_type = "HTTP"
-  description   = "Reading trainer api. Reached only through CloudFront at /api/*."
+  description   = "Reading trainer api. Fronted by CloudFront at /api/*; the execute-api endpoint is also reachable directly and throttled the same."
 
   # No CORS block. The SPA is served from the same origin as this API by the
   # distribution, so no preflight is ever issued. Configuring CORS in a second
@@ -58,6 +58,26 @@ resource "aws_apigatewayv2_route" "proxy" {
   target    = "integrations/${aws_apigatewayv2_integration.api.id}"
 }
 
+# The exception to "routing lives in the handler". A stage can only throttle a
+# route it can name, and the two unauthenticated routes need a limit of their
+# own — see the route_settings on the stage. Both point at the same
+# integration, so nothing about how the request reaches the handler changes.
+#
+# Route keys are exact. `POST /auth/challenge/` would fall through to $default
+# and its general limit, which is why the handler refuses a trailing slash on
+# the auth paths specifically (`route_path` in app/api/src/main.rs).
+resource "aws_apigatewayv2_route" "auth_challenge" {
+  api_id    = aws_apigatewayv2_api.api.id
+  route_key = "POST /auth/challenge"
+  target    = "integrations/${aws_apigatewayv2_integration.api.id}"
+}
+
+resource "aws_apigatewayv2_route" "auth_verify" {
+  api_id    = aws_apigatewayv2_api.api.id
+  route_key = "POST /auth/verify"
+  target    = "integrations/${aws_apigatewayv2_integration.api.id}"
+}
+
 resource "aws_cloudwatch_log_group" "apigateway" {
   name              = "/aws/apigateway/${var.project}-api"
   retention_in_days = 14
@@ -80,6 +100,24 @@ resource "aws_apigatewayv2_stage" "default" {
   default_route_settings {
     throttling_rate_limit  = 10
     throttling_burst_limit = 20
+  }
+
+  # The unauthenticated pair, on their own budget. Every call to either is a
+  # write against the ceremony table (a put, or the DeleteItem that consumes
+  # one), so their ceiling is set by what that table absorbs, not by what the
+  # reader needs — and the reader needs one of each per login. One a second
+  # with a burst of three is invisible to a human and holds the table at its
+  # provisioned 5 WCU under sustained abuse.
+  route_settings {
+    route_key              = "POST /auth/challenge"
+    throttling_rate_limit  = 1
+    throttling_burst_limit = 3
+  }
+
+  route_settings {
+    route_key              = "POST /auth/verify"
+    throttling_rate_limit  = 1
+    throttling_burst_limit = 3
   }
 
   access_log_settings {

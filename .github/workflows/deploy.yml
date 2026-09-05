@@ -58,8 +58,14 @@ jobs:
       # and the actions allowlist is four named repositories, so third-party
       # setup actions are not available. The runners ship Node and rustup
       # already, which is enough.
+      # `corepack enable` and nothing else. The pnpm version — hash included —
+      # is the `packageManager` field in web/package.json, and Corepack verifies
+      # the download against it before running anything. `pnpm@latest` here was
+      # the one unpinned thing executing in a job that holds the apply role.
       - name: Enable pnpm
-        run: corepack enable && corepack prepare pnpm@latest --activate
+        env:
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+        run: corepack enable
 
       # musl, statically linked, rather than the native gnu target. The runner
       # has glibc 2.39 and provided.al2023 has 2.34 — a dynamically linked

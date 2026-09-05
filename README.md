@@ -16,8 +16,12 @@ The goal is not that nothing happens. It is that the blast radius is small,
 bounded, and fully recorded. Concretely, an attacker who owns this pipeline
 still cannot:
 
-- escalate privileges — the apply role holds **no IAM role or policy write
-  permission at all**, so there is no first step
+- escalate privileges — the apply role's IAM writes are confined to roles and
+  policies named `marcusdunnca-*`, every role it creates must carry the
+  permissions boundary, and it may pass a role to Lambda only if that role is
+  named `marcusdunnca-*-execution`. Its own identities, the policies that
+  bind it, the spend brake and Identity Center's roles are all out of reach
+  by name, so there is no first step
 - mint anything that outlives the job — no IAM users, access keys, or console
   logins
 - run up a bill — every region but `ca-central-1`/`us-east-1` is denied, and
@@ -35,8 +39,14 @@ still cannot:
   here as code, and CI is denied the ability to modify or delete either
 - weaken the account's defences — the security floor is human-applied and CI is
   denied permission to touch it
-- read application data — the plan role's object reads are confined to the state
-  bucket
+- read application data unrecorded — the plan role's object reads are confined
+  to the state bucket, and every object read in the documents bucket is a
+  CloudTrail data event. The apply role deploys the application, so it can
+  read what the application reads; that is the accepted cost of "merge means
+  deploy", and it leaves a record
+- destroy application data — the table, its point-in-time backups and the
+  documents bucket's object versions are denied to both CI roles, the same
+  way state and the audit trail are
 
 ## Layout
 
@@ -93,14 +103,28 @@ services *even if a policy granting `Action: "*"` is attached to it*. Verified:
 under the boundary, `dynamodb:PutItem`, `ses:SendEmail` and `kms:Decrypt` are
 denied while `lambda:InvokeFunction` and `sqs:SendMessage` are allowed.
 
-Two conditioned denies make this safe:
+Three denies make this safe, and the names matter as much as the denies:
 
 - `DenyRoleWorkWithoutBoundary` — `iam:CreateRole` without the boundary is
-  refused. A missing `iam:PermissionsBoundary` key makes `StringNotEquals` true,
-  so no-boundary fails closed.
+  refused, as is attaching or detaching a policy on any role that lacks it. A
+  missing `iam:PermissionsBoundary` key makes `StringNotEquals` true, so
+  no-boundary fails closed.
 - `DenyPassRoleExceptToAppServices` — `iam:PassRole` is confined to
   `lambda.amazonaws.com` and `edgelambda.amazonaws.com`. Unconstrained PassRole
   is an escalation primitive; constrained it is ordinary wiring.
+- `DenyRoleTakeoverOutsideApplicationRoles` and
+  `DenyPassRoleOutsideExecutionRoles`, in a second guardrail policy — the
+  apply role may rewrite a trust policy only on `marcusdunnca-*` roles and pass
+  only `marcusdunnca-*-execution` roles. The first two denies say nothing about
+  a role that already exists without a boundary: re-trust one to
+  `lambda.amazonaws.com`, pass it to a function, and the function runs with no
+  boundary and no guardrail. Scoping by name is what closes that, which is why
+  `ManageApplicationRoles` is granted on those name patterns rather than `*`.
+
+**Naming is therefore load-bearing.** A boundary-less role a human creates
+under the `marcusdunnca-` prefix — the budgets executor is one — must be listed
+in `ci_control_plane_arns`, and every execution role `infra/` creates must end
+in `-execution`.
 
 Widening `app_service_actions` widens every application role at once, so it
 deserves the same scrutiny as widening the apply role itself. Its read-only
@@ -129,12 +153,20 @@ SSM Parameter Store, split into two namespaces that differ in who can read them:
 
 Secrets are created with `aws ssm put-parameter` and are **never referenced by
 value in Terraform** — only by name, in a Lambda environment variable and an IAM
-policy resource ARN. Neither CI role can read them:
+policy resource ARN. The plan role cannot read them at all. The apply role
+cannot read them directly either; it can deploy code that does, which is the
+accepted cost of merge-means-deploy and is recorded:
 
 ```bash
 aws ssm put-parameter --name /marcusdunnca/secret/jwt-signing-key \
   --type SecureString --value "$(openssl rand -base64 48)" --overwrite
 ```
+
+The passkey enrolment token is the second parameter under `/secret/`,
+`/marcusdunnca/secret/registration-token`, created the same way for the
+minutes a ceremony takes and deleted afterwards — see the ceremony notes in
+`infra/lambda.tf`. It used to be a Terraform variable, which put it in the
+function's environment and in state history, both readable from any PR.
 
 This is not squeamishness about state. The plan role is reachable from **any
 pull request** on a public repository, and it can read state objects — so any
@@ -301,9 +333,26 @@ hashes in `.terraform.lock.hcl`, nixpkgs in `flake.lock`.
 
 | What | How | Merge |
 | --- | --- | --- |
-| GitHub Actions SHAs | Dependabot, 14-day cooldown | auto-merged if non-major |
-| Provider constraints | Dependabot, 14-day cooldown | auto-merged if non-major |
-| `.terraform.lock.hcl`, `flake.lock` |  Dependabot `nix` ecosystem, 14-day cooldown | manual |
+| Provider constraints and `.terraform.lock.hcl` | Dependabot, 14-day cooldown | auto-merged if non-major and the plan is empty |
+| GitHub Actions SHAs | Dependabot, 14-day cooldown | manual |
+| Rust crates (`app/Cargo.lock`) | Dependabot, 14-day cooldown | manual |
+| npm packages (`web/pnpm-lock.yaml`) | Dependabot, 14-day cooldown | manual |
+| `flake.lock` | Dependabot `nix` ecosystem, 14-day cooldown | manual |
+
+Auto-merge is an allowlist of one ecosystem, on purpose. It is safe only where
+"the plan is empty" means "nothing changes", and that is true of a provider
+bump alone. An Actions bump executes in CI before the gate can evaluate. A
+crate or npm bump merges, trips the deploy workflow, runs its build scripts in
+a job holding the apply role, and lands on the Lambdas — and Dependabot's
+security updates, which bypass the cooldown by design, would take that path
+too. A `flake.lock` bump runs on the operator's admin workstation. All of those
+get read by a human.
+
+Advisories Dependabot cannot fix with a bump — a vulnerable crate whose parent
+has not released a fix — are caught by `.github/workflows/audit.yml`, which
+runs `cargo audit` and `pnpm audit` weekly and on every lockfile change, with
+no AWS access. Ignored advisories, each with a dated reason, live in
+`app/.cargo/audit.toml`.
 
 The 14-day cooldown means a release must survive two weeks in public before it
 is proposed here — long enough for a malicious or broken publish to be caught.
@@ -374,7 +423,13 @@ does not bound either:
 
 The brake is deliberately one-way: clearing it needs a human with Identity
 Center admin, because CI cannot modify its own role. That is the property you
-want at 3am during a runaway.
+want at 3am during a runaway. It holds only because the brake policy and the
+executor role AWS Budgets assumes are both in `ci_control_plane_arns` — before
+they were, the apply role's policy-version and trust-policy permissions
+reached them, and the brake could have been rewritten into a no-op before it
+ever fired. The executor is also confined by `iam:PolicyARN` to attaching that
+one policy, so even a hijacked executor cannot attach anything else to the CI
+roles.
 
 Realistically pennies per month while idle. GuardDuty, AWS Config, and Security
 Hub are deliberately **not** enabled. Set `state_bucket_use_cmk = true` in

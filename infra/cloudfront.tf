@@ -39,6 +39,89 @@ data "aws_cloudfront_cache_policy" "optimized" {
   name = "Managed-CachingOptimized"
 }
 
+# ---------------------------------------------------------------------------
+# Security response headers for the SPA.
+#
+# The session token lives in localStorage — a reasoned trade, documented in
+# web/src/lib/auth.ts — which makes an XSS a thirty-day credential theft. The
+# app renders a great deal of model-generated and reader-typed text, and React's
+# escaping is the only thing between that text and the DOM. A Content Security
+# Policy is the second control, and at CloudFront it costs nothing.
+#
+# The CSP ships REPORT-ONLY. Everything in it was checked against the built
+# bundle (Vite emits no inline script or style for this configuration, and the
+# app has none) but not against a browser rendering the PDF <embed> or issuing
+# the presigned PUT, and a wrong directive there breaks uploads or the reader
+# silently. Run the app with devtools open, confirm the console shows no CSP
+# reports through an upload and a quiz, then promote it: move local.site_csp
+# into security_headers_config as content_security_policy and delete the
+# custom header. The other four headers are enforced now — none of them can
+# break anything this app does.
+# ---------------------------------------------------------------------------
+
+locals {
+  # The one origin the app touches besides its own: the documents bucket, for
+  # the presigned PUT (connect-src) and the presigned GET behind the <embed>
+  # (object-src; frame-src as well, for browsers that host their PDF viewer in
+  # a frame). Presigned URLs from the Rust SDK use the virtual-hosted regional
+  # form, which is what bucket_regional_domain_name is — if the report-only run
+  # shows connect-src or object-src violations, this is the line to look at.
+  docs_origin = "https://${aws_s3_bucket.docs.bucket_regional_domain_name}"
+
+  site_csp = join("; ", [
+    "default-src 'self'",
+    "script-src 'self'",
+    "style-src 'self'",
+    "img-src 'self' data:",
+    "connect-src 'self' ${local.docs_origin}",
+    "object-src ${local.docs_origin}",
+    "frame-src ${local.docs_origin}",
+    "frame-ancestors 'none'",
+    "base-uri 'none'",
+    "form-action 'self'",
+  ])
+}
+
+resource "aws_cloudfront_response_headers_policy" "site" {
+  name    = "${var.project}-site"
+  comment = "Security headers for the SPA. The CSP is report-only until it has been verified in a browser."
+
+  security_headers_config {
+    # A year, no subdomains and no preload: the apex and its other subdomains
+    # are Cloudflare's to promise for, not this distribution's.
+    strict_transport_security {
+      access_control_max_age_sec = 31536000
+      include_subdomains         = false
+      preload                    = false
+      override                   = true
+    }
+
+    content_type_options {
+      override = true
+    }
+
+    # Nothing frames this app. Passkey prompts already refuse a cross-origin
+    # frame; this covers the rest of the UI.
+    frame_options {
+      frame_option = "DENY"
+      override     = true
+    }
+
+    referrer_policy {
+      referrer_policy = "strict-origin-when-cross-origin"
+      override        = true
+    }
+  }
+
+  custom_headers_config {
+    items {
+      header   = "Content-Security-Policy-Report-Only"
+      value    = local.site_csp
+      override = true
+    }
+  }
+}
+
 resource "aws_cloudfront_distribution" "site" {
   enabled             = true
   is_ipv6_enabled     = true
@@ -109,6 +192,11 @@ resource "aws_cloudfront_distribution" "site" {
     viewer_protocol_policy = "redirect-to-https"
     compress               = true
     cache_policy_id        = data.aws_cloudfront_cache_policy.optimized.id
+
+    # On the site behaviour only. The api sets its own headers in the handler,
+    # and HSTS is a per-host promise the browser learns from the first page it
+    # loads, which is always this one.
+    response_headers_policy_id = aws_cloudfront_response_headers_policy.site.id
   }
 
   # Client-side routing. A deep link like /doc/abc123 is not an object in the

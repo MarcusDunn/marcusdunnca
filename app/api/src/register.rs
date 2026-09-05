@@ -16,11 +16,12 @@
 //!    cannot both be true. Once a credential exists these routes are not
 //!    disabled, they are *absent* — the router 404s them along with anything
 //!    else it does not know.
-//! 2. `REGISTRATION_TOKEN` must be presented in the `x-registration-token`
-//!    header. Without it, the interval between `tofu apply` and the paste is an
-//!    open enrolment endpoint on an unauthenticated Function URL, and whoever
-//!    reaches it first owns the app — the ceremony does not care *who* is
-//!    holding the phone.
+//! 2. The registration token — an SSM parameter named by
+//!    `REGISTRATION_TOKEN_PARAM`, read at cold start only in this mode — must
+//!    be presented in the `x-registration-token` header. Without it, the
+//!    interval between `tofu apply` and the paste is an open enrolment endpoint
+//!    on an unauthenticated route, and whoever reaches it first owns the app —
+//!    the ceremony does not care *who* is holding the phone.
 //!
 //! The token is therefore a bearer secret of the highest privilege this system
 //! has, for as long as the window is open. It is never logged, never echoed and
@@ -37,7 +38,7 @@ use webauthn_rs::prelude::{
 
 use crate::state::AppState;
 
-/// The header carrying `REGISTRATION_TOKEN`.
+/// The header carrying the registration token.
 ///
 /// A header rather than a query parameter, because `handle` logs the path of
 /// every request and a query string is the classic way a secret ends up in a log
@@ -222,7 +223,7 @@ pub async fn finish(state: &AppState, request: FinishRequest) -> Result<FinishRe
     })
 }
 
-/// Check the `x-registration-token` header against `REGISTRATION_TOKEN`.
+/// Check the `x-registration-token` header against the configured token.
 ///
 /// A missing header is treated as an empty token rather than as its own error,
 /// so there is exactly one rejection path and one response. Nothing about the

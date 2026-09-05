@@ -77,11 +77,14 @@ async fn main() -> std::result::Result<(), lambda_http::Error> {
 /// available.
 async fn handle(state: &AppState, req: Request) -> Response<Body> {
     let method = req.method().clone();
-    let path = normalise(req.uri().path());
 
     if method == lambda_http::http::Method::OPTIONS {
         return http::preflight(&state.origin);
     }
+
+    let Some(path) = route_path(req.uri().path()) else {
+        return http::error_response(&state.origin, &Error::NotFound);
+    };
 
     // Logged before dispatch and without the query string: `?skill=` is
     // harmless, but logging a whole URI is how bearer tokens end up in log
@@ -104,6 +107,27 @@ fn normalise(path: &str) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+/// The path to route on, or `None` when the request must be refused.
+///
+/// One exception to the normalisation above. The gateway throttles the
+/// unauthenticated routes by exact route key (`POST /auth/challenge` and
+/// `POST /auth/verify` in infra/apigateway.tf), and `/auth/challenge/` is not
+/// that key — it falls through to `$default` and the general limit, and would
+/// then be normalised into the very route the tighter limit exists for. So an
+/// auth path has to arrive canonical. Nothing legitimate sends it any other
+/// way: the SPA's paths are fixed strings.
+///
+/// Scoped to `/auth/` rather than applied everywhere, because the routes
+/// behind a session gain nothing from the strictness and `/docs/` being
+/// `/docs` is a convenience worth keeping.
+fn route_path(raw: &str) -> Option<String> {
+    let path = normalise(raw);
+    if path.starts_with("/auth/") && raw != path {
+        return None;
+    }
+    Some(path)
 }
 
 async fn dispatch(
@@ -271,6 +295,24 @@ mod tests {
         assert_eq!(normalise("/docs"), "/docs");
         assert_eq!(normalise("/"), "/");
         assert_eq!(normalise(""), "/");
+    }
+
+    /// The per-route throttle at the gateway keys on the exact path. A trailing
+    /// slash must not be a way around it — and must still be harmless
+    /// everywhere else.
+    #[test]
+    fn auth_routes_cannot_be_reached_around_the_gateway_throttle() {
+        assert_eq!(
+            route_path("/auth/challenge"),
+            Some("/auth/challenge".into())
+        );
+        assert_eq!(route_path("/auth/verify"), Some("/auth/verify".into()));
+        assert_eq!(route_path("/auth/challenge/"), None);
+        assert_eq!(route_path("/auth/verify//"), None);
+        assert_eq!(route_path("/auth/register/begin/"), None);
+
+        assert_eq!(route_path("/docs/"), Some("/docs".into()));
+        assert_eq!(route_path("/"), Some("/".into()));
     }
 
     /// Guards the ordering in `dispatch`: exactly two routes are reachable

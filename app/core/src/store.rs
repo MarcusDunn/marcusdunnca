@@ -54,14 +54,42 @@ pub enum AttemptWrite {
 pub struct Store {
     client: Client,
     table: String,
+    /// Where WebAuthn ceremony rows go. Defaults to `table`; the api overrides
+    /// it — see [`Store::with_auth_table`] for why it must.
+    auth_table: String,
 }
 
 impl Store {
     pub fn new(client: Client, table: impl Into<String>) -> Self {
+        let table = table.into();
         Self {
             client,
-            table: table.into(),
+            auth_table: table.clone(),
+            table,
         }
+    }
+
+    /// Keep challenge and registration rows in a table of their own.
+    ///
+    /// The two routes that write them — `POST /auth/challenge` and
+    /// `POST /auth/verify` — are the only ones that need no session, and each
+    /// call to either is a write: a put of a kilobyte of serialized ceremony
+    /// state, or the `DeleteItem` that consumes one. In the application table
+    /// those writes competed with the reader's own for 5 WCU, and every row
+    /// they left behind was read by the `Scan`s in [`Store::list_docs`] and
+    /// [`Store::list_attempts`] until the TTL sweep — documented as up to 48
+    /// hours — removed it. An hour of anonymous traffic at the gateway's rate
+    /// limit could make the document list unreadable for a day.
+    ///
+    /// With the rows elsewhere, the worst an anonymous caller can do to the
+    /// application table is nothing. Only the two ceremony methods below read
+    /// or write `auth_table`; everything else stays on `table`.
+    ///
+    /// `generate` never calls this — it has no ceremony to run — so the
+    /// default of "same table" keeps its configuration unchanged.
+    pub fn with_auth_table(mut self, table: impl Into<String>) -> Self {
+        self.auth_table = table.into();
+        self
     }
 
     // ---- documents --------------------------------------------------------
@@ -926,7 +954,9 @@ impl Store {
 
         self.client
             .put_item()
-            .table_name(&self.table)
+            // The ceremony table, not the application table. See
+            // `with_auth_table`.
+            .table_name(&self.auth_table)
             .set_item(Some(item))
             .send()
             .await
@@ -981,7 +1011,7 @@ impl Store {
         let out = self
             .client
             .delete_item()
-            .table_name(&self.table)
+            .table_name(&self.auth_table)
             .key("pk", AttributeValue::S(keys::AUTH_PK.to_string()))
             .key("sk", AttributeValue::S(sk))
             .return_values(ReturnValue::AllOld)
