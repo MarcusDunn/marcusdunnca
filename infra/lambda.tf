@@ -1,8 +1,9 @@
 # ---------------------------------------------------------------------------
 # Compute: two Rust functions on the OS-only runtime.
 #
-#   api       synchronous, reached from the browser through a Function URL,
-#             routes internally on path. Authenticates every request itself.
+#   api       synchronous, reached from the browser through CloudFront and the
+#             HTTP API in apigateway.tf, routes internally on path.
+#             Authenticates every request itself.
 #   generate  asynchronous, fired by S3 when a PDF lands. Reads the document,
 #             asks Bedrock for questions, writes them to the table.
 #
@@ -26,6 +27,15 @@ locals {
   # asked to — which is the point. A `data "aws_ssm_parameter"` here would drag
   # the signing key into plaintext in the state file forever.
   jwt_signing_key_parameter = "/${var.project}/secret/jwt-signing-key"
+
+  # Same treatment, for the same reason. This was a Terraform variable written
+  # into the function's environment, which put the value in Lambda
+  # configuration — readable by the plan role, from any pull request — and in
+  # the state file, whose version history is kept for ninety days. Now it is a
+  # name: the handler reads the parameter at cold start, and only when there
+  # are no credentials to serve. See the REGISTRATION_TOKEN_PARAM variable
+  # below for the ceremony.
+  registration_token_parameter = "/${var.project}/secret/registration-token"
 
   # Bedrock's inference-profile indirection needs permission on BOTH the profile
   # ARN and the underlying foundation-model ARN in every region the profile can
@@ -129,6 +139,10 @@ data "aws_iam_policy_document" "lambda_assume_role" {
 
 # --- api -------------------------------------------------------------------
 
+# The `-execution` suffix is load-bearing: bootstrap's app guardrails allow
+# iam:PassRole only on roles named `${project}-*-execution`, so a role named
+# anything else cannot be handed to Lambda and CreateFunction fails. That is
+# how a role CI did not create stays out of a function CI did.
 resource "aws_iam_role" "api" {
   name                 = "${local.api_function_name}-execution"
   description          = "Execution role for the ${local.api_function_name} function."
@@ -170,6 +184,16 @@ data "aws_iam_policy_document" "api" {
     resources = [aws_dynamodb_table.app.arn]
   }
 
+  # The ceremony-state table. Puts for challenges and registrations; consuming
+  # one is a DeleteItem with ReturnValues, so nothing here needs GetItem,
+  # Query or Scan.
+  statement {
+    sid       = "CeremonyStateTable"
+    effect    = "Allow"
+    actions   = ["dynamodb:PutItem", "dynamodb:DeleteItem"]
+    resources = [aws_dynamodb_table.auth.arn]
+  }
+
   # Presigned URLs are signed locally with these credentials and evaluated
   # against this role when the browser uses them, so the scope of the prefix
   # here is the scope of what a presigned URL can ever reach. Both verbs are
@@ -181,11 +205,17 @@ data "aws_iam_policy_document" "api" {
     resources = ["${aws_s3_bucket.docs.arn}/docs/*"]
   }
 
+  # Exactly the two secrets the handler reads, by name. Not /secret/*: a wider
+  # grant here is a wider grant to whatever a handler bug can be talked into
+  # fetching.
   statement {
-    sid       = "ReadJwtSigningKey"
-    effect    = "Allow"
-    actions   = ["ssm:GetParameter"]
-    resources = ["arn:${local.partition}:ssm:${var.aws_region}:${local.account_id}:parameter${local.jwt_signing_key_parameter}"]
+    sid     = "ReadSecretParameters"
+    effect  = "Allow"
+    actions = ["ssm:GetParameter"]
+    resources = [
+      "arn:${local.partition}:ssm:${var.aws_region}:${local.account_id}:parameter${local.jwt_signing_key_parameter}",
+      "arn:${local.partition}:ssm:${var.aws_region}:${local.account_id}:parameter${local.registration_token_parameter}",
+    ]
   }
 
   # A SecureString read is refused without Decrypt on the key behind it.
@@ -326,8 +356,9 @@ resource "aws_lambda_function" "api" {
 
   environment {
     variables = {
-      TABLE_NAME  = aws_dynamodb_table.app.name
-      DOCS_BUCKET = aws_s3_bucket.docs.id
+      TABLE_NAME      = aws_dynamodb_table.app.name
+      AUTH_TABLE_NAME = aws_dynamodb_table.auth.name
+      DOCS_BUCKET     = aws_s3_bucket.docs.id
 
       # RP_ID is the apex while ORIGIN is the app subdomain, and they are
       # deliberately different — see the webauthn_rp_id variable. The handler
@@ -348,11 +379,26 @@ resource "aws_lambda_function" "api" {
       # logged at debug because they are noise in normal operation.
       LOG_LEVEL = var.api_log_level
 
-      # Bootstrap only. Non-empty turns on passkey enrolment, and ONLY while
-      # webauthn_credentials is still empty — the handler models these as an
-      # either/or, so a deployment can never both hold credentials and accept
-      # new ones. Clearing this is what actually closes the window.
-      REGISTRATION_TOKEN = var.registration_token
+      # Name, not value, exactly like the signing key. The handler reads this
+      # parameter at cold start ONLY while webauthn_credentials is empty — the
+      # two states are an either/or, so a deployment can never both hold
+      # credentials and accept new ones. Enrolling a passkey:
+      #
+      #   aws ssm put-parameter --name /marcusdunnca/secret/registration-token \
+      #     --type SecureString --value "$(openssl rand -base64 24)" --overwrite
+      #
+      # then empty webauthn_credentials, apply, run the ceremony with the token
+      # in the x-registration-token header, paste the credential back, apply
+      # again — which closes the window — and delete the parameter:
+      #
+      #   aws ssm delete-parameter --name /marcusdunnca/secret/registration-token
+      #
+      # Delete rather than leave it. A token that no longer exists cannot be
+      # replayed if the credentials are ever cleared again, and a fresh one
+      # costs nothing. Enrolment is protected only by this secret on an
+      # unauthenticated route throttled to one request a second — keep the
+      # window to minutes.
+      REGISTRATION_TOKEN_PARAM = local.registration_token_parameter
 
       WEBAUTHN_CREDENTIALS = var.webauthn_credentials
     }
