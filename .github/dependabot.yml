@@ -66,6 +66,55 @@ updates:
           - patch
 
   # ---------------------------------------------------------------------------
+  # The application's own dependencies. Neither ecosystem is auto-merged (see
+  # dependabot-auto-merge.yml for why): a bump here ships to production, so
+  # each PR is read. Grouped so a quiet week is one PR rather than nine.
+  #
+  # Security updates for both were already on repository-wide; these blocks add
+  # the weekly version updates, which is what keeps an SDK current enough that
+  # the next advisory is a lockfile bump rather than a stuck transitive
+  # dependency. Advisories that cannot be fixed by a bump are what
+  # .github/workflows/audit.yml is for.
+  # ---------------------------------------------------------------------------
+  - package-ecosystem: cargo
+    directory: "/app"
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 14
+    commit-message:
+      prefix: deps
+    labels:
+      - dependencies
+      - rust
+    groups:
+      cargo-non-major:
+        patterns: ["*"]
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: npm
+    directory: "/web"
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 14
+    commit-message:
+      prefix: deps
+    labels:
+      - dependencies
+      - javascript
+    groups:
+      npm-non-major:
+        patterns: ["*"]
+        update-types:
+          - minor
+          - patch
+
+  # ---------------------------------------------------------------------------
   # Nix flake inputs (flake.lock). Supported by Dependabot since April 2026,
   # which is what made .github/workflows/update-locks.yml redundant — deleting
   # that workflow removed a scheduled job holding contents+pull-requests write

@@ -21,6 +21,36 @@ session's network, so one condition-key detail in H-2 is stated from memory
 and flagged. Treat every IAM finding as "the policy as written permits this",
 which is what the repository controls.
 
+## Remediation
+
+The pull request that carries this document also carries the fixes. Status
+per finding, and what is left for a human:
+
+| ID | Status | Where |
+| --- | --- | --- |
+| H-1 | Fixed | `bootstrap/iam.tf` (`ci_control_plane_arns`, budget denies), `bootstrap/budget_action.tf` (`iam:PolicyARN` condition) |
+| H-2 | Fixed | `bootstrap/iam.tf` (`ManageApplicationRoles` scoped by name; new `ci-app-guardrails` policy with the takeover and PassRole denies; `role_takeover_actions` now attached) |
+| M-1 | Fixed | `bootstrap/iam.tf` (`DenyApplicationDataDestruction`, `DenyDocumentDestruction`), `infra/dynamodb.tf` (`deletion_protection_enabled`) |
+| M-2 | Fixed | Ceremony rows moved to their own table (`infra/dynamodb.tf`, `app/core/src/store.rs`); per-route throttles on the two anonymous routes (`infra/apigateway.tf`); the handler refuses a trailing slash on `/auth/*` so the throttle cannot be routed around (`app/api/src/main.rs`) |
+| M-3 | Fixed | Auto-merge is an allowlist of `terraform` only; `cargo` and `npm` version updates added to Dependabot; a no-AWS `audit.yml` runs `cargo audit` and `pnpm audit` weekly and on lockfile changes |
+| M-4 | Partial | HSTS, `nosniff`, `X-Frame-Options: DENY` and a referrer policy are enforced. **The CSP ships report-only**: it was checked against the built bundle but not against a browser rendering the PDF `<embed>` or issuing the presigned PUT. Promote it once devtools shows no reports through an upload and a quiz (`infra/cloudfront.tf` says how). |
+| L-1 | Fixed | `packageManager` pin with integrity hash in `web/package.json`; `deploy.yml` runs `corepack enable` only |
+| L-2 | Fixed | The registration token is an SSM parameter referenced by name (`REGISTRATION_TOKEN_PARAM`), read at cold start only when there are no credentials. The Terraform variable is gone. |
+| L-3 | Fixed | README and the `apigateway.tf` description corrected |
+| L-4 | Fixed | Object Lock on the trail bucket; data events for the documents bucket |
+| L-5 | Fixed | Unconditioned `iam:CreateServiceLinkedRole` removed; three budget-action mutations added to the deny list |
+| I-1 | Accepted | Comment corrected; no change |
+| Deps | Fixed | The four HTTP-stack advisories are gone: the SDK crates no longer enable the legacy `rustls` feature, which drops hyper 0.14, rustls 0.21, h2 0.3 and the SSO crates from the binary entirely. `rsa` is ignored with a dated reason in `app/.cargo/audit.toml`. |
+
+**After merge, by hand.** `bootstrap/` is human-applied: run `scripts/bootstrap.sh`
+for H-1, H-2, M-1's guardrail half, L-4 and L-5 to take effect, and check
+`get-trail-status` afterwards for a delivery error from the trail bucket's
+new Object Lock (none is expected). The registration-token parameter only
+needs to exist at the next enrolment ceremony. Watch the first deploy after
+merge: the api function now requires `AUTH_TABLE_NAME`, which `tofu apply`
+sets minutes before `deploy.yml` finishes compiling, so the ordering is
+safe in practice but not enforced.
+
 ## Summary
 
 The application layer is unusually well defended for its size: exact-origin

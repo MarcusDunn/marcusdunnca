@@ -20,27 +20,50 @@ jobs:
         id: meta
         uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
 
-      # `github_actions` is deliberately excluded, not an oversight.
+      # An ALLOWLIST of one ecosystem, not a denylist. This used to exclude only
+      # `github_actions`, on the reasoning that it was "the one ecosystem whose
+      # code actually executes in CI". It was not the only one:
       #
-      # The empty-plan gate cannot protect that ecosystem: an action SHA bump
-      # always produces an empty plan, and worse, the bumped action executes
-      # BEFORE the gate evaluates — setup-opentofu runs in a job holding
-      # id-token: write and the plan role, and could shim `tofu` or write
-      # exitcode=0 into $GITHUB_OUTPUT to neuter the check. Once merged, the same
-      # unreviewed SHA runs alongside the apply role.
+      #   * A `cargo` or `npm` bump — including Dependabot's security updates,
+      #     which bypass the 14-day cooldown by design — passes the empty-plan
+      #     gate trivially (an app dependency never changes a `tofu plan`),
+      #     merges, trips deploy.yml, compiles its build scripts in a job
+      #     holding the apply role, and lands on the Lambdas. Nobody reads it.
+      #   * A `nix` bump changes what runs on the operator's admin workstation.
+      #   * An action SHA bump executes BEFORE the gate evaluates —
+      #     setup-opentofu runs in a job holding id-token: write and the plan
+      #     role, and could shim `tofu` or write exitcode=0 into $GITHUB_OUTPUT.
       #
-      # So the one ecosystem whose code actually executes in CI is the one the
-      # gate is structurally blind to. Those PRs get read by a human.
-      - name: Enable auto-merge for non-major, non-Actions updates
+      # The gate is meaningful exactly where "the plan is empty" means "nothing
+      # changes": a provider bump. The provider binary runs in the plan job on
+      # every PR regardless of auto-merge, so the marginal exposure is the apply
+      # job, and the empty plan is what bounds that. Everything else is read by
+      # a human.
+      - name: Enable auto-merge for non-major provider updates
         if: >-
           steps.meta.outputs.update-type != 'version-update:semver-major' &&
-          steps.meta.outputs.package-ecosystem != 'github_actions'
+          steps.meta.outputs.package-ecosystem == 'terraform'
         run: gh pr merge --auto --squash "$PR_URL"
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      # Metadata goes through `env`, not into the script text: these values are
+      # Dependabot's, and the vocabulary is fixed, but interpolating anything
+      # into a shell script is a habit worth not having.
       - name: Explain why a major update was left alone
         if: steps.meta.outputs.update-type == 'version-update:semver-major'
+        env:
+          NAMES: ${{ steps.meta.outputs.dependency-names }}
         run: |
-          echo "::notice::Major update (${{ steps.meta.outputs.dependency-names }}) — merge by hand after reviewing the plan."
+          echo "::notice::Major update ($NAMES) — merge by hand after reviewing the plan."
+
+      - name: Explain why a non-provider update was left alone
+        if: >-
+          steps.meta.outputs.update-type != 'version-update:semver-major' &&
+          steps.meta.outputs.package-ecosystem != 'terraform'
+        env:
+          ECOSYSTEM: ${{ steps.meta.outputs.package-ecosystem }}
+          NAMES: ${{ steps.meta.outputs.dependency-names }}
+        run: |
+          echo "::notice::$ECOSYSTEM update ($NAMES) is not auto-merged — read it, then merge by hand. See the comment in this workflow."

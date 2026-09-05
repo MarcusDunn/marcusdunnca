@@ -1,0 +1,66 @@
+name: dependency audit
+
+# Dependabot opens a pull request for an advisory it can fix with a version
+# bump. It cannot open one for a vulnerable crate whose parent has not released
+# a fix — which is how four advisories in the AWS SDK's legacy HTTP stack sat
+# in Cargo.lock for five months. This is the thing that notices.
+#
+# No AWS role, a read-only token, and nothing here is worth protecting from a
+# fork, so no fork guard. Not a required check: a new advisory should be
+# visible, not a wedge that blocks every unrelated merge until it is triaged.
+on:
+  schedule:
+    - cron: "0 9 * * 1"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "app/Cargo.lock"
+      - "app/.cargo/audit.toml"
+      - "web/pnpm-lock.yaml"
+      - ".github/workflows/audit.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Built from crates.io against its own lockfile rather than fetched as a
+      # release binary or run through the rustsec action: the actions allowlist
+      # is four named repositories and neither is on it. A few minutes, weekly.
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version 0.22.2
+
+      # Ignores live in app/.cargo/audit.toml, each with a dated reason.
+      - name: Audit Cargo.lock
+        working-directory: app
+        run: cargo audit
+
+  pnpm-audit:
+    name: pnpm audit
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Enable pnpm
+        env:
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+        run: corepack enable
+
+      # Production dependencies only. A devDependency advisory in a bundler is
+      # worth a look on the weekly run's output, not a red check.
+      - name: Audit pnpm-lock.yaml
+        working-directory: web
+        run: pnpm audit --prod
