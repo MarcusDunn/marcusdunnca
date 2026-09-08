@@ -6,6 +6,9 @@ export const queryKeys = {
   documents: ["documents"] as const,
   documentUrl: (id: string) => ["documents", id, "url"] as const,
   quiz: (id: string) => ["documents", id, "quiz"] as const,
+  attempts: (id: string) => ["documents", id, "attempts"] as const,
+  attempt: (id: string, attemptId: string) =>
+    ["documents", id, "attempts", attemptId] as const,
   history: ["history"] as const,
   reviewQueue: ["review"] as const,
 };
@@ -69,6 +72,35 @@ export const quizQuery = (id: string) =>
     // Questions are fixed once generated; refetching mid-quiz would be a way to
     // lose answers, not a way to get fresher data.
     staleTime: Infinity,
+  });
+
+/**
+ * The sittings of one document, newest first.
+ *
+ * `staleTime: 0` because voiding a question from an attempt rewrites the score
+ * of every attempt that counted it — so the list is stale the moment anything
+ * on the detail screen is voided, and it is one query for a handful of rows.
+ */
+export const attemptsQuery = (id: string) =>
+  queryOptions({
+    queryKey: queryKeys.attempts(id),
+    queryFn: () => api.documentAttempts(id),
+    staleTime: 0,
+  });
+
+/**
+ * One past sitting, graded, with the key.
+ *
+ * Not `staleTime: Infinity` like `quizQuery`, and for the opposite reason: a
+ * quiz must not change under the reader mid-answer, while this screen's whole
+ * purpose is acting on it. Voiding a question here has to be reflected when the
+ * mutation invalidates it.
+ */
+export const attemptQuery = (id: string, attemptId: string) =>
+  queryOptions({
+    queryKey: queryKeys.attempt(id, attemptId),
+    queryFn: () => api.documentAttempt(id, attemptId),
+    staleTime: 0,
   });
 
 export const historyQuery = () =>

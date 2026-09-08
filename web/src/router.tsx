@@ -7,6 +7,7 @@ import {
 } from "@tanstack/react-router";
 import { z } from "zod";
 import { getSession } from "./lib/auth";
+import { AttemptScreen, AttemptsScreen } from "./routes/attempts";
 import { DocumentsScreen } from "./routes/documents";
 import { HistoryScreen } from "./routes/history";
 import { LoginScreen } from "./routes/login";
@@ -89,6 +90,25 @@ const readRoute = createRoute({
   component: ReadScreen,
 });
 
+/*
+ * Declared after `readRoute` and matched ahead of it regardless: the router
+ * ranks by specificity, not by declaration order, so `/docs/$documentId` does
+ * not swallow `/docs/x/attempts`. Written out because the opposite is a
+ * reasonable thing to assume and the failure — the read screen rendering for an
+ * attempts URL — looks like a data bug rather than a routing one.
+ */
+const attemptsRoute = createRoute({
+  getParentRoute: () => authRoute,
+  path: "/docs/$documentId/attempts",
+  component: AttemptsScreen,
+});
+
+const attemptRoute = createRoute({
+  getParentRoute: () => authRoute,
+  path: "/docs/$documentId/attempts/$attemptId",
+  component: AttemptScreen,
+});
+
 const uploadRoute = createRoute({
   getParentRoute: () => authRoute,
   path: "/upload",
@@ -113,6 +133,8 @@ const routeTree = rootRoute.addChildren([
     indexRoute,
     documentsRoute,
     readRoute,
+    attemptsRoute,
+    attemptRoute,
     uploadRoute,
     reviewRoute,
     historyRoute,

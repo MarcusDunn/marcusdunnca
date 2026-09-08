@@ -352,6 +352,18 @@ export const GradedQuestion = z.object({
   /** Bits over chance, as awarded by the server. Never recomputed here. */
   scoreBits: z.number(),
   explanation: z.string().default(""),
+  /**
+   * Whether the question has since been withdrawn.
+   *
+   * Always false in a fresh submission — a voided question is never offered, so
+   * it cannot be in one. Defaulted for the same reason every other late arrival
+   * here is: an API that has not been redeployed yet must not blank the screen.
+   */
+  voided: z.boolean().default(false),
+  /** When it was withdrawn. Absent unless `voided`. */
+  voidedAt: z.iso.datetime().nullable().default(null),
+  /** The note left at the time, when one was. Absent unless `voided`. */
+  voidReason: z.string().nullable().default(null),
 });
 export type GradedQuestion = z.infer<typeof GradedQuestion>;
 
@@ -371,6 +383,36 @@ export const AttemptResult = z.object({
   questions: z.array(GradedQuestion),
 });
 export type AttemptResult = z.infer<typeof AttemptResult>;
+
+/**
+ * One row of `GET /docs/:id/attempts`.
+ *
+ * `correct` and `total` are the stored figures, already corrected for any void
+ * — the server rewrites them across every attempt that counted a withdrawn
+ * question. `voided` is how many were withdrawn, which is the one number that
+ * explains why an old sitting reads as 7 of 9 when the quiz had ten questions.
+ */
+export const AttemptSummary = z.object({
+  attemptId: z.string().min(1),
+  submittedAt: z.iso.datetime(),
+  correct: z.number().int().nonnegative(),
+  // Not `.positive()`, unlike AttemptResult: voiding every question in an
+  // attempt leaves a real row with a total of zero, and refusing to parse it
+  // would blank the list rather than show what happened.
+  total: z.number().int().nonnegative(),
+  scoreBits: z.number(),
+  maxScoreBits: z.number(),
+  durationMs: z.number().int().nonnegative().default(0),
+  voided: z.number().int().nonnegative().default(0),
+});
+export type AttemptSummary = z.infer<typeof AttemptSummary>;
+
+export const AttemptList = z.object({
+  documentId: z.string().min(1),
+  documentTitle: z.string(),
+  attempts: z.array(AttemptSummary),
+});
+export type AttemptList = z.infer<typeof AttemptList>;
 
 /**
  * `POST /docs/:id/void` — withdraw a question, or restore one.
