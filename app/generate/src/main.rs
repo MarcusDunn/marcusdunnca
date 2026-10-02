@@ -70,6 +70,21 @@ const DEFAULT_BEDROCK_REGION: &str = "eu-west-1";
 /// settled by running the reference document at several and comparing.
 const DEFAULT_EFFORT: &str = "high";
 
+/// Times a rejected quiz is handed back to the model with the reason.
+///
+/// The schema is advisory here — structured outputs are unavailable on Bedrock,
+/// so a tool call that violates it arrives anyway and `validate` is what catches
+/// it. Before this, that was the end of the document: one malformed array and the
+/// upload was marked failed with a Retry button that started over from the PDF.
+///
+/// One is deliberate rather than timid. The failures seen are formatting slips —
+/// an array sent as a string containing JSON — which the model fixes on being
+/// told, and a model that gets the shape wrong twice in a row is usually wrong
+/// about the document rather than the format. Each attempt is a full billed call
+/// including the PDF, so this multiplies the per-document cost in the worst case;
+/// `generate_retry_attempts` already stacks on top.
+const DEFAULT_REPAIR_ATTEMPTS: u32 = 1;
+
 /// Ceiling on thinking plus answer, in tokens.
 ///
 /// Was `thinking_budget + 4096` — a formula that only made sense while the
@@ -124,6 +139,7 @@ struct Config {
     model_id: String,
     effort: String,
     max_output_tokens: u32,
+    repair_attempts: u32,
     max_pages: usize,
     daily_cap: u32,
     max_document_bytes: i64,
@@ -148,6 +164,7 @@ impl Config {
             model_id: config::parse_or("MODEL_ID", DEFAULT_MODEL_ID.to_string())?,
             effort: config::parse_or("EFFORT", DEFAULT_EFFORT.to_string())?,
             max_output_tokens: config::parse_or("MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS)?,
+            repair_attempts: config::parse_or("REPAIR_ATTEMPTS", DEFAULT_REPAIR_ATTEMPTS)?,
             max_pages: config::parse_or("MAX_PAGES", DEFAULT_MAX_PAGES)?,
             daily_cap: config::parse_or("DAILY_DOCUMENT_CAP", DEFAULT_DAILY_CAP)?,
             max_document_bytes: config::parse_or("MAX_DOCUMENT_BYTES", DEFAULT_MAX_DOCUMENT_BYTES)?,
@@ -451,6 +468,7 @@ async fn process(config: &Config, doc_id: &str) -> Result<()> {
             model_id: &config.model_id,
             effort: &config.effort,
             max_tokens: config.max_output_tokens,
+            repair_attempts: config.repair_attempts,
             known_topics: &known_topics,
             // The document id, so the option shuffle is reproducible per
             // document rather than per invocation.

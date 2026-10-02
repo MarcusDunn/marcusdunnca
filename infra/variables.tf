@@ -140,6 +140,37 @@ variable "bedrock_effort" {
   }
 }
 
+variable "bedrock_repair_attempts" {
+  description = <<-EOT
+    Times a rejected quiz is handed back to the model with the reason attached.
+
+    The JSON Schema the model is given is advisory, not enforced: structured
+    outputs are unavailable on Bedrock, so a tool call that violates the schema
+    arrives anyway and the handler's own validation is what catches it. Until
+    this existed, that was the end of the document — one malformed array and the
+    upload was marked failed, with a Retry button that started over from the PDF
+    and paid for the whole generation again.
+
+    A repair turn is cheaper than that retry: the conversation already holds the
+    document, so the correction is a short follow-up rather than a fresh upload.
+    It is still a billed call, and generate_retry_attempts stacks on top, so the
+    worst case per document is (repair_attempts + 1) x (retry_attempts + 1)
+    model calls.
+
+    One, because the observed failures are formatting slips an immediate
+    correction fixes — an array sent as a string containing JSON — and a model
+    that gets the shape wrong twice running is usually wrong about the document
+    rather than the format. Zero restores the previous single-shot behaviour.
+  EOT
+  type        = number
+  default     = 1
+
+  validation {
+    condition     = var.bedrock_repair_attempts >= 0 && var.bedrock_repair_attempts <= 3
+    error_message = "Repair attempts must be between 0 and 3."
+  }
+}
+
 variable "bedrock_max_output_tokens" {
   description = <<-EOT
     Ceiling on thinking plus answer, in tokens.

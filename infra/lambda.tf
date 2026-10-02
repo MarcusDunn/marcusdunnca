@@ -462,6 +462,7 @@ resource "aws_lambda_function" "generate" {
       BEDROCK_REGION    = var.bedrock_region
       EFFORT            = var.bedrock_effort
       MAX_OUTPUT_TOKENS = tostring(var.bedrock_max_output_tokens)
+      REPAIR_ATTEMPTS   = tostring(var.bedrock_repair_attempts)
 
       MAX_PAGES          = tostring(var.max_pages)
       MAX_DOCUMENT_BYTES = tostring(var.max_upload_bytes)

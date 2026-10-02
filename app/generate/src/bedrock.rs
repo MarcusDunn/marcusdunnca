@@ -522,6 +522,15 @@ pub struct Request<'a> {
     /// that failure arrives as `stop_reason: "max_tokens"` and an unparseable
     /// tool call, not as anything that names the real problem.
     pub max_tokens: u32,
+    /// How many times to hand a rejected quiz back to the model with the reason
+    /// and ask it to correct itself. Zero restores the old single-shot behaviour.
+    ///
+    /// This exists because the schema is advisory here — structured outputs are
+    /// unavailable on Bedrock, so a tool call that violates the schema arrives
+    /// anyway. The observed failure is a whole array emitted as a JSON *string*
+    /// rather than an array, which no amount of schema wording prevents and which
+    /// the model corrects immediately when told.
+    pub repair_attempts: u32,
     /// Topics used so far, offered back for reuse.
     pub known_topics: &'a [Topic],
     /// Seeds option shuffling. The document id, so a regeneration of the same
@@ -550,9 +559,65 @@ pub struct Generated {
 /// the payload by about a third, which is worth remembering against the
 /// `max_document_bytes` ceiling — that limit is on the file, not on the request.
 pub async fn generate(client: &mantle::Client, req: Request<'_>) -> Result<Generated> {
-    let response = client.messages(&request_body(&req)).await?;
+    let mut body = request_body(&req);
 
-    let quiz = parse(extract_tool_input(&response)?)?;
+    // `remaining` counts repair turns left, so the first pass is the original
+    // single-shot call and the loop degenerates to it when repair_attempts is 0.
+    for remaining in (0..=req.repair_attempts).rev() {
+        let response = client.messages(&body).await?;
+        let call = extract_tool_call(&response)?;
+
+        match build(call.input, req.seed) {
+            Ok(generated) => return Ok(generated),
+            Err(rejection) if remaining > 0 => {
+                // `public` only. `detail` can quote the model's own output,
+                // answers included, and a log group is not the place for that.
+                tracing::warn!(
+                    remaining,
+                    reason = %rejection.public,
+                    "quiz rejected; asking the model to correct it"
+                );
+                append_repair_turn(&mut body, &response, &call.id, &rejection.detail)?;
+            }
+            Err(rejection) => return Err(Error::Invalid(rejection.public)),
+        }
+    }
+
+    // Unreachable: the loop runs at least once and every path either returns or
+    // continues. Stated rather than `unwrap`ed so a future edit to the bounds
+    // cannot turn this into a panic in a Lambda.
+    Err(Error::Invalid(
+        "the model produced no usable quiz; try again".into(),
+    ))
+}
+
+/// A tool call, with the id needed to answer it.
+#[derive(Debug)]
+struct ToolCall {
+    id: String,
+    input: serde_json::Value,
+}
+
+/// Why a candidate quiz was rejected, split by who may see it.
+#[derive(Debug)]
+struct Rejection {
+    /// Content-free. Safe to log, and safe to store in a document's `error`
+    /// field where the browser will render it.
+    public: String,
+    /// Verbose, for the model alone. May quote the model's own output — which
+    /// includes the answer key — so it must never be logged or stored. This is
+    /// the distinction rule 2 in the module header is about.
+    detail: String,
+}
+
+/// parse, normalise, validate and assemble: everything between a tool call and a
+/// quiz worth storing.
+///
+/// Returns [`Rejection`] rather than [`Error`] because every failure here is the
+/// model's output being wrong, which is the one kind of failure worth handing
+/// back for another try.
+fn build(input: serde_json::Value, seed: &str) -> std::result::Result<Generated, Rejection> {
+    let quiz = parse(input)?;
 
     let title = quiz.title.trim().to_string();
     let topics = tags::normalise(&quiz.topics);
@@ -560,15 +625,85 @@ pub async fn generate(client: &mantle::Client, req: Request<'_>) -> Result<Gener
     // Validated before assembly, because the checks are stated per array — a
     // count, a skill vocabulary, a tolerance band — and every one of them is
     // easier to phrase, and to report, against the shape the model returned.
-    validate(&title, &topics, &quiz)?;
+    //
+    // These messages are counts, lengths and vocabulary violations rather than
+    // quotations, so the same text serves as both halves of the rejection.
+    validate(&title, &topics, &quiz).map_err(|e| {
+        let text = e.to_string();
+        Rejection {
+            public: text.clone(),
+            detail: text,
+        }
+    })?;
 
-    let questions = assemble(quiz, req.seed);
+    let questions = assemble(quiz, seed);
 
     Ok(Generated {
         title,
         topics,
         questions,
     })
+}
+
+/// Append the rejected turn and the reason, so the next call is a correction
+/// rather than a fresh attempt.
+///
+/// The assistant turn is echoed **verbatim**, thinking blocks and all. On this
+/// model a thinking block is signed over the conversation that preceded it, so
+/// replaying an edited history is a 400 rather than a subtle degradation.
+fn append_repair_turn(
+    body: &mut serde_json::Value,
+    response: &serde_json::Value,
+    tool_use_id: &str,
+    detail: &str,
+) -> Result<()> {
+    let messages = body
+        .get_mut("messages")
+        .and_then(|m| m.as_array_mut())
+        .ok_or_else(|| Error::Aws("request body lost its messages array".into()))?;
+
+    messages.push(json!({
+        "role": "assistant",
+        "content": response.get("content").cloned().unwrap_or_else(|| json!([])),
+    }));
+
+    // `is_error` is what marks this as a failed call rather than a result, which
+    // is the difference between the model correcting itself and the model
+    // treating the text as data to incorporate.
+    //
+    // Truncated because a serde error on a large array can quote a lot of that
+    // array back, and the point is to name the fault, not to re-send the quiz.
+    messages.push(json!({
+        "role": "user",
+        "content": [{
+            "type": "tool_result",
+            "tool_use_id": tool_use_id,
+            "is_error": true,
+            "content": format!(
+                "That call was rejected and nothing was stored: {}\n\n\
+                 Call `{TOOL_NAME}` again with the complete corrected quiz. Send every \
+                 field as its proper JSON type — an array as an array, a number as a \
+                 number — not as a string containing JSON. Do not repeat the rejected \
+                 call and do not explain the correction in prose.",
+                truncate(detail, 600),
+            ),
+        }],
+    }));
+
+    Ok(())
+}
+
+/// Char-boundary-safe truncation. `&s[..n]` through a multi-byte character is a
+/// panic, and model output is full of typographic quotes and dashes.
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut cut = max;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}…", &s[..cut])
 }
 
 /// Build the Messages API request body.
@@ -701,7 +836,7 @@ fn assemble(quiz: GeneratedQuiz, seed: &str) -> Vec<Question> {
 /// content array starts with one, and it is not JSON. They arrive with empty
 /// text under the default `display`, but they still arrive, so the loop has to
 /// walk past them rather than read `content[0]`.
-fn extract_tool_input(response: &serde_json::Value) -> Result<serde_json::Value> {
+fn extract_tool_call(response: &serde_json::Value) -> Result<ToolCall> {
     // Two stop reasons are worth naming before the content walk, because both
     // produce a response with no usable tool call and the generic "replied
     // without generating a quiz" would misdescribe them.
@@ -744,12 +879,22 @@ fn extract_tool_input(response: &serde_json::Value) -> Result<serde_json::Value>
             tracing::warn!(tool = %name, "model called an unexpected tool");
             continue;
         }
+        // The id is needed to answer this call with a tool_result if the quiz
+        // turns out to be unusable — see `append_repair_turn`.
+        let id = block
+            .get("id")
+            .and_then(|i| i.as_str())
+            .ok_or_else(|| Error::Invalid("the model's tool call carried no id".into()))?
+            .to_string();
+
         // Cloned rather than borrowed so `parse` keeps taking an owned value,
         // which is what its tests construct directly.
-        return block
+        let input = block
             .get("input")
             .cloned()
-            .ok_or_else(|| Error::Invalid("the model's tool call carried no input".into()));
+            .ok_or_else(|| Error::Invalid("the model's tool call carried no input".into()))?;
+
+        return Ok(ToolCall { id, input });
     }
 
     // Reached when the model answered in prose instead of calling the tool.
@@ -763,17 +908,42 @@ fn extract_tool_input(response: &serde_json::Value) -> Result<serde_json::Value>
 
 /// Deserialize the tool arguments into the quiz.
 ///
-/// Note what is *not* logged on failure. The response contains the answer key,
-/// so an error logs the serde message — which names a path and a position, not
-/// content — and nothing else.
-fn parse(input: serde_json::Value) -> Result<GeneratedQuiz> {
+/// # Why the serde message is split in two
+///
+/// This used to log and surface `{e}` directly, on the stated assumption that a
+/// serde message "names a path and a position, not content". **That is false for
+/// `invalid type`,** which quotes the offending value — and when the offending
+/// value is a whole `choice_questions` array emitted as a string, the quoted
+/// value is the quiz, options and answers included.
+///
+/// The observed instance: `invalid type: string "[\n {\n \"id\": \"c1\", ...`
+/// carrying the full text of the questions. That string reached a log group and
+/// a document's `error` field, where the browser rendered it. Rule 2 in the
+/// module header says the full response is never logged; this was the hole in it.
+///
+/// So `public` carries serde's structural coordinates — category, line, column —
+/// which are the actionable part and name nothing. `detail` carries the full
+/// message and goes only to the model, which wrote it in the first place.
+fn parse(input: serde_json::Value) -> std::result::Result<GeneratedQuiz, Rejection> {
     serde_json::from_value(input).map_err(|e| {
-        // `e` here can name an unknown enum variant, which is the closed
-        // vocabulary firing. That is worth surfacing to the reader, because
-        // "the model used a skill that does not exist" is a real and
-        // actionable explanation for a failed document.
-        tracing::warn!(error = %e, "model tool call failed validation");
-        Error::Invalid(format!("the model returned unusable output: {e}"))
+        // `classify` distinguishes data (the shape was wrong) from syntax and
+        // EOF, which is the part worth knowing without reading the value. An
+        // unknown enum variant — the closed skill vocabulary firing — classifies
+        // as Data, and is the common case worth recognising here.
+        let kind = match e.classify() {
+            serde_json::error::Category::Data => "a field had the wrong type or an unknown value",
+            serde_json::error::Category::Syntax => "the JSON was malformed",
+            serde_json::error::Category::Eof => "the JSON ended early",
+            serde_json::error::Category::Io => "the JSON could not be read",
+        };
+        Rejection {
+            public: format!(
+                "the model returned unusable output: {kind} (line {}, column {})",
+                e.line(),
+                e.column()
+            ),
+            detail: e.to_string(),
+        }
     })
 }
 
@@ -1062,7 +1232,7 @@ mod tests {
     }
 
     fn check(value: serde_json::Value) -> Result<Vec<Question>> {
-        let quiz = parse(value)?;
+        let quiz = parse(value).map_err(|r| Error::Invalid(r.public))?;
         let topics = tags::normalise(&quiz.topics);
         validate(&quiz.title, &topics, &quiz)?;
         Ok(assemble(quiz, "doc-under-test"))
@@ -1152,7 +1322,7 @@ mod tests {
     fn an_invented_skill_is_rejected_at_parse_time() {
         let mut quiz = good();
         quiz["choice_questions"][0]["skill"] = json!("macroeconomic");
-        assert!(matches!(parse(quiz), Err(Error::Invalid(_))));
+        assert!(parse(quiz).is_err());
     }
 
     /// **The rule that keeps invented statistics out of the option lists.**
@@ -1178,7 +1348,7 @@ mod tests {
     fn an_answer_outside_a_to_d_is_rejected_at_parse_time() {
         let mut quiz = good();
         quiz["choice_questions"][0]["answer"] = json!("e");
-        assert!(matches!(parse(quiz), Err(Error::Invalid(_))));
+        assert!(parse(quiz).is_err());
     }
 
     #[test]
@@ -1327,6 +1497,7 @@ mod tests {
             model_id: "anthropic.claude-sonnet-5-5",
             effort: "high",
             max_tokens: 16000,
+            repair_attempts: 1,
             known_topics: &[],
             seed: "doc",
             pdf: b"%PDF-1.7".to_vec(),
@@ -1374,7 +1545,7 @@ mod tests {
     #[test]
     fn refusal_and_truncation_are_reported_as_themselves() {
         let refusal = json!({"stop_reason": "refusal", "content": []});
-        match extract_tool_input(&refusal) {
+        match extract_tool_call(&refusal) {
             Err(Error::Invalid(m)) => assert!(m.contains("declined")),
             other => panic!("expected an Invalid refusal, got {other:?}"),
         }
@@ -1383,7 +1554,7 @@ mod tests {
         // configuration fault, and marking the document failed would blame it
         // for something it did not do.
         let truncated = json!({"stop_reason": "max_tokens", "content": []});
-        match extract_tool_input(&truncated) {
+        match extract_tool_call(&truncated) {
             Err(Error::Aws(m)) => assert!(m.contains("max_tokens")),
             other => panic!("expected an Aws truncation error, got {other:?}"),
         }
@@ -1398,10 +1569,85 @@ mod tests {
             "stop_reason": "tool_use",
             "content": [
                 {"type": "thinking", "thinking": "", "signature": "abc"},
-                {"type": "tool_use", "name": TOOL_NAME, "input": {"title": "t"}},
+                {"type": "tool_use", "id": "toolu_1", "name": TOOL_NAME, "input": {"title": "t"}},
             ],
         });
-        let input = extract_tool_input(&response).expect("tool call should be found");
-        assert_eq!(input["title"], "t");
+        let call = extract_tool_call(&response).expect("tool call should be found");
+        assert_eq!(call.id, "toolu_1");
+        assert_eq!(call.input["title"], "t");
+    }
+
+    /// The exact failure seen in production: a whole array emitted as a string
+    /// containing JSON. serde quotes the offending value, so the quiz — options
+    /// and answers — is inside the message.
+    ///
+    /// This is the regression test for rule 2 in the module header. The public
+    /// half of the rejection is what reaches a log group and a document's
+    /// `error` field, and it must not carry any of that text.
+    #[test]
+    fn a_parse_failure_does_not_leak_the_quiz_into_the_public_message() {
+        let secret = "reconciliation theatre is the calculated performance";
+        let input = json!({
+            "title": "A Report",
+            "topics": ["housing"],
+            // The array arrives as a string, which is the observed fault.
+            "choice_questions": format!("[{{\"id\":\"c1\",\"prompt\":\"{secret}\"}}]"),
+            "numeric_questions": [],
+        });
+
+        let rejection = parse(input).expect_err("a stringified array must be rejected");
+
+        assert!(
+            !rejection.public.contains(secret),
+            "public message leaked model content: {}",
+            rejection.public
+        );
+        assert!(rejection.public.contains("wrong type"));
+        assert!(rejection.public.contains("line"));
+        // The model is told what it actually did, since it wrote the thing.
+        assert!(rejection.detail.contains("invalid type"));
+    }
+
+    /// A repair turn has to be a correction rather than a fresh attempt, which
+    /// means the rejected call is echoed and answered by id.
+    #[test]
+    fn a_repair_turn_echoes_the_rejected_call_and_answers_it() {
+        let mut body = json!({"messages": [{"role": "user", "content": []}]});
+        let response = json!({
+            "content": [
+                {"type": "thinking", "thinking": "", "signature": "sig-abc"},
+                {"type": "tool_use", "id": "toolu_9", "name": TOOL_NAME, "input": {}},
+            ],
+        });
+
+        append_repair_turn(&mut body, &response, "toolu_9", "7 questions, expected 7").unwrap();
+
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3, "original, assistant echo, tool_result");
+
+        // Echoed verbatim: the signature has to survive, because a thinking block
+        // is signed over the conversation and an edited replay is a 400.
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"], response["content"]);
+        assert_eq!(messages[1]["content"][0]["signature"], "sig-abc");
+
+        let result = &messages[2]["content"][0];
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(result["type"], "tool_result");
+        assert_eq!(result["tool_use_id"], "toolu_9");
+        // Without is_error the model treats the text as data to incorporate
+        // rather than a fault to fix.
+        assert_eq!(result["is_error"], true);
+        assert!(result["content"].as_str().unwrap().contains("expected 7"));
+    }
+
+    /// Truncation runs over model prose, which is full of multi-byte characters.
+    /// `&s[..n]` through one is a panic in the error path.
+    #[test]
+    fn truncation_does_not_split_a_character() {
+        let s = "— ".repeat(400);
+        let out = truncate(&s, 601);
+        assert!(out.len() <= 605, "unexpectedly long: {}", out.len());
+        assert!(out.ends_with('…'));
     }
 }
