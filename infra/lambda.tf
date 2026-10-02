@@ -37,33 +37,33 @@ locals {
   # below for the ceremony.
   registration_token_parameter = "/${var.project}/secret/registration-token"
 
-  # Bedrock's inference-profile indirection needs permission on BOTH the profile
-  # ARN and the underlying foundation-model ARN in every region the profile can
-  # route to — hence the wildcard region, which is not laziness. Granting only
-  # the profile produces an AccessDeniedException naming a model ARN you never
-  # wrote down, which is a miserable thing to debug.
+  # Inference-profile ARNs are gone with Converse: this endpoint is named by
+  # region in its hostname and takes a bare model ID, so there is no profile to
+  # authorize alongside the foundation model.
   #
   # Kept in step with bedrock_allowed_models in bootstrap/variables.tf. The
-  # boundary caps these roles at that list regardless, so widening here alone
+  # boundary caps this role at that list regardless, so widening here alone
   # achieves nothing except misleading the next reader — and narrowing here is
-  # what actually reduces what the function can invoke.
+  # what actually reduces what the function can reach.
   #
-  # Sonnet is the model in use; the Nova entries are kept so that reverting
-  # var.bedrock_model_id to the in-region profile does not also require an IAM
-  # change. Opus is absent from the bootstrap allowlist and so cannot be
-  # reached from here whatever this list says.
+  # **The resource shape for `bedrock-mantle:CreateInference` is not documented.**
+  # AWS states the action but gives no resource type for it, and
+  # `accessanalyzer validate-policy` confirms the action name while declining to
+  # check action/resource compatibility at all (it passes `s3:GetObject` on a
+  # Bedrock ARN without complaint). So this grants the foundation-model ARN on the
+  # reasoning that the inference target is still a foundation model, and it fails
+  # closed if that is wrong: the first generation returns AccessDenied naming the
+  # resource it wanted, which is the information needed to correct this list. If
+  # that happens, widen to "*" here — the model stays constrained by
+  # var.bedrock_model_id and by the boundary either way.
   bedrock_model_patterns = [
     "anthropic.claude-sonnet-*",
-    "amazon.nova-lite-*",
-    "amazon.nova-2-lite-*",
   ]
 
-  bedrock_model_arns = flatten([
-    for pattern in local.bedrock_model_patterns : [
-      "arn:${local.partition}:bedrock:*::foundation-model/${pattern}",
-      "arn:${local.partition}:bedrock:*:${local.account_id}:inference-profile/*${pattern}",
-    ]
-  ])
+  bedrock_model_arns = [
+    for pattern in local.bedrock_model_patterns :
+    "arn:${local.partition}:bedrock:*::foundation-model/${pattern}"
+  ]
 }
 
 # ---------------------------------------------------------------------------
@@ -295,12 +295,11 @@ data "aws_iam_policy_document" "generate" {
   statement {
     sid    = "InvokeApprovedModels"
     effect = "Allow"
-    actions = [
-      "bedrock:InvokeModel",
-      "bedrock:InvokeModelWithResponseStream",
-      "bedrock:Converse",
-      "bedrock:ConverseStream",
-    ]
+    # One action, not four. The Messages-API endpoint signs and authorizes as its
+    # own service: `bedrock-mantle`, not `bedrock`. Streaming is a field in the
+    # request body here rather than a separate operation, so there is no
+    # WithResponseStream counterpart to grant.
+    actions   = ["bedrock-mantle:CreateInference"]
     resources = local.bedrock_model_arns
   }
 
@@ -457,8 +456,12 @@ resource "aws_lambda_function" "generate" {
       TABLE_NAME  = aws_dynamodb_table.app.name
       DOCS_BUCKET = aws_s3_bucket.docs.id
 
-      MODEL_ID               = var.bedrock_model_id
-      THINKING_BUDGET_TOKENS = tostring(var.bedrock_thinking_budget_tokens)
+      MODEL_ID = var.bedrock_model_id
+      # Where the request is sent, which is not where this function runs. There
+      # is no bedrock-mantle endpoint in Canada — see var.bedrock_region.
+      BEDROCK_REGION    = var.bedrock_region
+      EFFORT            = var.bedrock_effort
+      MAX_OUTPUT_TOKENS = tostring(var.bedrock_max_output_tokens)
 
       MAX_PAGES          = tostring(var.max_pages)
       MAX_DOCUMENT_BYTES = tostring(var.max_upload_bytes)

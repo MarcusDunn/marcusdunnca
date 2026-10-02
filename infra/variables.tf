@@ -67,61 +67,103 @@ variable "webauthn_credentials" {
 
 variable "bedrock_model_id" {
   description = <<-EOT
-    Model the generate function invokes.
+    Model the generate function runs inference on.
 
-    **This is a `us.` inference profile, so document text leaves Canada.**
-    That was a deliberate trade, not an oversight. Nova Lite carried a genuine
-    in-region (`ca.`) profile and was chosen for it, but measured on a real
-    document it produced questions answerable without reading the document,
-    exposes no reasoning mode at any price, and still emitted malformed
-    questions under a JSON Schema. Sonnet with a thinking budget did not.
+    A bare model ID, with no `us.` or `global.` prefix: inference-profile
+    prefixes belong to the Converse and InvokeModel integration this moved off.
+    Here the region lives in the endpoint hostname — see bedrock_region.
 
-    Reverting to in-region residency means setting this back to
-    "ca.amazon.nova-lite-v1:0" and accepting those question-quality losses;
-    nothing else in the stack depends on the choice.
+    **Model access is granted per model in the Bedrock console and is not
+    managed here.** A model this account has not been granted returns 403 with
+    "not available for this account", which reads exactly like an IAM problem
+    until you look at the response body. At the time of writing this account has
+    access to Sonnet 4.6 and nothing newer, so this value does not yet work —
+    enabling it on the Model access page is a prerequisite, not a formality.
 
-    **Any cross-region profile depends on the Bedrock exemption in
-    bootstrap/iam.tf's global_service_actions.** A cross-region inference
-    profile authorizes each of its routing targets with `aws:RequestedRegion`
-    set to *that target's* region, not the caller's: `us.` routes through
-    us-east-1, us-east-2, ca-central-1 and us-west-2, so a call made to the
-    ca-central-1 endpoint is authorized four times, twice against regions the
-    region lock does not allow. Every Sonnet profile does this, and a `global.`
-    profile additionally routes to a region-less ARN authorized with no
-    `aws:RequestedRegion` at all.
-
-    Without that exemption every generation fails with AccessDenied naming an
-    explicit deny in the permissions boundary — which is what happened, twice,
-    before it was added.
-
-    Cost is roughly 7c per document against Nova's 0.1c — bounded by
-    daily_document_cap and by the budget's spend brake, both unchanged.
+    Lineage, since it is the third model here: Nova Lite was first and was the
+    only one with a genuine in-region (`ca.`) profile, dropped because on a real
+    document it produced questions answerable without reading it, exposes no
+    reasoning mode at any price, and emitted malformed questions even under a
+    JSON Schema. Sonnet 4.6 with a thinking budget replaced it. Sonnet 5.5
+    replaced that, because the Messages-API endpoint does not serve 4.6.
   EOT
   type        = string
-  default     = "us.anthropic.claude-sonnet-4-6"
+  default     = "anthropic.claude-sonnet-5-5"
 }
 
-variable "bedrock_thinking_budget_tokens" {
+variable "bedrock_region" {
   description = <<-EOT
-    Tokens the model may spend reasoning before it answers. Zero disables it.
+    Region whose bedrock-mantle endpoint receives the request.
+
+    **Not this stack's region, and that is the uncomfortable part.** There is no
+    bedrock-mantle endpoint in Canada: the service exists in US, EU,
+    Asia-Pacific and South American regions only, and neither ca-central-1 nor
+    ca-west-1 resolves. So where the previous integration called a ca-central-1
+    endpoint and let a `us.` profile route the inference onward, this call leaves
+    Canada itself.
+
+    Document text therefore leaves the country either way — it did before too —
+    but the thing crossing the border is now the request rather than an internal
+    routing hop, and the region lock in bootstrap/iam.tf had to be loosened to
+    permit it. That exemption, and what it costs, is documented there.
+
+    EU rather than US on the reasoning that if the data is leaving regardless, it
+    may as well land where the statutory floor under it is higher.
+
+    Valid values are the bedrock-mantle regions. In the EU: eu-west-1, eu-west-2,
+    eu-central-1, eu-north-1, eu-south-1. Note eu-west-3 is NOT among them.
+  EOT
+  type        = string
+  default     = "eu-west-1"
+}
+
+variable "bedrock_effort" {
+  description = <<-EOT
+    How hard the model may think before answering.
 
     This is the lever that moves questions from "a well-read person could
     answer this" to "you had to have opened the document", which is the only
-    property that makes the quiz worth taking. It bills as output tokens.
+    property that makes the quiz worth taking. Thinking bills as output tokens.
 
-    Anthropic models only. The Nova family rejects the request field outright,
-    so setting this while pointing bedrock_model_id at Nova fails every
-    generation — the handler sends the field whenever this is non-zero.
+    It replaced a 3000-token thinking budget, which this model rejects with a
+    400. The two do not convert — a budget bought tokens, a level buys a
+    disposition — so `high` here is the model's own default and a starting
+    point, not a measured finding. Settling it means running the reference
+    document at two or three levels and comparing the questions.
   EOT
-  type        = number
-  default     = 3000
+  type        = string
+  default     = "high"
 
   validation {
-    # Below about a thousand the model cannot finish a thought and the budget is
-    # spent for nothing; the upper bound is a cost guard, since these are output
-    # tokens at Sonnet's rate.
-    condition     = var.bedrock_thinking_budget_tokens == 0 || (var.bedrock_thinking_budget_tokens >= 1024 && var.bedrock_thinking_budget_tokens <= 16000)
-    error_message = "Thinking budget must be 0 (disabled) or between 1024 and 16000 tokens."
+    condition     = contains(["low", "medium", "high", "xhigh", "max"], var.bedrock_effort)
+    error_message = "Effort must be one of low, medium, high, xhigh, max."
+  }
+}
+
+variable "bedrock_max_output_tokens" {
+  description = <<-EOT
+    Ceiling on thinking plus answer, in tokens.
+
+    Was derived as thinking_budget + 4096, a formula that only made sense while
+    the budget was a number this stack chose. Adaptive thinking has no such
+    number, so this is a flat value and the only thing standing between a model
+    that starts looping and the budget's spend brake.
+
+    Ten questions with four options and an explanation each runs to roughly 2k
+    tokens of answer. The rest is headroom for thinking at the configured effort,
+    plus the ~30% more tokens this model's tokenizer produces for the same text.
+
+    Too low shows up as a truncated tool call rather than as anything naming the
+    real cause, so the handler checks for it and says so explicitly.
+  EOT
+  type        = number
+  default     = 16000
+
+  validation {
+    # The floor leaves room for the answer once thinking has taken its share; the
+    # ceiling is this model's documented maximum output.
+    condition     = var.bedrock_max_output_tokens >= 8192 && var.bedrock_max_output_tokens <= 128000
+    error_message = "Max output tokens must be between 8192 and 128000."
   }
 }
 

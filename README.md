@@ -401,22 +401,38 @@ Three layers, because Bedrock and CloudFront are metered and the region lock
 does not bound either:
 
 1. **Model scoping.** There is no IAM condition key for token count, so *which
-   model* is the only lever IAM offers. `bedrock:InvokeModel` is scoped by
-   model-ID pattern (`bedrock_allowed_models`) to Nova Lite and the Claude
-   Sonnet/Haiku families — Nova is what the application actually uses. Opus is `implicitDeny` for both the apply role and any
-   boundary-capped runtime role.
+   model* is the only lever IAM offers. `bedrock-mantle:CreateInference` is
+   scoped by model-ID pattern (`bedrock_allowed_models`) to the Claude
+   Sonnet and Haiku families. Opus and Fable are `implicitDeny` for both the
+   apply role and any boundary-capped runtime role.
 
-   The app uses `ca.amazon.nova-lite-v1:0` — roughly a twentieth of Sonnet's
-   token price and, uniquely among available models, a genuine **in-region**
-   inference profile. Every Claude profile in `ca-central-1` is `us.`- or
-   `global.`-prefixed and routes outside Canada. Verified that Nova Lite reads
-   PDFs via Converse document blocks; `inputModalities` does not list
-   `DOCUMENT` for *any* of these models, because that field describes
-   InvokeModel rather than Converse.
+   The app uses `anthropic.claude-sonnet-5-5` on Bedrock's **Messages-API
+   endpoint** (`bedrock-mantle`), not the Converse API. Three consequences worth
+   knowing:
+
+   - **The service prefix is `bedrock-mantle`, not `bedrock`.** IAM matches the
+     literal prefix, so a policy written against `bedrock:*` neither grants nor
+     denies this. The spend brake lists both for exactly that reason.
+   - **There is no `bedrock-mantle` endpoint in Canada.** It exists in US, EU,
+     Asia-Pacific and South American regions only; `ca-central-1` and
+     `ca-west-1` have no DNS for it. The function calls `eu-west-1` directly
+     (`bedrock_region`), so document text leaves the country as the request
+     itself rather than as an internal routing hop. The region lock in
+     `bootstrap/iam.tf` was loosened to permit this, and that comment records
+     what the loosening costs.
+   - **Model access is granted per model in the Bedrock console**, outside this
+     repo. An ungranted model returns 403 "not available for this account",
+     which reads like an IAM fault until you read the response body.
+
+   This replaced `us.anthropic.claude-sonnet-4-6` on Converse, which in turn
+   replaced `ca.amazon.nova-lite-v1:0` — the one model with a genuine in-region
+   profile, dropped for question quality. Converse is not an option for current
+   models: its model table stops at Sonnet 4.6.
 2. **Alerting.** $10 budget at 80/100% actual and 100% forecast, plus a Cost
    Anomaly subscription at $1 that publishes immediately via SNS.
 3. **An automated circuit breaker.** At 90% of budget, AWS Budgets itself
-   attaches `marcusdunnca-spend-brake` to both CI roles, denying Bedrock and
+   attaches `marcusdunnca-spend-brake` to both CI roles, denying both Bedrock
+   service prefixes (`bedrock:*` and `bedrock-mantle:*`) and
    further resource creation. No human, no Lambda, no dependency on anything in
    this repo still working. Free — the first two action-enabled budgets cost
    nothing.

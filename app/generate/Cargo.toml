@@ -10,13 +10,22 @@ publish.workspace = true
 trainer-core = { version = "0.1.0", path = "../core" }
 
 aws-config = { version = "1.11.0", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client"] }
-aws-sdk-bedrockruntime = { version = "1.142.0", default-features = false, features = ["rt-tokio", "default-https-client"] }
 aws-sdk-dynamodb = { version = "1.123.0", default-features = false, features = ["rt-tokio", "default-https-client"] }
 aws-sdk-s3 = { version = "1.144.0", default-features = false, features = ["rt-tokio", "default-https-client", "http-1x"] }
-# `Document`, the untyped JSON the Converse API uses for a tool's input schema
-# and for additionalModelRequestFields. A transitive dependency of the SDK
-# already, named here because bedrock.rs constructs it directly.
-aws-smithy-types = "1.4.0"
+# Bedrock's Messages-API endpoint has no generated SDK crate and Anthropic ships
+# no Rust SDK, so the call is signed and posted by hand. Both of these are
+# already in the tree as transitive dependencies of aws-config — named here
+# because mantle.rs uses them directly, not because they are new weight.
+aws-credential-types = "1.3.0"
+aws-sigv4 = "1.5.1"
+# The PDF goes to this endpoint base64-encoded in a `document` content block.
+# Converse took raw bytes in a Blob and did this itself.
+base64 = "0.21.7"
+# The one genuinely new dependency. hyper and rustls are already compiled in
+# under aws-config's default-https-client, so this is a thin layer over them
+# rather than a second TLS stack — which matters because the release profile here
+# is tuned for cold-start binary size, not throughput.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 # Only the S3 event shape. The default feature set of aws_lambda_events compiles
 # every AWS event type there is, which is a lot of code for one struct.
 aws_lambda_events = { version = "1.2.0", default-features = false, features = ["s3"] }

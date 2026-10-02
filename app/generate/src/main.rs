@@ -12,6 +12,7 @@
 //! idle evening of tapping into forty Bedrock invocations.
 
 mod bedrock;
+mod mantle;
 mod pdf;
 
 use aws_lambda_events::event::s3::S3Event;
@@ -24,34 +25,62 @@ use trainer_core::model::DocStatus;
 use trainer_core::store::Store;
 use trainer_core::tags::TAG_VERSION;
 
-/// Claude Sonnet 4.6 on the US cross-region inference profile.
+/// Claude Sonnet 5.5 on Bedrock's Messages-API endpoint.
 ///
-/// This replaced Nova Lite, and the tradeoff was made knowingly: Nova Lite was
-/// the only model with a genuine in-region (`ca.`) profile, so document text
-/// stayed in ca-central-1. A `us.` profile routes outside Canada. The reason it
-/// is worth it is question quality — measured on the same document, Nova
-/// produced questions answerable from general knowledge, no reasoning mode is
-/// available on the Nova family at any price, and structural failures persisted
-/// even under a JSON Schema. Sonnet with a thinking budget produced ten
-/// schema-clean questions anchored to the document's own tables.
+/// No `us.` or `global.` prefix: inference-profile prefixes belong to the
+/// Converse and InvokeModel integration this moved off. Here the region is in
+/// the endpoint hostname (see [`BEDROCK_REGION`]) and the model is named plainly.
 ///
-/// Any cross-region profile — `us.` or `global.` — depends on the Bedrock
-/// exemption in the permissions boundary's region lock, because each routing
-/// target is authorized with `aws:RequestedRegion` set to that target's region
-/// rather than the caller's. See `global_service_actions` in bootstrap/iam.tf.
+/// The model lineage: Nova Lite was first, and was the only model with a genuine
+/// in-region (`ca.`) profile, so document text stayed in ca-central-1. It was
+/// dropped for question quality — measured on the same document it produced
+/// questions answerable from general knowledge, offers no reasoning mode at any
+/// price, and emitted malformed questions even under a JSON Schema. Sonnet 4.6
+/// with a thinking budget replaced it; Sonnet 5.5 replaced that, because the
+/// Messages-API endpoint does not serve 4.6 at all.
 ///
-/// Roughly 7c per document against Nova's 0.1c. At a handful of documents a
-/// month that is inside the noise of the budget.
-const DEFAULT_MODEL_ID: &str = "us.anthropic.claude-sonnet-4-6";
+/// **Access is granted per model in the Bedrock console.** A model this account
+/// has not been granted returns 403 with "not available for this account",
+/// which is indistinguishable from an IAM problem until you read the body.
+const DEFAULT_MODEL_ID: &str = "anthropic.claude-sonnet-5-5";
 
-/// Thinking budget, in tokens. Zero disables it.
+/// Region whose `bedrock-mantle` endpoint receives the request.
+///
+/// **Not this function's region, and not optional.** There is no
+/// `bedrock-mantle` endpoint in Canada — it resolves in US and EU regions only.
+/// So where the previous integration called a ca-central-1 endpoint and let a
+/// `us.` profile route the inference onward, this call leaves Canada itself.
+///
+/// EU rather than US on the reasoning that if the data is leaving the country
+/// regardless, it may as well leave to the jurisdiction with the stronger
+/// statutory floor under it.
+const DEFAULT_BEDROCK_REGION: &str = "eu-west-1";
+
+/// How hard the model may think: `low`, `medium`, `high`, `xhigh` or `max`.
 ///
 /// Reasoning is what moves questions from "a well-read person could answer
 /// this" to "you had to have opened the document" — on the reference document
 /// it was the difference between defining `bond yields` in the abstract and
-/// asking what this report says pent-up demand did in Ontario. It costs output
-/// tokens, hence configurable rather than hardcoded.
-const DEFAULT_THINKING_BUDGET_TOKENS: u32 = 3000;
+/// asking what this report says pent-up demand did in Ontario.
+///
+/// This replaced a 3000-token thinking budget, which the model rejects with a
+/// 400. The two do not convert: a budget bought tokens, a level buys a
+/// disposition. `high` is the model's own default and the starting point, not a
+/// finding — the level that reproduces the old question quality has to be
+/// settled by running the reference document at several and comparing.
+const DEFAULT_EFFORT: &str = "high";
+
+/// Ceiling on thinking plus answer, in tokens.
+///
+/// Was `thinking_budget + 4096` — a formula that only made sense while the
+/// budget was a number this code chose. Adaptive thinking has no such number, so
+/// this is now a flat value and the only thing standing between a looping model
+/// and the budget's spend brake.
+///
+/// Ten questions with four options and an explanation each runs to roughly 2k
+/// tokens of answer. The rest is headroom for thinking at `high`, plus the ~30%
+/// more tokens this model's tokenizer produces for the same text.
+const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 16000;
 
 /// Page ceiling. A hundred pages is already a long read; beyond that the
 /// generation is expensive and the resulting ten questions cover so little of
@@ -85,7 +114,7 @@ const DEFAULT_MAX_DOCUMENT_BYTES: i64 = 4_500_000;
 struct Config {
     store: Store,
     s3: aws_sdk_s3::Client,
-    bedrock: aws_sdk_bedrockruntime::Client,
+    bedrock: mantle::Client,
     /// Read from configuration, never from the event. The event's bucket name
     /// is attacker-influenced in the general case — any bucket can be
     /// configured to notify any function it has permission to — and trusting it
@@ -93,7 +122,8 @@ struct Config {
     /// means the function reads from exactly one place.
     docs_bucket: String,
     model_id: String,
-    thinking_budget_tokens: u32,
+    effort: String,
+    max_output_tokens: u32,
     max_pages: usize,
     daily_cap: u32,
     max_document_bytes: i64,
@@ -110,13 +140,14 @@ impl Config {
                 config::require("TABLE_NAME")?,
             ),
             s3: aws_sdk_s3::Client::new(&sdk),
-            bedrock: aws_sdk_bedrockruntime::Client::new(&sdk),
+            bedrock: mantle::Client::new(
+                &sdk,
+                config::parse_or("BEDROCK_REGION", DEFAULT_BEDROCK_REGION.to_string())?,
+            )?,
             docs_bucket: config::require("DOCS_BUCKET")?,
             model_id: config::parse_or("MODEL_ID", DEFAULT_MODEL_ID.to_string())?,
-            thinking_budget_tokens: config::parse_or(
-                "THINKING_BUDGET_TOKENS",
-                DEFAULT_THINKING_BUDGET_TOKENS,
-            )?,
+            effort: config::parse_or("EFFORT", DEFAULT_EFFORT.to_string())?,
+            max_output_tokens: config::parse_or("MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS)?,
             max_pages: config::parse_or("MAX_PAGES", DEFAULT_MAX_PAGES)?,
             daily_cap: config::parse_or("DAILY_DOCUMENT_CAP", DEFAULT_DAILY_CAP)?,
             max_document_bytes: config::parse_or("MAX_DOCUMENT_BYTES", DEFAULT_MAX_DOCUMENT_BYTES)?,
@@ -418,7 +449,8 @@ async fn process(config: &Config, doc_id: &str) -> Result<()> {
         &config.bedrock,
         bedrock::Request {
             model_id: &config.model_id,
-            thinking_budget_tokens: config.thinking_budget_tokens,
+            effort: &config.effort,
+            max_tokens: config.max_output_tokens,
             known_topics: &known_topics,
             // The document id, so the option shuffle is reproducible per
             // document rather than per invocation.
