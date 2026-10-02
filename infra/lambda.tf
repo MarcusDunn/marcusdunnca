@@ -37,33 +37,32 @@ locals {
   # below for the ceremony.
   registration_token_parameter = "/${var.project}/secret/registration-token"
 
-  # Inference-profile ARNs are gone with Converse: this endpoint is named by
-  # region in its hostname and takes a bare model ID, so there is no profile to
-  # authorize alongside the foundation model.
+  # Bedrock's inference-profile indirection needs permission on BOTH the profile
+  # ARN and the underlying foundation-model ARN in every region the profile can
+  # route to — hence the wildcard region, which is not laziness. Granting only
+  # the profile produces an AccessDeniedException naming a model ARN you never
+  # wrote down, which is a miserable thing to debug.
+  #
+  # This applies again, and did not for a moment. The native Messages API was
+  # briefly pointed at `bedrock-mantle`, which takes a bare model ID and needed
+  # no profile — but that endpoint serves this model in us-gov-west-1 alone. On
+  # `bedrock-runtime` the model is unreachable without a profile prefix, because
+  # in-region inference is unavailable for it in every region.
   #
   # Kept in step with bedrock_allowed_models in bootstrap/variables.tf. The
   # boundary caps this role at that list regardless, so widening here alone
   # achieves nothing except misleading the next reader — and narrowing here is
-  # what actually reduces what the function can reach.
-  #
-  # **The resource shape for `bedrock-mantle:CreateInference` is not documented.**
-  # AWS states the action but gives no resource type for it, and
-  # `accessanalyzer validate-policy` confirms the action name while declining to
-  # check action/resource compatibility at all (it passes `s3:GetObject` on a
-  # Bedrock ARN without complaint). So this grants the foundation-model ARN on the
-  # reasoning that the inference target is still a foundation model, and it fails
-  # closed if that is wrong: the first generation returns AccessDenied naming the
-  # resource it wanted, which is the information needed to correct this list. If
-  # that happens, widen to "*" here — the model stays constrained by
-  # var.bedrock_model_id and by the boundary either way.
+  # what actually reduces what the function can invoke.
   bedrock_model_patterns = [
     "anthropic.claude-sonnet-*",
   ]
 
-  bedrock_model_arns = [
-    for pattern in local.bedrock_model_patterns :
-    "arn:${local.partition}:bedrock:*::foundation-model/${pattern}"
-  ]
+  bedrock_model_arns = flatten([
+    for pattern in local.bedrock_model_patterns : [
+      "arn:${local.partition}:bedrock:*::foundation-model/${pattern}",
+      "arn:${local.partition}:bedrock:*:${local.account_id}:inference-profile/*${pattern}",
+    ]
+  ])
 }
 
 # ---------------------------------------------------------------------------
@@ -295,11 +294,18 @@ data "aws_iam_policy_document" "generate" {
   statement {
     sid    = "InvokeApprovedModels"
     effect = "Allow"
-    # One action, not four. The Messages-API endpoint signs and authorizes as its
-    # own service: `bedrock-mantle`, not `bedrock`. Streaming is a field in the
-    # request body here rather than a separate operation, so there is no
-    # WithResponseStream counterpart to grant.
-    actions   = ["bedrock-mantle:CreateInference"]
+    # `bedrock:`, not `bedrock-mantle:`. The native Messages API is served on the
+    # `bedrock-runtime` endpoint, which signs and authorizes as `bedrock` exactly
+    # as Converse did — the service prefix follows the endpoint, not the request
+    # shape. A policy written against `bedrock-mantle` authorizes nothing here.
+    #
+    # Converse and ConverseStream are gone because nothing calls them now. The
+    # streaming variant is kept: it costs nothing to hold and is the difference
+    # between adding `"stream": true` and debugging an AccessDenied.
+    actions = [
+      "bedrock:InvokeModel",
+      "bedrock:InvokeModelWithResponseStream",
+    ]
     resources = local.bedrock_model_arns
   }
 

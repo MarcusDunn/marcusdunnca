@@ -12,7 +12,7 @@
 //! idle evening of tapping into forty Bedrock invocations.
 
 mod bedrock;
-mod mantle;
+mod messages;
 mod pdf;
 
 use aws_lambda_events::event::s3::S3Event;
@@ -25,35 +25,46 @@ use trainer_core::model::DocStatus;
 use trainer_core::store::Store;
 use trainer_core::tags::TAG_VERSION;
 
-/// Claude Sonnet 5.5 on Bedrock's Messages-API endpoint.
+/// Claude Sonnet 5.5, named by EU geographic inference profile.
 ///
-/// No `us.` or `global.` prefix: inference-profile prefixes belong to the
-/// Converse and InvokeModel integration this moved off. Here the region is in
-/// the endpoint hostname (see [`BEDROCK_REGION`]) and the model is named plainly.
+/// **The prefix is not decoration and is not optional.** In-region inference is
+/// unavailable for this model in every region, so the bare
+/// `anthropic.claude-sonnet-5-5` is rejected; a profile prefix is required, and
+/// which one decides where the document may travel:
+///
+///   * `eu.` — data stays within EU regions. What this uses.
+///   * `us.` — data stays within US *and Canada* regions.
+///   * `global.` — routes anywhere, no residency constraint.
+///
+/// So residency is a property of this string rather than of
+/// [`DEFAULT_BEDROCK_REGION`], which is only where the request is addressed.
+/// `us.` is the option worth knowing about: it would keep the document inside
+/// North America and let this call go back to a ca-central-1 endpoint.
 ///
 /// The model lineage: Nova Lite was first, and was the only model with a genuine
 /// in-region (`ca.`) profile, so document text stayed in ca-central-1. It was
 /// dropped for question quality — measured on the same document it produced
 /// questions answerable from general knowledge, offers no reasoning mode at any
 /// price, and emitted malformed questions even under a JSON Schema. Sonnet 4.6
-/// with a thinking budget replaced it; Sonnet 5.5 replaced that, because the
-/// Messages-API endpoint does not serve 4.6 at all.
+/// with a thinking budget replaced it, and Sonnet 5.5 replaced that.
 ///
-/// **Access is granted per model in the Bedrock console.** A model this account
-/// has not been granted returns 403 with "not available for this account",
-/// which is indistinguishable from an IAM problem until you read the body.
-const DEFAULT_MODEL_ID: &str = "anthropic.claude-sonnet-5-5";
+/// **Access is granted per model in the Bedrock console, separately from the
+/// marketplace agreement.** An account holding an `AVAILABLE` agreement still
+/// gets 403 "not available for this account" until model access is enabled, and
+/// that 403 is indistinguishable from an IAM failure until you read the body.
+const DEFAULT_MODEL_ID: &str = "eu.anthropic.claude-sonnet-5-5";
 
-/// Region whose `bedrock-mantle` endpoint receives the request.
+/// Region whose `bedrock-runtime` endpoint receives the request.
 ///
-/// **Not this function's region, and not optional.** There is no
-/// `bedrock-mantle` endpoint in Canada — it resolves in US and EU regions only.
-/// So where the previous integration called a ca-central-1 endpoint and let a
-/// `us.` profile route the inference onward, this call leaves Canada itself.
+/// Only the address. Where inference actually runs, and where the document may
+/// travel, is decided by the profile prefix on [`DEFAULT_MODEL_ID`] — so this
+/// being an EU region is for latency and coherence with an `eu.` profile, not
+/// the residency control itself.
 ///
-/// EU rather than US on the reasoning that if the data is leaving the country
-/// regardless, it may as well leave to the jurisdiction with the stronger
-/// statutory floor under it.
+/// ca-central-1 is a valid value and was briefly thought not to be: that was
+/// true of the `bedrock-mantle` endpoint, which has no Canadian presence and
+/// which serves this model in us-gov-west-1 alone. `bedrock-runtime` is in
+/// ca-central-1 and serves this model there through a geographic profile.
 const DEFAULT_BEDROCK_REGION: &str = "eu-west-1";
 
 /// How hard the model may think: `low`, `medium`, `high`, `xhigh` or `max`.
@@ -129,7 +140,7 @@ const DEFAULT_MAX_DOCUMENT_BYTES: i64 = 4_500_000;
 struct Config {
     store: Store,
     s3: aws_sdk_s3::Client,
-    bedrock: mantle::Client,
+    bedrock: messages::Client,
     /// Read from configuration, never from the event. The event's bucket name
     /// is attacker-influenced in the general case — any bucket can be
     /// configured to notify any function it has permission to — and trusting it
@@ -156,7 +167,7 @@ impl Config {
                 config::require("TABLE_NAME")?,
             ),
             s3: aws_sdk_s3::Client::new(&sdk),
-            bedrock: mantle::Client::new(
+            bedrock: messages::Client::new(
                 &sdk,
                 config::parse_or("BEDROCK_REGION", DEFAULT_BEDROCK_REGION.to_string())?,
             )?,

@@ -401,38 +401,48 @@ Three layers, because Bedrock and CloudFront are metered and the region lock
 does not bound either:
 
 1. **Model scoping.** There is no IAM condition key for token count, so *which
-   model* is the only lever IAM offers. `bedrock-mantle:CreateInference` is
-   scoped by model-ID pattern (`bedrock_allowed_models`) to the Claude
-   Sonnet and Haiku families. Opus and Fable are `implicitDeny` for both the
+   model* is the only lever IAM offers. `bedrock:InvokeModel` is scoped by
+   model-ID pattern (`bedrock_allowed_models`) to the Claude Sonnet and Haiku
+   families, on both the foundation-model and inference-profile ARNs. Opus and Fable are `implicitDeny` for both the
    apply role and any boundary-capped runtime role.
 
-   The app uses `anthropic.claude-sonnet-5-5` on Bedrock's **Messages-API
-   endpoint** (`bedrock-mantle`), not the Converse API. Three consequences worth
-   knowing:
+   The app uses `eu.anthropic.claude-sonnet-5-5` through the **native Messages
+   API on the `bedrock-runtime` endpoint** (`/anthropic/v1/messages`), not
+   Converse. Three consequences worth knowing:
 
-   - **The service prefix is `bedrock-mantle`, not `bedrock`.** IAM matches the
-     literal prefix, so a policy written against `bedrock:*` neither grants nor
-     denies this. The spend brake lists both for exactly that reason.
-   - **There is no `bedrock-mantle` endpoint in Canada.** It exists in US, EU,
-     Asia-Pacific and South American regions only; `ca-central-1` and
-     `ca-west-1` have no DNS for it. The function calls `eu-west-1` directly
-     (`bedrock_region`), so document text leaves the country as the request
-     itself rather than as an internal routing hop. The region lock in
-     `bootstrap/iam.tf` was loosened to permit this, and that comment records
-     what the loosening costs.
-   - **Model access is granted per model in the Bedrock console**, outside this
-     repo. An ungranted model returns 403 "not available for this account",
-     which reads like an IAM fault until you read the response body.
+   - **The model must be named by inference profile.** In-region inference is
+     unavailable for this model in every region, so a bare
+     `anthropic.claude-sonnet-5-5` is rejected. The prefix decides data
+     residency: `eu.` keeps data in EU regions, `us.` keeps it in US **and
+     Canada**, `global.` routes anywhere. Residency is therefore a property of
+     `bedrock_model_id`, not of `bedrock_region` — which is only the address the
+     request is sent to.
+   - **Not `bedrock-mantle`.** That endpoint serves the same native Messages API
+     and was tried first, but it serves this model in `us-gov-west-1` alone:
+     every commercial region returns 404 `not_found_error`. The model is listed
+     by `ListFoundationModels` in commercial regions and has a marketplace
+     agreement there, so the control plane and the data plane disagree and only
+     the data plane is honest. `bedrock-runtime` is also what AWS recommends for
+     new applications.
+   - **Model access is granted per model in the Bedrock console**, separately
+     from the marketplace agreement. An account holding an `AVAILABLE` agreement
+     still gets 403 "not available for this account" until access is enabled,
+     and that 403 is indistinguishable from an IAM failure until you read the
+     body.
 
    This replaced `us.anthropic.claude-sonnet-4-6` on Converse, which in turn
    replaced `ca.amazon.nova-lite-v1:0` — the one model with a genuine in-region
-   profile, dropped for question quality. Converse is not an option for current
-   models: its model table stops at Sonnet 4.6.
+   profile, dropped for question quality. Structured outputs are unavailable on
+   Bedrock for this model on either endpoint, so the tool's JSON Schema is
+   advisory and the handler's own validation is the enforcement point; see
+   `bedrock_repair_attempts`.
+
 2. **Alerting.** $10 budget at 80/100% actual and 100% forecast, plus a Cost
    Anomaly subscription at $1 that publishes immediately via SNS.
 3. **An automated circuit breaker.** At 90% of budget, AWS Budgets itself
    attaches `marcusdunnca-spend-brake` to both CI roles, denying both Bedrock
-   service prefixes (`bedrock:*` and `bedrock-mantle:*`) and
+   service prefixes (`bedrock:*` and `bedrock-mantle:*` — IAM matches the
+   literal prefix, so one does not cover the other) and
    further resource creation. No human, no Lambda, no dependency on anything in
    this repo still working. Free — the first two action-enabled budgets cost
    nothing.

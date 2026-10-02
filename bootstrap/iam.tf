@@ -99,27 +99,28 @@ locals {
   # Services whose API calls are not region-scoped, and so must be exempt from
   # the region lock or they would break entirely.
   #
-  # The Bedrock entry is the non-obvious one, and the reason it is here changed
-  # when the generate function moved to Bedrock's Messages-API endpoint.
+  # The Bedrock entries are the non-obvious ones, and they are here because
+  # cross-region inference makes model invocation genuinely multi-region.
   #
-  # It used to be here because cross-region inference made invocation genuinely
-  # multi-region: a `us.` inference profile authorizes each of its routing
-  # targets with `aws:RequestedRegion` set to *that target's* region rather than
-  # the caller's, so one Converse call to the ca-central-1 endpoint was
-  # authorized four times, twice against regions this lock does not allow.
+  # **A cross-region inference profile authorizes each of its routing targets
+  # with `aws:RequestedRegion` set to that target's region, not the caller's.**
+  # A geographic profile such as `eu.anthropic.claude-sonnet-5-5` routes through
+  # every region in its geography, so one call is authorized many times, mostly
+  # against regions this lock does not allow. A `global.` profile is worse: it
+  # adds a *region-less* target, `arn:aws:bedrock:::foundation-model/...`,
+  # authorized with no `aws:RequestedRegion` at all — and `StringNotEquals`
+  # against a missing key is true, so the deny fires on that one too.
   #
-  # **It is now here for a blunter reason: there is no `bedrock-mantle` endpoint
-  # in Canada.** The service exists in US, EU, Asia-Pacific and South American
-  # regions only — `ca-central-1` and `ca-west-1` have no DNS for it. So the
-  # function is not a ca-central-1 caller whose routing happens to leave; it
-  # calls another region directly, and `aws:RequestedRegion` is that region.
+  # **This model cannot be reached without such a profile.** In-region inference
+  # is unavailable for it in every region, so there is no configuration that
+  # keeps a single-region authorization and still runs. The choice was: exempt
+  # these actions, widen the region list for every service, or give up the model.
+  # This is the narrowest of the three.
   #
-  # This is a weaker boundary than what it replaced, and the weakening is the
-  # honest cost of the move: before, the exemption covered a call whose
-  # *endpoint* was in an allowed region. Now it covers a call that is entirely
-  # outside one. The alternatives were to widen `allowed_regions` for every
-  # service, or to stay on Converse and its model list, which stops at Sonnet
-  # 4.6. This is still the narrowest of the three.
+  # The exemption is scoped to the endpoint region being an allowed one, which
+  # is the part a brief detour to `bedrock-mantle` would have given up: that
+  # endpoint has no Canadian presence, so the caller itself would have sat
+  # outside the lock rather than its routing targets.
   #
   # What still constrains this action:
   #   * `bedrock_allowed_model_arns` — sonnet and haiku patterns only. Opus and
@@ -139,11 +140,8 @@ locals {
   # evaluation does. CloudTrail's `errorMessage` names the exact resource and
   # the exact policy, and was the only reliable witness.
   global_service_actions = [
-    # Verified against `accessanalyzer validate-policy`, which rejects an unknown
-    # action in this service and accepts this one. Note the service prefix is
-    # `bedrock-mantle`, not `bedrock` — a policy written against the latter does
-    # not authorize this endpoint at all.
-    "bedrock-mantle:CreateInference",
+    "bedrock:InvokeModel",
+    "bedrock:InvokeModelWithResponseStream",
     "iam:*",
     "sts:*",
     "account:*",
@@ -380,29 +378,26 @@ locals {
   # cost bound rather than a hope. Add a model here deliberately, knowing the
   # price.
   #
-  # One action, under the `bedrock-mantle` service prefix rather than `bedrock`:
-  # the Messages-API endpoint the generate function now uses authorizes as its
-  # own service, and streaming is a body field there rather than a separate
-  # operation. The four `bedrock:` Converse and Invoke actions this replaced
-  # would not authorize it.
+  # Under the `bedrock` prefix: the native Messages API is served on the
+  # `bedrock-runtime` endpoint, which authorizes as `bedrock` exactly as Converse
+  # did. The service prefix follows the endpoint, not the request shape.
+  #
+  # Converse and ConverseStream are dropped because nothing calls them now.
   bedrock_invoke_actions = [
-    "bedrock-mantle:CreateInference",
+    "bedrock:InvokeModel",
+    "bedrock:InvokeModelWithResponseStream",
   ]
 
-  # Foundation-model ARNs only. The inference-profile form went with Converse —
-  # this endpoint takes a bare model ID and carries its region in the hostname,
-  # so there is no profile ARN to authorize alongside the model.
-  #
-  # The wildcard region stays, and now earns its place differently: the endpoint
-  # region is configurable (see var.bedrock_region in infra), so pinning a region
-  # here would turn a config change into an IAM change.
-  #
-  # Note AWS documents no resource type for this action at all. See the longer
-  # note in infra/lambda.tf for why the foundation-model ARN is the chosen guess
-  # and how it fails if that is wrong.
+  # Both the raw foundation-model ARN and the inference-profile form, because
+  # this model is addressed through a profile rather than directly — in-region
+  # inference is unavailable for it everywhere. Both forms are required:
+  # invoking through a profile needs permission on the profile ARN AND on the
+  # underlying foundation-model ARN in every region the profile may route to,
+  # hence the wildcard region.
   bedrock_allowed_model_arns = flatten([
     for pattern in var.bedrock_allowed_models : [
       "arn:${local.partition}:bedrock:*::foundation-model/${pattern}",
+      "arn:${local.partition}:bedrock:*:${local.account_id}:inference-profile/*${pattern}",
     ]
   ])
 

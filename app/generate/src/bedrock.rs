@@ -62,7 +62,7 @@
 //! [`validate`] are what actually hold the shape. That is not a regression; it
 //! is the arrangement this file already had.
 
-use crate::mantle;
+use crate::messages;
 use base64::Engine;
 use serde::Deserialize;
 use serde_json::json;
@@ -558,7 +558,7 @@ pub struct Generated {
 /// takes; Converse accepted a `Blob` and encoded it internally. Encoding inflates
 /// the payload by about a third, which is worth remembering against the
 /// `max_document_bytes` ceiling — that limit is on the file, not on the request.
-pub async fn generate(client: &mantle::Client, req: Request<'_>) -> Result<Generated> {
+pub async fn generate(client: &messages::Client, req: Request<'_>) -> Result<Generated> {
     let mut body = request_body(&req);
 
     // `remaining` counts repair turns left, so the first pass is the original
@@ -1494,7 +1494,7 @@ mod tests {
     #[test]
     fn the_request_omits_what_the_model_rejects() {
         let body = request_body(&Request {
-            model_id: "anthropic.claude-sonnet-5-5",
+            model_id: "eu.anthropic.claude-sonnet-5-5",
             effort: "high",
             max_tokens: 16000,
             repair_attempts: 1,

@@ -1,36 +1,45 @@
 //! Signed HTTP to Claude's Messages API on Amazon Bedrock.
 //!
-//! # Why this exists rather than an AWS SDK client
+//! # Which of Bedrock's several endpoints this is, and why
 //!
-//! This replaced `aws_sdk_bedrockruntime`'s Converse API. The models this app
-//! wants are served by Bedrock's Messages-API endpoint
-//! (`bedrock-mantle.{region}.api.aws`), which speaks Anthropic's native request
-//! shape rather than Converse's normalised one. There is no generated AWS SDK
-//! crate for it and no Anthropic SDK for Rust, so the request is built as JSON,
-//! signed with SigV4, and posted directly.
+//! Bedrock exposes Claude through more than one endpoint, and they do not serve
+//! the same models in the same places. This targets **`bedrock-runtime`**, at
+//! `/anthropic/v1/messages` — the native Messages API shape, on the endpoint AWS
+//! recommends for new applications.
 //!
-//! Two things are gained by moving off Converse. The models are reachable at all
-//! — Converse's model table stops at Sonnet 4.6. And PDFs no longer need
-//! citations switched on to be read visually: Converse forces that coupling,
-//! this endpoint does not, which matters because `figure_recall` questions are
-//! about what a page *looks* like.
+//! The alternative, `bedrock-mantle.{region}.api.aws`, was tried first and is
+//! wrong for this app: it serves Claude Sonnet 5.5 in **`us-gov-west-1` only**.
+//! Every call from a commercial region returns 404 `not_found_error` — not a
+//! permissions failure, the model genuinely is not there. That is worth
+//! recording because the model *is* listed by `ListFoundationModels` in
+//! commercial regions and *does* have a marketplace agreement there, so the
+//! control plane and the data plane disagree and only the data plane is honest.
 //!
-//! One thing is lost: Converse validated the request shape locally, in types.
-//! Here a malformed body is a 400 from the service, so the shapes in
+//! This also replaced `aws_sdk_bedrockruntime`'s Converse API. Converse still
+//! serves this model, but the native shape is what Anthropic documents, and
+//! Converse forces citations on to read a PDF visually — which matters here,
+//! because `figure_recall` questions are about what a page looks like.
+//!
+//! There is no generated AWS SDK crate for this path and no Anthropic SDK for
+//! Rust, so the request is built as JSON, signed with SigV4, and posted
+//! directly. What is lost relative to Converse is local, typed validation of the
+//! request shape; a malformed body is a 400 from the service, so the shapes in
 //! [`crate::bedrock`] are the only guard.
 //!
-//! # Why the endpoint region is configuration
+//! # Why the model is named by inference profile
 //!
-//! **There is no `bedrock-mantle` endpoint in Canada.** It resolves in US and EU
-//! regions only — `ca-central-1` and `ca-west-1` have no DNS for it. The
-//! previous integration called a ca-central-1 endpoint and used a `us.`
-//! inference profile, so routing left Canada but the call did not. Here the
-//! call itself leaves, and the region it leaves to is the one thing about that
-//! worth making explicit rather than hardcoding.
+//! **In-region inference is not available for this model in any region.** The
+//! bare `anthropic.claude-sonnet-5-5` is rejected; a geographic or global
+//! profile prefix is required, and the prefix is what decides data residency:
 //!
-//! This is also why the permissions boundary's region lock needed a different
-//! exemption than it had: the Lambda is now the caller into another region, not
-//! a ca-central-1 caller whose routing targets happen to be elsewhere. See
+//!   * `us.` — keeps data within US *and Canada* regions.
+//!   * `eu.` — keeps data within EU regions.
+//!   * `global.` — routes anywhere, no residency constraint.
+//!
+//! So residency is a property of the model ID here, not of the endpoint region.
+//! A cross-region profile is also why the permissions boundary needs its Bedrock
+//! exemption: each routing target is authorized with `aws:RequestedRegion` set
+//! to *that target's* region rather than the caller's. See
 //! `global_service_actions` in bootstrap/iam.tf.
 
 use aws_credential_types::provider::ProvideCredentials;
@@ -40,9 +49,11 @@ use aws_sigv4::sign::v4;
 use std::time::SystemTime;
 use trainer_core::error::{aws, Error, Result};
 
-/// SigV4 service name. Not `bedrock` — this endpoint signs as its own service,
-/// and the IAM action is `bedrock-mantle:CreateInference`.
-const SERVICE: &str = "bedrock-mantle";
+/// SigV4 service name. `bedrock`, not `bedrock-runtime` and not
+/// `bedrock-mantle`: the signing name and the hostname differ here, and signing
+/// against the hostname produces a signature mismatch rather than anything that
+/// names the real problem.
+const SERVICE: &str = "bedrock";
 
 /// The API version header the Messages API requires. Unrelated to the model, and
 /// unchanged since 2023 — pinned rather than configurable because a different
@@ -60,8 +71,9 @@ pub struct Client {
 }
 
 impl Client {
-    /// `region` is where the request is *sent*, which is not this function's
-    /// region. Lambda runs in ca-central-1; this endpoint does not exist there.
+    /// `region` is the endpoint the request is sent to. It does not by itself
+    /// decide where inference runs or where the data may travel — the model's
+    /// profile prefix does that. See the module header.
     pub fn new(sdk: &aws_config::SdkConfig, region: String) -> Result<Self> {
         let credentials = sdk
             .credentials_provider()
@@ -79,7 +91,7 @@ impl Client {
         Ok(Self {
             http,
             credentials,
-            url: format!("https://{SERVICE}.{region}.api.aws/anthropic/v1/messages"),
+            url: format!("https://bedrock-runtime.{region}.amazonaws.com/anthropic/v1/messages"),
             region,
         })
     }
@@ -88,8 +100,9 @@ impl Client {
     ///
     /// Errors carry the service's message. The Messages API returns failures as
     /// a JSON envelope with an `error.message`, which is far more useful than
-    /// the status line — a rejected `thinking` field or an unavailable model both
-    /// arrive as a 400 or 403 whose body names the actual problem.
+    /// the status line — a rejected `thinking` field, an unentitled model and a
+    /// model that does not exist on this endpoint arrive as 400, 403 and 404
+    /// whose bodies are the only thing that distinguishes them.
     pub async fn messages(&self, body: &serde_json::Value) -> Result<serde_json::Value> {
         let bytes = serde_json::to_vec(body)?;
 
@@ -153,9 +166,10 @@ impl Client {
                 .unwrap_or_else(|| text.chars().take(200).collect());
 
             // 400 is the model rejecting the request and will reject it again on
-            // retry; 403 is model access or IAM. Neither is worth a Lambda
-            // retry, but both are infrastructure rather than the document's
-            // fault, so they stay `Aws` and surface in CloudWatch.
+            // retry; 403 is model access or IAM; 404 is a model this endpoint
+            // does not serve. None is worth a Lambda retry, but all are
+            // infrastructure rather than the document's fault, so they stay
+            // `Aws` and surface in CloudWatch.
             return Err(Error::Aws(format!("bedrock {status}: {detail}")));
         }
 
