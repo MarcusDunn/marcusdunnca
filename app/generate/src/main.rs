@@ -25,21 +25,25 @@ use trainer_core::model::DocStatus;
 use trainer_core::store::Store;
 use trainer_core::tags::TAG_VERSION;
 
-/// Claude Sonnet 5.5, named by EU geographic inference profile.
+/// Claude Sonnet 5.5, named by US geographic inference profile.
 ///
 /// **The prefix is not decoration and is not optional.** In-region inference is
 /// unavailable for this model in every region, so the bare
 /// `anthropic.claude-sonnet-5-5` is rejected; a profile prefix is required, and
 /// which one decides where the document may travel:
 ///
-///   * `eu.` — data stays within EU regions. What this uses.
-///   * `us.` — data stays within US *and Canada* regions.
+///   * `us.` — data stays within US *and Canada* regions. What this uses.
+///   * `eu.` — data stays within EU regions.
 ///   * `global.` — routes anywhere, no residency constraint.
 ///
 /// So residency is a property of this string rather than of
 /// [`DEFAULT_BEDROCK_REGION`], which is only where the request is addressed.
-/// `us.` is the option worth knowing about: it would keep the document inside
-/// North America and let this call go back to a ca-central-1 endpoint.
+///
+/// `us.` keeps the document inside North America, which is the closest this
+/// model gets to staying in Canada: there is no `ca.` profile for it and no
+/// in-region option anywhere. This is the same bargain the Sonnet 4.6 setup
+/// struck, and it is strictly narrower than it reads — "US" here includes the
+/// Canadian regions rather than excluding them.
 ///
 /// The model lineage: Nova Lite was first, and was the only model with a genuine
 /// in-region (`ca.`) profile, so document text stayed in ca-central-1. It was
@@ -52,20 +56,20 @@ use trainer_core::tags::TAG_VERSION;
 /// marketplace agreement.** An account holding an `AVAILABLE` agreement still
 /// gets 403 "not available for this account" until model access is enabled, and
 /// that 403 is indistinguishable from an IAM failure until you read the body.
-const DEFAULT_MODEL_ID: &str = "eu.anthropic.claude-sonnet-5-5";
+const DEFAULT_MODEL_ID: &str = "us.anthropic.claude-sonnet-5-5";
 
 /// Region whose `bedrock-runtime` endpoint receives the request.
 ///
 /// Only the address. Where inference actually runs, and where the document may
-/// travel, is decided by the profile prefix on [`DEFAULT_MODEL_ID`] — so this
-/// being an EU region is for latency and coherence with an `eu.` profile, not
-/// the residency control itself.
+/// travel, is decided by the profile prefix on [`DEFAULT_MODEL_ID`].
 ///
-/// ca-central-1 is a valid value and was briefly thought not to be: that was
-/// true of the `bedrock-mantle` endpoint, which has no Canadian presence and
-/// which serves this model in us-gov-west-1 alone. `bedrock-runtime` is in
-/// ca-central-1 and serves this model there through a geographic profile.
-const DEFAULT_BEDROCK_REGION: &str = "eu-west-1";
+/// This is the same region everything else in the stack runs in, which was
+/// briefly thought impossible: the `bedrock-mantle` endpoint has no Canadian
+/// presence and serves this model in us-gov-west-1 alone. `bedrock-runtime` is
+/// in ca-central-1 and reaches this model from there through a geographic
+/// profile, so the call stays inside the region lock and only the profile's
+/// routing targets leave it.
+const DEFAULT_BEDROCK_REGION: &str = "ca-central-1";
 
 /// How hard the model may think: `low`, `medium`, `high`, `xhigh` or `max`.
 ///

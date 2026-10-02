@@ -67,54 +67,58 @@ variable "webauthn_credentials" {
 
 variable "bedrock_model_id" {
   description = <<-EOT
-    Model the generate function runs inference on.
+    Model the generate function runs inference on, as a geographic inference
+    profile.
 
-    A bare model ID, with no `us.` or `global.` prefix: inference-profile
-    prefixes belong to the Converse and InvokeModel integration this moved off.
-    Here the region lives in the endpoint hostname — see bedrock_region.
+    **The prefix is required, and it is the data-residency control.** In-region
+    inference is unavailable for this model in every region, so a bare
+    `anthropic.claude-sonnet-5-5` is rejected outright. The prefix decides where
+    the document may travel:
+
+      * `us.` — stays within US *and Canada* regions. What this uses.
+      * `eu.` — stays within EU regions.
+      * `global.` — routes anywhere, no residency constraint.
+
+    So residency lives here rather than in bedrock_region, which is only the
+    address the request is sent to. `us.` is the closest this model gets to
+    staying in Canada — there is no `ca.` profile for it — and it is the same
+    bargain the Sonnet 4.6 setup struck.
 
     **Model access is granted per model in the Bedrock console and is not
-    managed here.** A model this account has not been granted returns 403 with
-    "not available for this account", which reads exactly like an IAM problem
-    until you look at the response body. At the time of writing this account has
-    access to Sonnet 4.6 and nothing newer, so this value does not yet work —
-    enabling it on the Model access page is a prerequisite, not a formality.
+    managed here.** It is also separate from the AWS Marketplace agreement: an
+    account holding an `AVAILABLE` agreement still gets 403 "not available for
+    this account" until access is enabled on the Model access page, and that 403
+    reads exactly like an IAM problem until you look at the response body.
 
     Lineage, since it is the third model here: Nova Lite was first and was the
     only one with a genuine in-region (`ca.`) profile, dropped because on a real
     document it produced questions answerable without reading it, exposes no
     reasoning mode at any price, and emitted malformed questions even under a
-    JSON Schema. Sonnet 4.6 with a thinking budget replaced it. Sonnet 5.5
-    replaced that, because the Messages-API endpoint does not serve 4.6.
+    JSON Schema. Sonnet 4.6 with a thinking budget replaced it, and Sonnet 5.5
+    replaced that.
   EOT
   type        = string
-  default     = "anthropic.claude-sonnet-5-5"
+  default     = "us.anthropic.claude-sonnet-5-5"
 }
 
 variable "bedrock_region" {
   description = <<-EOT
-    Region whose bedrock-mantle endpoint receives the request.
+    Region whose bedrock-runtime endpoint receives the request.
 
-    **Not this stack's region, and that is the uncomfortable part.** There is no
-    bedrock-mantle endpoint in Canada: the service exists in US, EU,
-    Asia-Pacific and South American regions only, and neither ca-central-1 nor
-    ca-west-1 resolves. So where the previous integration called a ca-central-1
-    endpoint and let a `us.` profile route the inference onward, this call leaves
-    Canada itself.
+    Only the address. Where inference runs, and where the document may travel, is
+    decided by the profile prefix on bedrock_model_id — so this matching
+    aws_region is for latency and for keeping the call inside the region lock,
+    not for residency.
 
-    Document text therefore leaves the country either way — it did before too —
-    but the thing crossing the border is now the request rather than an internal
-    routing hop, and the region lock in bootstrap/iam.tf had to be loosened to
-    permit it. That exemption, and what it costs, is documented there.
-
-    EU rather than US on the reasoning that if the data is leaving regardless, it
-    may as well land where the statutory floor under it is higher.
-
-    Valid values are the bedrock-mantle regions. In the EU: eu-west-1, eu-west-2,
-    eu-central-1, eu-north-1, eu-south-1. Note eu-west-3 is NOT among them.
+    This was briefly thought impossible. The `bedrock-mantle` endpoint has no
+    Canadian presence and serves this model in us-gov-west-1 alone, which would
+    have put the caller itself outside the region lock. `bedrock-runtime` is in
+    ca-central-1 and reaches the model from there through a geographic profile,
+    so only the profile's routing targets leave the allowed regions — which is
+    what the Bedrock exemption in bootstrap/iam.tf has always covered.
   EOT
   type        = string
-  default     = "eu-west-1"
+  default     = "ca-central-1"
 }
 
 variable "bedrock_effort" {

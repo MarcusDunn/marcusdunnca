@@ -406,17 +406,19 @@ does not bound either:
    families, on both the foundation-model and inference-profile ARNs. Opus and Fable are `implicitDeny` for both the
    apply role and any boundary-capped runtime role.
 
-   The app uses `eu.anthropic.claude-sonnet-5-5` through the **native Messages
+   The app uses `us.anthropic.claude-sonnet-5-5` through the **native Messages
    API on the `bedrock-runtime` endpoint** (`/anthropic/v1/messages`), not
    Converse. Three consequences worth knowing:
 
    - **The model must be named by inference profile.** In-region inference is
      unavailable for this model in every region, so a bare
      `anthropic.claude-sonnet-5-5` is rejected. The prefix decides data
-     residency: `eu.` keeps data in EU regions, `us.` keeps it in US **and
-     Canada**, `global.` routes anywhere. Residency is therefore a property of
-     `bedrock_model_id`, not of `bedrock_region` — which is only the address the
-     request is sent to.
+     residency: `us.` keeps data in US **and Canada**, `eu.` keeps it in EU
+     regions, `global.` routes anywhere. Residency is therefore a property of
+     `bedrock_model_id`, not of `bedrock_region` — which stays `ca-central-1`,
+     the same region as everything else. Only the profile's routing targets
+     leave it, which is exactly what the Bedrock exemption in the region lock
+     has always covered.
    - **Not `bedrock-mantle`.** That endpoint serves the same native Messages API
      and was tried first, but it serves this model in `us-gov-west-1` alone:
      every commercial region returns 404 `not_found_error`. The model is listed
