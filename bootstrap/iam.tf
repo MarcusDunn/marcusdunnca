@@ -104,30 +104,35 @@ locals {
   #
   # **A cross-region inference profile authorizes each of its routing targets
   # with `aws:RequestedRegion` set to that target's region, not the caller's.**
-  # `us.anthropic.claude-sonnet-4-6` routes through us-east-1, us-east-2,
-  # ca-central-1 and us-west-2, so a Converse call made to the ca-central-1
-  # endpoint is authorized four times, twice against regions this lock does not
-  # allow. A `global.` profile is worse: it adds a *region-less* target,
-  # `arn:aws:bedrock:::foundation-model/...`, authorized with no
-  # `aws:RequestedRegion` at all — and `StringNotEquals` against a missing key
-  # is true, so the deny fires on that one too.
+  # A geographic profile such as `us.anthropic.claude-sonnet-5-5` routes through
+  # every region in its geography, so one call is authorized many times, mostly
+  # against regions this lock does not allow. A `global.` profile is worse: it
+  # adds a *region-less* target, `arn:aws:bedrock:::foundation-model/...`,
+  # authorized with no `aws:RequestedRegion` at all — and `StringNotEquals`
+  # against a missing key is true, so the deny fires on that one too.
   #
-  # There is no Sonnet profile that stays inside ca-central-1 and us-east-1.
-  # The choice was: exempt these four actions, widen the region list for every
-  # service, or give up Sonnet. This is the narrowest of the three.
+  # **This model cannot be reached without such a profile.** In-region inference
+  # is unavailable for it in every region, so there is no configuration that
+  # keeps a single-region authorization and still runs. The choice was: exempt
+  # these actions, widen the region list for every service, or give up the model.
+  # This is the narrowest of the three.
   #
-  # What still constrains these actions:
-  #   * `bedrock_allowed_model_arns` — sonnet, haiku and nova patterns only.
-  #     Opus is absent and unreachable.
-  #   * Invocation creates no persistent resource, so this cannot be used to
+  # The exemption is scoped to the endpoint region being an allowed one, which
+  # is the part a brief detour to `bedrock-mantle` would have given up: that
+  # endpoint has no Canadian presence, so the caller itself would have sat
+  # outside the lock rather than its routing targets.
+  #
+  # What still constrains this action:
+  #   * `bedrock_allowed_model_arns` — sonnet and haiku patterns only. Opus and
+  #     Fable are absent and unreachable.
+  #   * Inference creates no persistent resource, so this cannot be used to
   #     stand something up in an unwatched region.
-  #   * The trail is multi-region, so calls in us-east-2 and us-west-2 are still
-  #     recorded.
-  #   * DAILY_DOCUMENT_CAP, MAX_PAGES, MAX_DOCUMENT_BYTES and the budget spend
-  #     brake bound the spend.
+  #   * The trail is multi-region, so the calls are still recorded.
+  #   * DAILY_DOCUMENT_CAP, MAX_PAGES, MAX_DOCUMENT_BYTES, MAX_OUTPUT_TOKENS and
+  #     the budget spend brake bound the spend.
   #
-  # What it costs: a compromised role may invoke the approved models from any
-  # region rather than two.
+  # What it costs: a compromised role may run inference on the approved models
+  # from any region.
   #
   # Debugging note, because it cost real time. `iam:simulate-principal-policy`
   # does NOT reproduce any of this — with no context entries it reports these
@@ -137,8 +142,6 @@ locals {
   global_service_actions = [
     "bedrock:InvokeModel",
     "bedrock:InvokeModelWithResponseStream",
-    "bedrock:Converse",
-    "bedrock:ConverseStream",
     "iam:*",
     "sts:*",
     "account:*",
@@ -370,21 +373,27 @@ locals {
   ]
 
   # Inference is metered per token, and there is no IAM condition key for token
-  # count — so the only lever IAM offers is WHICH model. Opus costs several
-  # times Sonnet per token, so restricting the allowed models is a real cost
-  # bound rather than a hope. Add a model here deliberately, knowing the price.
+  # count — so the only lever IAM offers is WHICH model. Opus and Fable cost
+  # several times Sonnet per token, so restricting the allowed models is a real
+  # cost bound rather than a hope. Add a model here deliberately, knowing the
+  # price.
+  #
+  # Under the `bedrock` prefix: the native Messages API is served on the
+  # `bedrock-runtime` endpoint, which authorizes as `bedrock` exactly as Converse
+  # did. The service prefix follows the endpoint, not the request shape.
+  #
+  # Converse and ConverseStream are dropped because nothing calls them now.
   bedrock_invoke_actions = [
     "bedrock:InvokeModel",
     "bedrock:InvokeModelWithResponseStream",
-    "bedrock:Converse",
-    "bedrock:ConverseStream",
   ]
 
   # Both the raw foundation-model ARN and the inference-profile form, because
-  # newer models are addressed through profiles rather than directly.
-  # Both forms are required: invoking through an inference profile needs
-  # permission on the profile ARN AND on the underlying foundation-model ARN in
-  # every region the profile may route to, hence the wildcard region.
+  # this model is addressed through a profile rather than directly — in-region
+  # inference is unavailable for it everywhere. Both forms are required:
+  # invoking through a profile needs permission on the profile ARN AND on the
+  # underlying foundation-model ARN in every region the profile may route to,
+  # hence the wildcard region.
   bedrock_allowed_model_arns = flatten([
     for pattern in var.bedrock_allowed_models : [
       "arn:${local.partition}:bedrock:*::foundation-model/${pattern}",

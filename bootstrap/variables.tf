@@ -149,18 +149,19 @@ variable "bedrock_allowed_models" {
     Model ID patterns the application may invoke.
 
     There is no IAM condition key for token count, so model choice is the only
-    cost lever IAM offers, and this list is where it is pulled. Generalised from
-    an Anthropic-only shape when Nova was chosen — Nova Lite is roughly a
-    twentieth of Sonnet's token price and, uniquely, has a genuine in-region
-    (ca.) inference profile rather than routing globally.
+    cost lever IAM offers, and this list is where it is pulled.
 
-    Opus is deliberately absent: several times Sonnet's price per token, and
-    nothing here needs it.
+    The Nova patterns are gone. They were here because Nova Lite was the one
+    model with a genuine in-region (ca.) inference profile, kept so that
+    reverting to it needed no IAM change. Bedrock's Messages-API endpoint does
+    not serve Nova at all, and reverting now means reverting the transport too,
+    so the entry was buying nothing but the impression of an escape hatch.
+
+    Opus and Fable are deliberately absent: several times Sonnet's price per
+    token, and nothing here needs them.
   EOT
   type        = list(string)
   default = [
-    "amazon.nova-lite-*",
-    "amazon.nova-2-lite-*",
     "anthropic.claude-sonnet-*",
     "anthropic.claude-haiku-*",
   ]

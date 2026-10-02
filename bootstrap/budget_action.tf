@@ -25,9 +25,20 @@
 
 data "aws_iam_policy_document" "spend_brake" {
   statement {
-    sid       = "HaltMeteredServices"
-    effect    = "Deny"
-    actions   = ["bedrock:*"]
+    sid    = "HaltMeteredServices"
+    effect = "Deny"
+    # BOTH prefixes. `bedrock-mantle` is a separate IAM service, not a sub-path of
+    # `bedrock`: action matching is on the literal service prefix, so `bedrock:*`
+    # does not match `bedrock-mantle:CreateInference`.
+    #
+    # Inference currently runs on `bedrock-runtime`, which `bedrock:*` does cover,
+    # so the second entry guards nothing today. It stays because a near-miss
+    # proved the failure mode: while the generate function was briefly pointed at
+    # `bedrock-mantle`, this statement covered none of its spend, and the brake
+    # would still have fired, attached, and halted nothing that costs money. A
+    # circuit breaker that reports success while the meter runs is worse than no
+    # brake, because it is believed.
+    actions   = ["bedrock:*", "bedrock-mantle:*"]
     resources = ["*"]
   }
 
