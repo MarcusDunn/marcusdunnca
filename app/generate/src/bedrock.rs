@@ -1494,7 +1494,7 @@ mod tests {
     #[test]
     fn the_request_omits_what_the_model_rejects() {
         let body = request_body(&Request {
-            model_id: "us.anthropic.claude-sonnet-5-5",
+            model_id: "us.anthropic.claude-sonnet-5",
             effort: "high",
             max_tokens: 16000,
             repair_attempts: 1,

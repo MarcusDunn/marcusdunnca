@@ -104,7 +104,7 @@ locals {
   #
   # **A cross-region inference profile authorizes each of its routing targets
   # with `aws:RequestedRegion` set to that target's region, not the caller's.**
-  # A geographic profile such as `us.anthropic.claude-sonnet-5-5` routes through
+  # A geographic profile such as `us.anthropic.claude-sonnet-5` routes through
   # every region in its geography, so one call is authorized many times, mostly
   # against regions this lock does not allow. A `global.` profile is worse: it
   # adds a *region-less* target, `arn:aws:bedrock:::foundation-model/...`,

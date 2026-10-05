@@ -25,7 +25,18 @@ use trainer_core::model::DocStatus;
 use trainer_core::store::Store;
 use trainer_core::tags::TAG_VERSION;
 
-/// Claude Sonnet 5.5, named by US geographic inference profile.
+/// Claude Sonnet 5, named by US geographic inference profile.
+///
+/// **Sonnet 5 rather than 5.5, and not by preference.** 5.5 is gated by AWS
+/// account criteria that these APIs do not expose: with the marketplace
+/// agreement accepted and `get-foundation-model-availability` reporting
+/// `AVAILABLE`/`AUTHORIZED`/`AVAILABLE`/`AVAILABLE` in every region the profile
+/// routes through — the same four values the working model reports — inference
+/// still returns 403 "not available for this account", whose closing line is an
+/// invitation to contact AWS Sales. Sonnet 5 is documented as open to all
+/// Bedrock customers and costs the same $2/$10 per MTok on Bedrock, so it is
+/// what this runs on until 5.5 is granted. Switching is this string and nothing
+/// else; the agreement for 5.5 is already in place.
 ///
 /// **The prefix is not decoration and is not optional.** In-region inference is
 /// unavailable for this model in every region, so the bare
@@ -50,13 +61,18 @@ use trainer_core::tags::TAG_VERSION;
 /// dropped for question quality — measured on the same document it produced
 /// questions answerable from general knowledge, offers no reasoning mode at any
 /// price, and emitted malformed questions even under a JSON Schema. Sonnet 4.6
-/// with a thinking budget replaced it, and Sonnet 5.5 replaced that.
+/// with a thinking budget replaced it, and this replaced that.
 ///
-/// **Access is granted per model in the Bedrock console, separately from the
-/// marketplace agreement.** An account holding an `AVAILABLE` agreement still
-/// gets 403 "not available for this account" until model access is enabled, and
-/// that 403 is indistinguishable from an IAM failure until you read the body.
-const DEFAULT_MODEL_ID: &str = "us.anthropic.claude-sonnet-5-5";
+/// **4.6 cannot be reverted to without also reverting the transport.** The
+/// native Messages API serves Sonnet 5 and later only; 4.6 returns 404 "doesn't
+/// exist or doesn't support this API" on it and is reachable through Converse
+/// alone. Model and transport are welded together here.
+///
+/// **An inference denial is invisible to CloudTrail here.** Model invocation is
+/// a Bedrock *data* event, and the account's trail carries management events, so
+/// the usual witness for an AccessDenied has nothing to say about this one.
+/// `get-foundation-model-availability` is the first thing to read instead.
+const DEFAULT_MODEL_ID: &str = "us.anthropic.claude-sonnet-5";
 
 /// Region whose `bedrock-runtime` endpoint receives the request.
 ///

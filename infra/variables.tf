@@ -84,21 +84,31 @@ variable "bedrock_model_id" {
     staying in Canada — there is no `ca.` profile for it — and it is the same
     bargain the Sonnet 4.6 setup struck.
 
-    **Model access is granted per model in the Bedrock console and is not
-    managed here.** It is also separate from the AWS Marketplace agreement: an
-    account holding an `AVAILABLE` agreement still gets 403 "not available for
-    this account" until access is enabled on the Model access page, and that 403
-    reads exactly like an IAM problem until you look at the response body.
+    **Sonnet 5 rather than 5.5, and not by preference.** 5.5 is gated by AWS
+    account criteria that no API exposes: with the marketplace agreement accepted
+    and get-foundation-model-availability reporting AVAILABLE / AUTHORIZED /
+    AVAILABLE / AVAILABLE in every region the profile routes through — the same
+    four values the working model reports — inference still returns 403 "not
+    available for this account", closing with an invitation to contact AWS Sales.
+    Sonnet 5 is documented as open to all Bedrock customers and carries the same
+    $2/$10 per MTok on Bedrock. Moving to 5.5 is this value and nothing else; its
+    agreement is already in place.
+
+    **A denial here is invisible to CloudTrail.** Model invocation is a Bedrock
+    data event and the trail carries management events, so the usual witness has
+    nothing to say. Read get-foundation-model-availability first.
 
     Lineage, since it is the third model here: Nova Lite was first and was the
     only one with a genuine in-region (`ca.`) profile, dropped because on a real
     document it produced questions answerable without reading it, exposes no
     reasoning mode at any price, and emitted malformed questions even under a
-    JSON Schema. Sonnet 4.6 with a thinking budget replaced it, and Sonnet 5.5
-    replaced that.
+    JSON Schema. Sonnet 4.6 with a thinking budget replaced it, and this
+    replaced that — though 4.6 cannot be reverted to without also reverting the
+    transport, since the native Messages API serves Sonnet 5 and later only and
+    returns 404 for 4.6.
   EOT
   type        = string
-  default     = "us.anthropic.claude-sonnet-5-5"
+  default     = "us.anthropic.claude-sonnet-5"
 }
 
 variable "bedrock_region" {

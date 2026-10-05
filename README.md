@@ -406,7 +406,7 @@ does not bound either:
    families, on both the foundation-model and inference-profile ARNs. Opus and Fable are `implicitDeny` for both the
    apply role and any boundary-capped runtime role.
 
-   The app uses `us.anthropic.claude-sonnet-5-5` through the **native Messages
+   The app uses `us.anthropic.claude-sonnet-5` through the **native Messages
    API on the `bedrock-runtime` endpoint** (`/anthropic/v1/messages`), not
    Converse. Three consequences worth knowing:
 
@@ -426,15 +426,19 @@ does not bound either:
      agreement there, so the control plane and the data plane disagree and only
      the data plane is honest. `bedrock-runtime` is also what AWS recommends for
      new applications.
-   - **Model access is granted per model in the Bedrock console**, separately
-     from the marketplace agreement. An account holding an `AVAILABLE` agreement
-     still gets 403 "not available for this account" until access is enabled,
-     and that 403 is indistinguishable from an IAM failure until you read the
-     body.
+   - **Sonnet 5 rather than 5.5, and not by preference.** 5.5 is gated by AWS
+     account criteria no API exposes: agreement accepted,
+     `get-foundation-model-availability` green on all four fields in every
+     routing region, and inference still 403s with an invitation to contact AWS
+     Sales. Sonnet 5 is open to all Bedrock customers at the same $2/$10 on
+     Bedrock. Note a denial here is invisible to CloudTrail — model invocation
+     is a *data* event and the trail carries management events.
 
    This replaced `us.anthropic.claude-sonnet-4-6` on Converse, which in turn
    replaced `ca.amazon.nova-lite-v1:0` — the one model with a genuine in-region
-   profile, dropped for question quality. Structured outputs are unavailable on
+   profile, dropped for question quality. 4.6 cannot be reverted to without also
+   reverting the transport: the native Messages API serves Sonnet 5 and later
+   only and returns 404 for 4.6. Structured outputs are unavailable on
    Bedrock for this model on either endpoint, so the tool's JSON Schema is
    advisory and the handler's own validation is the enforcement point; see
    `bedrock_repair_attempts`.
