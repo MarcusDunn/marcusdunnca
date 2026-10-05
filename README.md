@@ -402,21 +402,53 @@ does not bound either:
 
 1. **Model scoping.** There is no IAM condition key for token count, so *which
    model* is the only lever IAM offers. `bedrock:InvokeModel` is scoped by
-   model-ID pattern (`bedrock_allowed_models`) to Nova Lite and the Claude
-   Sonnet/Haiku families — Nova is what the application actually uses. Opus is `implicitDeny` for both the apply role and any
-   boundary-capped runtime role.
+   model-ID pattern (`bedrock_allowed_models`) to the Claude Sonnet and Haiku
+   families, on both the foundation-model and inference-profile ARNs. Opus and Fable are `implicitDeny` for both the
+   apply role and any boundary-capped runtime role.
 
-   The app uses `ca.amazon.nova-lite-v1:0` — roughly a twentieth of Sonnet's
-   token price and, uniquely among available models, a genuine **in-region**
-   inference profile. Every Claude profile in `ca-central-1` is `us.`- or
-   `global.`-prefixed and routes outside Canada. Verified that Nova Lite reads
-   PDFs via Converse document blocks; `inputModalities` does not list
-   `DOCUMENT` for *any* of these models, because that field describes
-   InvokeModel rather than Converse.
+   The app uses `us.anthropic.claude-sonnet-5` through the **native Messages
+   API on the `bedrock-runtime` endpoint** (`/anthropic/v1/messages`), not
+   Converse. Three consequences worth knowing:
+
+   - **The model must be named by inference profile.** In-region inference is
+     unavailable for this model in every region, so a bare
+     `anthropic.claude-sonnet-5-5` is rejected. The prefix decides data
+     residency: `us.` keeps data in US **and Canada**, `eu.` keeps it in EU
+     regions, `global.` routes anywhere. Residency is therefore a property of
+     `bedrock_model_id`, not of `bedrock_region` — which stays `ca-central-1`,
+     the same region as everything else. Only the profile's routing targets
+     leave it, which is exactly what the Bedrock exemption in the region lock
+     has always covered.
+   - **Not `bedrock-mantle`.** That endpoint serves the same native Messages API
+     and was tried first, but it serves this model in `us-gov-west-1` alone:
+     every commercial region returns 404 `not_found_error`. The model is listed
+     by `ListFoundationModels` in commercial regions and has a marketplace
+     agreement there, so the control plane and the data plane disagree and only
+     the data plane is honest. `bedrock-runtime` is also what AWS recommends for
+     new applications.
+   - **Sonnet 5 rather than 5.5, and not by preference.** 5.5 is gated by AWS
+     account criteria no API exposes: agreement accepted,
+     `get-foundation-model-availability` green on all four fields in every
+     routing region, and inference still 403s with an invitation to contact AWS
+     Sales. Sonnet 5 is open to all Bedrock customers at the same $2/$10 on
+     Bedrock. Note a denial here is invisible to CloudTrail — model invocation
+     is a *data* event and the trail carries management events.
+
+   This replaced `us.anthropic.claude-sonnet-4-6` on Converse, which in turn
+   replaced `ca.amazon.nova-lite-v1:0` — the one model with a genuine in-region
+   profile, dropped for question quality. 4.6 cannot be reverted to without also
+   reverting the transport: the native Messages API serves Sonnet 5 and later
+   only and returns 404 for 4.6. Structured outputs are unavailable on
+   Bedrock for this model on either endpoint, so the tool's JSON Schema is
+   advisory and the handler's own validation is the enforcement point; see
+   `bedrock_repair_attempts`.
+
 2. **Alerting.** $10 budget at 80/100% actual and 100% forecast, plus a Cost
    Anomaly subscription at $1 that publishes immediately via SNS.
 3. **An automated circuit breaker.** At 90% of budget, AWS Budgets itself
-   attaches `marcusdunnca-spend-brake` to both CI roles, denying Bedrock and
+   attaches `marcusdunnca-spend-brake` to both CI roles, denying both Bedrock
+   service prefixes (`bedrock:*` and `bedrock-mantle:*` — IAM matches the
+   literal prefix, so one does not cover the other) and
    further resource creation. No human, no Lambda, no dependency on anything in
    this repo still working. Free — the first two action-enabled budgets cost
    nothing.

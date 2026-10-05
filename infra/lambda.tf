@@ -43,19 +43,18 @@ locals {
   # the profile produces an AccessDeniedException naming a model ARN you never
   # wrote down, which is a miserable thing to debug.
   #
+  # This applies again, and did not for a moment. The native Messages API was
+  # briefly pointed at `bedrock-mantle`, which takes a bare model ID and needed
+  # no profile — but that endpoint serves this model in us-gov-west-1 alone. On
+  # `bedrock-runtime` the model is unreachable without a profile prefix, because
+  # in-region inference is unavailable for it in every region.
+  #
   # Kept in step with bedrock_allowed_models in bootstrap/variables.tf. The
-  # boundary caps these roles at that list regardless, so widening here alone
+  # boundary caps this role at that list regardless, so widening here alone
   # achieves nothing except misleading the next reader — and narrowing here is
   # what actually reduces what the function can invoke.
-  #
-  # Sonnet is the model in use; the Nova entries are kept so that reverting
-  # var.bedrock_model_id to the in-region profile does not also require an IAM
-  # change. Opus is absent from the bootstrap allowlist and so cannot be
-  # reached from here whatever this list says.
   bedrock_model_patterns = [
     "anthropic.claude-sonnet-*",
-    "amazon.nova-lite-*",
-    "amazon.nova-2-lite-*",
   ]
 
   bedrock_model_arns = flatten([
@@ -295,11 +294,17 @@ data "aws_iam_policy_document" "generate" {
   statement {
     sid    = "InvokeApprovedModels"
     effect = "Allow"
+    # `bedrock:`, not `bedrock-mantle:`. The native Messages API is served on the
+    # `bedrock-runtime` endpoint, which signs and authorizes as `bedrock` exactly
+    # as Converse did — the service prefix follows the endpoint, not the request
+    # shape. A policy written against `bedrock-mantle` authorizes nothing here.
+    #
+    # Converse and ConverseStream are gone because nothing calls them now. The
+    # streaming variant is kept: it costs nothing to hold and is the difference
+    # between adding `"stream": true` and debugging an AccessDenied.
     actions = [
       "bedrock:InvokeModel",
       "bedrock:InvokeModelWithResponseStream",
-      "bedrock:Converse",
-      "bedrock:ConverseStream",
     ]
     resources = local.bedrock_model_arns
   }
@@ -457,8 +462,13 @@ resource "aws_lambda_function" "generate" {
       TABLE_NAME  = aws_dynamodb_table.app.name
       DOCS_BUCKET = aws_s3_bucket.docs.id
 
-      MODEL_ID               = var.bedrock_model_id
-      THINKING_BUDGET_TOKENS = tostring(var.bedrock_thinking_budget_tokens)
+      MODEL_ID = var.bedrock_model_id
+      # Where the request is sent, which is not where this function runs. There
+      # is no bedrock-mantle endpoint in Canada — see var.bedrock_region.
+      BEDROCK_REGION    = var.bedrock_region
+      EFFORT            = var.bedrock_effort
+      MAX_OUTPUT_TOKENS = tostring(var.bedrock_max_output_tokens)
+      REPAIR_ATTEMPTS   = tostring(var.bedrock_repair_attempts)
 
       MAX_PAGES          = tostring(var.max_pages)
       MAX_DOCUMENT_BYTES = tostring(var.max_upload_bytes)
