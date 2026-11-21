@@ -13,8 +13,18 @@ terraform {
       source  = "hashicorp/archive"
       version = "~> 2.7"
     }
+
+    # DNS records only. See infra/dns.tf.
+    cloudflare = {
+      source  = "cloudflare/cloudflare"
+      version = "~> 5.29"
+    }
   }
 }
+
+# Reads CLOUDFLARE_API_TOKEN from the environment. See infra/dns.tf for the
+# token that each workflow uses.
+provider "cloudflare" {}
 
 provider "aws" {
   region = var.aws_region

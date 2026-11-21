@@ -16,11 +16,40 @@ variable "app_domain" {
     Fully-qualified domain the application is served from.
 
     marcusdunn.ca is registered at Cloudflare and stays there — no Route53
-    delegation. A hosted zone would cost $0.50/month to automate two DNS records
-    that are created once and then left alone.
+    delegation. A hosted zone would cost $0.50/month. infra/dns.tf manages the
+    records at Cloudflare.
   EOT
   type        = string
   default     = "study.aws.marcusdunn.ca"
+}
+
+variable "cloudflare_zone_id" {
+  description = "Cloudflare zone ID of marcusdunn.ca. Not a secret: it identifies the zone and gives no access."
+  type        = string
+  default     = "124e581f9ae18c786ba0eac9fd00aaac"
+}
+
+variable "vpn_domain" {
+  description = "Name of the A record that points to the WireGuard server at home."
+  type        = string
+  default     = "vpn.marcusdunn.ca"
+}
+
+variable "home_public_ipv4" {
+  description = <<-EOT
+    Static public IPv4 address of the home network. The vpn_domain record
+    points to it.
+
+    Public by design: anyone can read it from DNS. To commit it here shows
+    nothing more than a DNS lookup shows.
+  EOT
+  type        = string
+  default     = "24.83.126.6"
+
+  validation {
+    condition     = can(regex("^(\\d{1,3}\\.){3}\\d{1,3}$", var.home_public_ipv4)) && can(cidrhost("${var.home_public_ipv4}/32", 0))
+    error_message = "home_public_ipv4 must be a plain IPv4 address."
+  }
 }
 
 variable "webauthn_rp_id" {

@@ -99,10 +99,25 @@ jobs:
       - name: Plan
         id: plan
         working-directory: ${{ matrix.module }}
+        env:
+          MODULE: ${{ matrix.module }}
         # -lock=false keeps the plan role genuinely read-only: it never needs to
         # write a lock object into the state bucket.
         # -detailed-exitcode: 0 = no changes, 1 = error, 2 = changes pending.
+        #
+        # The Cloudflare token is READ ONLY, and it must stay so: any pull
+        # request gets the plan role. The plan role can read this one SSM
+        # parameter and is denied the edit token (bootstrap/iam.tf). The token
+        # is read here, in this step only, so no other step has it.
+        # bootstrap/ has no DNS records, so it does not get the token.
         run: |
+          if [ "$MODULE" = infra ]; then
+            CLOUDFLARE_API_TOKEN=$(aws ssm get-parameter --name /ci/cloudflare/dns-read \
+              --with-decryption --query Parameter.Value --output text)
+            echo "::add-mask::$CLOUDFLARE_API_TOKEN"
+            export CLOUDFLARE_API_TOKEN
+          fi
+
           set +e
           tofu plan -input=false -lock=false -no-color -detailed-exitcode -out=tfplan > plan.txt 2>&1
           code=$?

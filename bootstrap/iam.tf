@@ -93,6 +93,17 @@ locals {
   # nothing. Uploaded PDFs are the only user data in the system.
   docs_bucket_arn = "arn:${local.partition}:s3:::${var.project}-docs-${local.account_id}-${var.aws_region}-an"
 
+  # Cloudflare API tokens for the DNS records in infra/dns.tf. A human writes
+  # them with scripts/cloudflare-setup.sh, and the CI workflows read them with
+  # the AWS CLI. They are never in state.
+  #
+  # The path is outside /${var.project}/ on purpose. The permissions boundary
+  # lets application roles read all of /${var.project}/*, so a token there
+  # could be reachable from a Lambda function.
+  cloudflare_parameter_prefix = "arn:${local.partition}:ssm:${var.aws_region}:${local.account_id}:parameter/ci/cloudflare"
+  cloudflare_dns_read_arn     = "${local.cloudflare_parameter_prefix}/dns-read"
+  cloudflare_dns_edit_arn     = "${local.cloudflare_parameter_prefix}/dns-edit"
+
   # Immutable-form subject. See var.github_owner_id.
   github_sub_prefix = "repo:${var.github_owner}@${var.github_owner_id}/${var.github_repo}@${var.github_repo_id}"
 
@@ -805,6 +816,25 @@ data "aws_iam_policy_document" "ci_app_guardrails" {
     actions   = ["s3:DeleteBucket", "s3:DeleteObjectVersion", "s3:PutBucketVersioning"]
     resources = [local.docs_bucket_arn, "${local.docs_bucket_arn}/*"]
   }
+
+  # CI only reads the Cloudflare tokens. If CI could write them, a compromised
+  # pipeline could put in its own token, or move the edit token to the path
+  # that the plan role reads. This is here, not in ci_guardrails, because that
+  # policy is at the 6144-character limit.
+  statement {
+    sid    = "DenyWritingCloudflareTokens"
+    effect = "Deny"
+    actions = [
+      "ssm:PutParameter",
+      "ssm:DeleteParameter",
+      "ssm:DeleteParameters",
+      "ssm:LabelParameterVersion",
+      "ssm:UnlabelParameterVersion",
+      "ssm:AddTagsToResource",
+      "ssm:RemoveTagsFromResource",
+    ]
+    resources = ["${local.cloudflare_parameter_prefix}/*"]
+  }
 }
 
 resource "aws_iam_policy" "ci_app_guardrails" {
@@ -954,6 +984,56 @@ data "aws_iam_policy_document" "plan_permissions" {
       "tag:GetResources",
     ]
     resources = ["*"]
+  }
+
+  # The Cloudflare token that can only READ DNS. Any pull request from this
+  # repository gets this role, so this token must never be able to edit.
+  statement {
+    sid       = "ReadCloudflareDnsReadToken"
+    effect    = "Allow"
+    actions   = ["ssm:GetParameter"]
+    resources = [local.cloudflare_dns_read_arn]
+  }
+
+  # SSM encrypts each SecureString with its parameter ARN as the encryption
+  # context. This condition lets the role decrypt that one parameter only.
+  statement {
+    sid       = "DecryptCloudflareDnsReadToken"
+    effect    = "Allow"
+    actions   = ["kms:Decrypt"]
+    resources = ["*"]
+
+    condition {
+      test     = "StringEquals"
+      variable = "kms:ViaService"
+      values   = ["ssm.${var.aws_region}.amazonaws.com"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "kms:EncryptionContext:PARAMETER_ARN"
+      values   = [local.cloudflare_dns_read_arn]
+    }
+  }
+
+  # Not granted above, so this deny changes nothing today. It stops a later
+  # change from giving pull requests the token that can edit DNS.
+  # GetParametersByPath is checked against the path, not against each
+  # parameter below it, so the parent paths are named too.
+  statement {
+    sid    = "DenyCloudflareDnsEditToken"
+    effect = "Deny"
+    actions = [
+      "ssm:GetParameter",
+      "ssm:GetParameters",
+      "ssm:GetParametersByPath",
+      "ssm:GetParameterHistory",
+    ]
+    resources = [
+      local.cloudflare_dns_edit_arn,
+      local.cloudflare_parameter_prefix,
+      trimsuffix(local.cloudflare_parameter_prefix, "/cloudflare"),
+    ]
   }
 }
 
@@ -1209,6 +1289,34 @@ data "aws_iam_policy_document" "apply_permissions" {
       test     = "StringEquals"
       variable = "iam:AWSServiceName"
       values   = ["access-analyzer.amazonaws.com"]
+    }
+  }
+
+  # The Cloudflare token that can edit DNS. Only the `production` environment
+  # can assume this role, so only the main branch gets this token.
+  statement {
+    sid       = "ReadCloudflareDnsEditToken"
+    effect    = "Allow"
+    actions   = ["ssm:GetParameter"]
+    resources = [local.cloudflare_dns_edit_arn]
+  }
+
+  statement {
+    sid       = "DecryptCloudflareDnsEditToken"
+    effect    = "Allow"
+    actions   = ["kms:Decrypt"]
+    resources = ["*"]
+
+    condition {
+      test     = "StringEquals"
+      variable = "kms:ViaService"
+      values   = ["ssm.${var.aws_region}.amazonaws.com"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "kms:EncryptionContext:PARAMETER_ARN"
+      values   = [local.cloudflare_dns_edit_arn]
     }
   }
 }
