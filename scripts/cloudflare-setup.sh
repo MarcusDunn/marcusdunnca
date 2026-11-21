@@ -19,7 +19,7 @@
 #
 #   nix develop
 #   aws sso login
-#   ./scripts/cloudflare-setup.sh
+#   bash scripts/cloudflare-setup.sh
 set -euo pipefail
 umask 077
 WORK_DIR="$(mktemp -d)"
