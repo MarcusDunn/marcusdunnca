@@ -67,9 +67,17 @@ jobs:
         run: tofu init -input=false -lockfile=readonly -backend-config=backend.hcl
         working-directory: infra
 
+      # The Cloudflare token can edit DNS. Only the apply role can read it, and
+      # only the `production` environment can assume the apply role. It is read
+      # here, in this step only, so no other step has it. See infra/dns.tf.
       - name: Apply
-        run: tofu apply -input=false -auto-approve
         working-directory: infra
+        run: |
+          CLOUDFLARE_API_TOKEN=$(aws ssm get-parameter --name /ci/cloudflare/dns-edit \
+            --with-decryption --query Parameter.Value --output text)
+          echo "::add-mask::$CLOUDFLARE_API_TOKEN"
+          export CLOUDFLARE_API_TOKEN
+          tofu apply -input=false -auto-approve
 
       - name: Publish outputs to job summary
         if: always()

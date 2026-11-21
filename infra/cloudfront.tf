@@ -280,7 +280,7 @@ resource "aws_s3_bucket_policy" "site" {
 }
 
 output "cloudfront_distribution_domain_name" {
-  description = "Target for the CNAME at Cloudflare (DNS-only / grey cloud — proxying it would break the SNI match against the ACM certificate)."
+  description = "Target of the app CNAME at Cloudflare (cloudflare_dns_record.app in dns.tf)."
   value       = aws_cloudfront_distribution.site.domain_name
 }
 
