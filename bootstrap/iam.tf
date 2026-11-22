@@ -942,9 +942,9 @@ data "aws_iam_policy_document" "plan_permissions" {
   # The homelab issuer's IAM OIDC provider. GetOpenIDConnectProvider is
   # granted below; the provider also reads its tags.
   statement {
-    sid       = "ReadHomelabOIDCProviderTags"
-    effect    = "Allow"
-    actions   = ["iam:ListOpenIDConnectProviderTags"]
+    sid     = "ReadHomelabOIDCProviderTags"
+    effect  = "Allow"
+    actions = ["iam:ListOpenIDConnectProviderTags"]
     # A string, not the resource: IAM creates the provider only once the
     # issuer is served, which is after this policy.
     resources = ["${local.iam_root}:oidc-provider/oidc.home.marcusdunn.ca"]
