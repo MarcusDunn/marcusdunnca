@@ -926,6 +926,28 @@ data "aws_iam_policy_document" "plan_permissions" {
     resources = ["*"]
   }
 
+  # The homelab zone (bootstrap/homelab.tf), for `tofu plan` to refresh it
+  # and its records. Scoped to that one zone; its records are public DNS.
+  statement {
+    sid    = "ReadHomelabZone"
+    effect = "Allow"
+    actions = [
+      "route53:GetHostedZone",
+      "route53:ListResourceRecordSets",
+      "route53:ListTagsForResource",
+    ]
+    resources = [aws_route53_zone.homelab.arn]
+  }
+
+  # The homelab issuer's IAM OIDC provider. GetOpenIDConnectProvider is
+  # granted below; the provider also reads its tags.
+  statement {
+    sid       = "ReadHomelabOIDCProviderTags"
+    effect    = "Allow"
+    actions   = ["iam:ListOpenIDConnectProviderTags"]
+    resources = [aws_iam_openid_connect_provider.homelab.arn]
+  }
+
   # Bucket-level metadata for application buckets. Object CONTENT is not
   # included — s3:GetObject stays confined to the state bucket above.
   statement {
