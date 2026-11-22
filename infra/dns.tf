@@ -63,14 +63,31 @@ resource "cloudflare_dns_record" "acm_validation" {
   comment = local.dns_record_comment
 }
 
-# The WireGuard server on the home desktop (marcusd-home). The router forwards
-# UDP 51820 to it. Its configuration is in the nixos-config repository, in
-# modules/wireguard-home-server.nix.
+# The WireGuard server on the home cluster node (marcusd-home, Talos). The
+# router forwards UDP 51820 to it. Its configuration is in the homelab
+# repository, in talos/talconfig.yaml.
 resource "cloudflare_dns_record" "vpn" {
   zone_id = var.cloudflare_zone_id
   name    = var.vpn_domain
   type    = "A"
   content = var.home_public_ipv4
+  ttl     = local.cloudflare_auto_ttl
+  proxied = false
+  comment = local.dns_record_comment
+}
+
+# home.marcusdunn.ca is a Route53 zone (bootstrap/homelab.tf): the home
+# cluster's Let's Encrypt DNS-01 challenges and its service-account issuer.
+# These records delegate it. The name servers are the zone's
+# (tofu -chdir=bootstrap output homelab_name_servers); a hosted zone keeps
+# them for its life.
+resource "cloudflare_dns_record" "homelab_delegation" {
+  for_each = toset(var.homelab_name_servers)
+
+  zone_id = var.cloudflare_zone_id
+  name    = var.homelab_zone
+  type    = "NS"
+  content = each.value
   ttl     = local.cloudflare_auto_ttl
   proxied = false
   comment = local.dns_record_comment
