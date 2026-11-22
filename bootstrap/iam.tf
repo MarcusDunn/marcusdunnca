@@ -945,7 +945,9 @@ data "aws_iam_policy_document" "plan_permissions" {
     sid       = "ReadHomelabOIDCProviderTags"
     effect    = "Allow"
     actions   = ["iam:ListOpenIDConnectProviderTags"]
-    resources = [aws_iam_openid_connect_provider.homelab.arn]
+    # A string, not the resource: IAM creates the provider only once the
+    # issuer is served, which is after this policy.
+    resources = ["${local.iam_root}:oidc-provider/oidc.home.marcusdunn.ca"]
   }
 
   # Bucket-level metadata for application buckets. Object CONTENT is not

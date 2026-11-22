@@ -208,7 +208,10 @@ resource "aws_route53_record" "homelab_oidc" {
 
 # --- Trust in the cluster's service-account tokens -------------------------
 
-# AWS validates this issuer against its own trust store; no thumbprint.
+# AWS validates this issuer against its own trust store; no thumbprint. IAM
+# connects to the issuer when it creates the provider, so the first apply
+# goes in two steps: everything except this provider and the role, then
+# scripts/publish-oidc.sh (homelab repository), then the rest.
 resource "aws_iam_openid_connect_provider" "homelab" {
   url            = "https://${local.homelab_issuer_host}"
   client_id_list = ["sts.amazonaws.com"]
