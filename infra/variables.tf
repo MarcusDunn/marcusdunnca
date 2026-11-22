@@ -238,3 +238,20 @@ variable "api_log_level" {
   type        = string
   default     = "info"
 }
+
+variable "homelab_zone" {
+  description = "The home cluster's Route53 zone, delegated from Cloudflare."
+  type        = string
+  default     = "home.marcusdunn.ca"
+}
+
+variable "homelab_name_servers" {
+  description = "Name servers of the homelab Route53 zone (tofu -chdir=bootstrap output homelab_name_servers)."
+  type        = list(string)
+  default = [
+    "ns-1405.awsdns-47.org",
+    "ns-1835.awsdns-37.co.uk",
+    "ns-81.awsdns-10.com",
+    "ns-902.awsdns-48.net",
+  ]
+}
