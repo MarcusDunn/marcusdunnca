@@ -20,6 +20,10 @@
 #    one thing: read and write that configuration's state file in the state
 #    bucket. GitHub signs a token for the job, as for this repository's CI.
 #
+# 4. A second role of the same kind, for the workflow that applies the
+#    realm of Keycloak (the homelab repository's keycloak/ directory): that
+#    configuration's state file only.
+#
 # This is bootstrap, not infra: it creates a hosted zone (denied to CI) and an
 # identity provider plus a role that trusts it.
 # ---------------------------------------------------------------------------
@@ -38,7 +42,8 @@ locals {
   homelab_github_repo_id      = 1467036181
   homelab_github_settings_sub = "repo:${var.github_owner}@${var.github_owner_id}/homelab@${local.homelab_github_repo_id}:ref:refs/heads/main"
 
-  homelab_github_state_key = "homelab/github.tfstate"
+  homelab_github_state_key   = "homelab/github.tfstate"
+  homelab_keycloak_state_key = "homelab/keycloak.tfstate"
 }
 
 # CloudFront accepts certificates from us-east-1 only: aws.us_east_1 is the
@@ -375,6 +380,51 @@ resource "aws_iam_role_policy" "homelab_github_settings" {
   policy = data.aws_iam_policy_document.homelab_github_settings.json
 }
 
+# --- The realm of Keycloak in the home cluster ------------------------------
+
+# The same job identity as above: a workflow of the homelab repository on
+# its main branch. One state file and its lock. The state holds no secret:
+# the realm's clients are public, or get their secret another way.
+data "aws_iam_policy_document" "homelab_keycloak" {
+  statement {
+    sid       = "FindState"
+    actions   = ["s3:ListBucket"]
+    resources = [aws_s3_bucket.state.arn]
+
+    condition {
+      test     = "StringEquals"
+      variable = "s3:prefix"
+      values   = [local.homelab_keycloak_state_key, "${local.homelab_keycloak_state_key}.tflock"]
+    }
+  }
+
+  statement {
+    sid       = "ReadWriteState"
+    actions   = ["s3:GetObject", "s3:PutObject"]
+    resources = ["${aws_s3_bucket.state.arn}/${local.homelab_keycloak_state_key}"]
+  }
+
+  statement {
+    sid       = "Lock"
+    actions   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"]
+    resources = ["${aws_s3_bucket.state.arn}/${local.homelab_keycloak_state_key}.tflock"]
+  }
+}
+
+resource "aws_iam_role" "homelab_keycloak" {
+  name                 = "homelab-keycloak"
+  path                 = "/homelab/"
+  description          = "The homelab repository's workflow that applies the realm of Keycloak: its state file only."
+  assume_role_policy   = data.aws_iam_policy_document.homelab_github_settings_trust.json
+  max_session_duration = 3600
+}
+
+resource "aws_iam_role_policy" "homelab_keycloak" {
+  name   = "state"
+  role   = aws_iam_role.homelab_keycloak.id
+  policy = data.aws_iam_policy_document.homelab_keycloak.json
+}
+
 output "homelab_zone_id" {
   description = "Route53 zone ID of home.marcusdunn.ca (cert-manager's hostedZoneID)."
   value       = aws_route53_zone.homelab.zone_id
@@ -408,4 +458,9 @@ output "homelab_cert_manager_role_arn" {
 output "homelab_github_settings_role_arn" {
   description = "The role in .github/workflows/github-settings.yaml of the homelab repository."
   value       = aws_iam_role.homelab_github_settings.arn
+}
+
+output "homelab_keycloak_role_arn" {
+  description = "The role in .github/workflows/keycloak.yaml of the homelab repository."
+  value       = aws_iam_role.homelab_keycloak.arn
 }
