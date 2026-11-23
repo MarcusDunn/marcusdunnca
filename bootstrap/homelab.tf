@@ -15,6 +15,11 @@
 #    an hour. The two files are public keys; the homelab repository publishes
 #    them (scripts/publish-oidc.sh) whenever the signing key changes.
 #
+# 3. A role for the workflow of the homelab repository that applies that
+#    repository's settings at GitHub (its github/ directory). The role does
+#    one thing: read and write that configuration's state file in the state
+#    bucket. GitHub signs a token for the job, as for this repository's CI.
+#
 # This is bootstrap, not infra: it creates a hosted zone (denied to CI) and an
 # identity provider plus a role that trusts it.
 # ---------------------------------------------------------------------------
@@ -25,6 +30,15 @@ locals {
 
   # The only identity that may assume the cert-manager role.
   homelab_cert_manager_sub = "system:serviceaccount:cert-manager:cert-manager"
+
+  # The only job that may assume the settings role: a workflow of the
+  # homelab repository that runs on its main branch. A pull request has
+  # another subject. The numbers are the owner and the repository (see
+  # var.github_owner_id): a renamed or re-created repository does not match.
+  homelab_github_repo_id      = 1467036181
+  homelab_github_settings_sub = "repo:${var.github_owner}@${var.github_owner_id}/homelab@${local.homelab_github_repo_id}:ref:refs/heads/main"
+
+  homelab_github_state_key = "homelab/github.tfstate"
 }
 
 # CloudFront accepts certificates from us-east-1 only: aws.us_east_1 is the
@@ -294,6 +308,73 @@ resource "aws_iam_role_policy" "homelab_cert_manager" {
   policy = data.aws_iam_policy_document.homelab_cert_manager.json
 }
 
+# --- The settings of the homelab repository at GitHub ----------------------
+
+data "aws_iam_policy_document" "homelab_github_settings_trust" {
+  statement {
+    actions = ["sts:AssumeRoleWithWebIdentity"]
+
+    principals {
+      type        = "Federated"
+      identifiers = [aws_iam_openid_connect_provider.github_actions.arn]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "token.actions.githubusercontent.com:aud"
+      values   = ["sts.amazonaws.com"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "token.actions.githubusercontent.com:sub"
+      values   = [local.homelab_github_settings_sub]
+    }
+  }
+}
+
+# One state file and its lock. The state holds no secret: the settings of a
+# repository, which the GitHub API also returns.
+data "aws_iam_policy_document" "homelab_github_settings" {
+  statement {
+    sid       = "FindState"
+    actions   = ["s3:ListBucket"]
+    resources = [aws_s3_bucket.state.arn]
+
+    condition {
+      test     = "StringEquals"
+      variable = "s3:prefix"
+      values   = [local.homelab_github_state_key, "${local.homelab_github_state_key}.tflock"]
+    }
+  }
+
+  statement {
+    sid       = "ReadWriteState"
+    actions   = ["s3:GetObject", "s3:PutObject"]
+    resources = ["${aws_s3_bucket.state.arn}/${local.homelab_github_state_key}"]
+  }
+
+  statement {
+    sid       = "Lock"
+    actions   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"]
+    resources = ["${aws_s3_bucket.state.arn}/${local.homelab_github_state_key}.tflock"]
+  }
+}
+
+resource "aws_iam_role" "homelab_github_settings" {
+  name                 = "homelab-github-settings"
+  path                 = "/homelab/"
+  description          = "The homelab repository's workflow that applies its GitHub settings: its state file only."
+  assume_role_policy   = data.aws_iam_policy_document.homelab_github_settings_trust.json
+  max_session_duration = 3600
+}
+
+resource "aws_iam_role_policy" "homelab_github_settings" {
+  name   = "state"
+  role   = aws_iam_role.homelab_github_settings.id
+  policy = data.aws_iam_policy_document.homelab_github_settings.json
+}
+
 output "homelab_zone_id" {
   description = "Route53 zone ID of home.marcusdunn.ca (cert-manager's hostedZoneID)."
   value       = aws_route53_zone.homelab.zone_id
@@ -322,4 +403,9 @@ output "homelab_oidc_distribution_id" {
 output "homelab_cert_manager_role_arn" {
   description = "Role that cert-manager assumes with its service-account token."
   value       = aws_iam_role.homelab_cert_manager.arn
+}
+
+output "homelab_github_settings_role_arn" {
+  description = "The role in .github/workflows/github-settings.yaml of the homelab repository."
+  value       = aws_iam_role.homelab_github_settings.arn
 }
