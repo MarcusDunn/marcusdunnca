@@ -58,7 +58,7 @@ resource "aws_route53_zone" "homelab" {
 #
 # Everything else in home.marcusdunn.ca has no public record: the cluster's
 # own DNS answers those names on the VPN, with the home Gateway's address.
-# These two go to the house: the router forwards 80 and 443 to the public
+# These go to the house: the router forwards 80 and 443 to the public
 # Gateway of the cluster (homelab, k8s/infrastructure/gateway/public.yaml),
 # which serves these names and no other. On the VPN they still get the home
 # Gateway's address, from the cluster's DNS.
@@ -70,8 +70,8 @@ locals {
 }
 
 resource "aws_route53_record" "homelab_public" {
-  # Trip Photos, and the login of Keycloak's realm "friends".
-  for_each = toset(["photos", "auth-friends"])
+  # Trip Photos, Wagers, and the login of Keycloak's realm "friends".
+  for_each = toset(["photos", "wagers", "auth-friends"])
 
   zone_id = aws_route53_zone.homelab.zone_id
   name    = "${each.key}.${local.homelab_zone}"
