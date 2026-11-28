@@ -70,8 +70,9 @@ locals {
 }
 
 resource "aws_route53_record" "homelab_public" {
-  # Trip Photos, Wagers, and the login of Keycloak's realm "friends".
-  for_each = toset(["photos", "wagers", "auth-friends"])
+  # Trip Photos, Wagers, the login of Keycloak's realm "friends", and the
+  # ingest of dialai's profiles (homelab, k8s/apps/profiling/ingest.yaml).
+  for_each = toset(["photos", "wagers", "auth-friends", "profiles"])
 
   zone_id = aws_route53_zone.homelab.zone_id
   name    = "${each.key}.${local.homelab_zone}"
